@@ -5,6 +5,9 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#ifdef _WIN32
+#define strcasecmp _stricmp
+#endif
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("fps-analyzer", "en-US")
@@ -16,7 +19,19 @@ struct fps_analyzer_filter {
     float current_fps;
     uint32_t prev_crc;
     bool has_prev;
+    char output_path[512];
 };
+
+// Helper: ensure .txt extension
+static void ensure_txt_extension(char *path, size_t maxlen)
+{
+    size_t len = strlen(path);
+    if (len < 4 || strcasecmp(path + len - 4, ".txt") != 0) {
+        if (len + 4 < maxlen) {
+            strcat(path, ".txt");
+        }
+    }
+}
 
 // Called for every video frame (pixel data)
 static struct obs_source_frame *fps_analyzer_filter_video(void *data, struct obs_source_frame *frame)
@@ -52,8 +67,16 @@ static void fps_analyzer_video_tick(void *data, float seconds)
         filter->last_frame_time = now;
         filter->unique_frame_count = 0;
 
-        // Save FPS to file (relative to OBS working dir)
-        FILE *f = fopen("fps.txt", "w");
+        // Save FPS to file (user-defined path or default)
+        char path[512];
+        if (filter->output_path[0]) {
+            strncpy(path, filter->output_path, sizeof(path));
+            path[sizeof(path)-1] = '\0';
+            ensure_txt_extension(path, sizeof(path));
+        } else {
+            strcpy(path, "fps.txt");
+        }
+        FILE *f = fopen(path, "w");
         if (f) {
             fprintf(f, "FPS: %.1f\n", filter->current_fps);
             fclose(f);
@@ -75,6 +98,16 @@ static void *fps_analyzer_create(obs_data_t *settings, obs_source_t *context)
     filter->current_fps = 0.0f;
     filter->prev_crc = 0;
     filter->has_prev = false;
+    filter->output_path[0] = '\0';
+
+    // Odczytaj ścieżkę z ustawień (jeśli istnieje)
+    const char *path = obs_data_get_string(settings, "output_path");
+    if (path) {
+        strncpy(filter->output_path, path, sizeof(filter->output_path));
+        filter->output_path[sizeof(filter->output_path)-1] = '\0';
+        ensure_txt_extension(filter->output_path, sizeof(filter->output_path));
+    }
+
     return filter;
 }
 
@@ -84,15 +117,38 @@ static const char *fps_analyzer_get_name(void *unused)
     return "FPS Analyzer";
 }
 
+// Properties for filter settings
+static obs_properties_t *fps_analyzer_properties(void *data)
+{
+    obs_properties_t *props = obs_properties_create();
+    obs_properties_add_path(props, "output_path", "FPS Output file",
+                            OBS_PATH_FILE_SAVE, "Text File (*.txt)", NULL);
+    return props;
+}
+
+// Update filter settings
+static void fps_analyzer_update(void *data, obs_data_t *settings)
+{
+    struct fps_analyzer_filter *filter = (struct fps_analyzer_filter *)data;
+    const char *path = obs_data_get_string(settings, "output_path");
+    if (path) {
+        strncpy(filter->output_path, path, sizeof(filter->output_path));
+        filter->output_path[sizeof(filter->output_path)-1] = '\0';
+        ensure_txt_extension(filter->output_path, sizeof(filter->output_path));
+    }
+}
+
 struct obs_source_info fps_analyzer_filter_info = {
-    .id = "fps_analyzer_filter",
-    .type = OBS_SOURCE_TYPE_FILTER,
-    .output_flags = OBS_SOURCE_VIDEO,
-    .get_name = fps_analyzer_get_name,
-    .create = fps_analyzer_create,
-    .destroy = fps_analyzer_destroy,
-    .video_tick = fps_analyzer_video_tick,
-    .filter_video = fps_analyzer_filter_video,
+	.id = "fps_analyzer_filter",
+	.type = OBS_SOURCE_TYPE_FILTER,
+	.output_flags = OBS_SOURCE_VIDEO,
+	.get_name = fps_analyzer_get_name,
+	.create = fps_analyzer_create,
+	.destroy = fps_analyzer_destroy,
+	.get_properties = fps_analyzer_properties,
+	.update = fps_analyzer_update,
+	.video_tick = fps_analyzer_video_tick,
+	.filter_video = fps_analyzer_filter_video,
 };
 
 bool obs_module_load(void)
