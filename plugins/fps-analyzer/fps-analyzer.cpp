@@ -21,6 +21,7 @@ struct fps_analyzer_filter {
     bool has_prev;
     char output_path[512];
     double sensitivity_percent; // threshold in percent (0-100)
+    double update_interval; // in seconds
     uint8_t *prev_frame;
     size_t prev_frame_size;
 };
@@ -88,12 +89,11 @@ static void fps_analyzer_video_tick(void *data, float seconds)
         return;
     }
     double elapsed = (now - filter->last_frame_time) / 1000000000.0;
-    if (elapsed >= 1.0) {
+    if (elapsed >= filter->update_interval) {
         filter->current_fps = filter->unique_frame_count / (float)elapsed;
         filter->last_frame_time = now;
         filter->unique_frame_count = 0;
 
-        // Save FPS to file (user-defined path or default)
         char path[512];
         int fps_int = (int)(filter->current_fps + 0.5); // rounded FPS
         double frametime_ms = (fps_int > 0) ? (1000.0 / fps_int) : 0.0;
@@ -130,6 +130,7 @@ static void *fps_analyzer_create(obs_data_t *settings, obs_source_t *context)
     filter->has_prev = false;
     filter->output_path[0] = '\0';
     filter->sensitivity_percent = 0.0;
+    filter->update_interval = 1.0;
     filter->prev_frame = NULL;
     filter->prev_frame_size = 0;
     const char *path = obs_data_get_string(settings, "output_path");
@@ -139,6 +140,9 @@ static void *fps_analyzer_create(obs_data_t *settings, obs_source_t *context)
         ensure_txt_extension(filter->output_path, sizeof(filter->output_path));
     }
     filter->sensitivity_percent = obs_data_get_double(settings, "sensitivity_percent");
+    filter->update_interval = obs_data_get_double(settings, "update_interval");
+    if (filter->update_interval <= 0.0)
+        filter->update_interval = 1.0;
     return filter;
 }
 
@@ -162,13 +166,22 @@ static obs_properties_t *fps_analyzer_properties(void *data)
         "",
         OBS_TEXT_INFO
     );
+    
     obs_property_t *slider = obs_properties_add_float_slider(
         props, "sensitivity_percent", "Sensitivity threshold (%)", 0.0, 5.0, 0.01);
-    // Description for the label
     obs_property_t *info = obs_properties_get(props, "sensitivity_info");
     if (info) {
         obs_property_set_description(info, "Minimal percent of changed bytes between frames to count as a new frame.\n0% = every change, 1% = ignore small noise, 5% = only big changes.");
     }
+
+    // Dropdown for update interval
+    obs_property_t *interval = obs_properties_add_list(
+        props, "update_interval", "Update interval",
+        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_FLOAT);
+    obs_property_list_add_float(interval, "2 times per second", 0.5);
+    obs_property_list_add_float(interval, "1 time per second", 1.0);
+    obs_property_list_add_float(interval, "0.5 times per second", 2.0);
+    obs_property_set_long_description(interval, "How often FPS/frametime is written to file.");
     return props;
 }
 
@@ -183,6 +196,9 @@ static void fps_analyzer_update(void *data, obs_data_t *settings)
         ensure_txt_extension(filter->output_path, sizeof(filter->output_path));
     }
     filter->sensitivity_percent = obs_data_get_double(settings, "sensitivity_percent");
+    filter->update_interval = obs_data_get_double(settings, "update_interval");
+    if (filter->update_interval <= 0.0)
+        filter->update_interval = 1.0;
 }
 
 struct obs_source_info fps_analyzer_filter_info = {
