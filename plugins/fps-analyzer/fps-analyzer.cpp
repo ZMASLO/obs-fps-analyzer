@@ -20,6 +20,9 @@ struct fps_analyzer_filter {
     uint32_t prev_crc;
     bool has_prev;
     char output_path[512];
+    double sensitivity_percent; // threshold in percent (0-100)
+    uint8_t *prev_frame;
+    size_t prev_frame_size;
 };
 
 // Helper: ensure .txt extension
@@ -33,22 +36,45 @@ static void ensure_txt_extension(char *path, size_t maxlen)
     }
 }
 
+// Helper: count number of different bytes between two frames
+static size_t count_diff_bytes(const uint8_t *a, const uint8_t *b, size_t size)
+{
+    size_t diff = 0;
+    for (size_t i = 0; i < size; ++i) {
+        if (a[i] != b[i]) diff++;
+    }
+    return diff;
+}
+
 // Called for every video frame (pixel data)
 static struct obs_source_frame *fps_analyzer_filter_video(void *data, struct obs_source_frame *frame)
 {
     struct fps_analyzer_filter *filter = (struct fps_analyzer_filter *)data;
     if (frame && frame->data[0]) {
-        // Calculate CRC32 hash of the frame pixel data
-        uint32_t cur_crc = calc_crc32(0, frame->data[0], frame->linesize[0] * frame->height);
-        if (filter->has_prev) {
-            if (cur_crc != filter->prev_crc) {
-                filter->unique_frame_count++;
+        size_t frame_size = frame->linesize[0] * frame->height;
+        int is_unique = 0;
+        if (filter->has_prev && filter->prev_frame && filter->prev_frame_size == frame_size) {
+            size_t diff = count_diff_bytes((const uint8_t *)frame->data[0], filter->prev_frame, frame_size);
+            double percent = (frame_size > 0) ? (100.0 * diff / frame_size) : 0.0;
+            if (percent > filter->sensitivity_percent) {
+                is_unique = 1;
             }
+        } else {
+            is_unique = 1; // First frame or size changed
         }
-        filter->prev_crc = cur_crc;
+        if (is_unique) {
+            filter->unique_frame_count++;
+        }
+        // Save current frame for next comparison
+        if (!filter->prev_frame || filter->prev_frame_size != frame_size) {
+            free(filter->prev_frame);
+            filter->prev_frame = (uint8_t *)malloc(frame_size);
+            filter->prev_frame_size = frame_size;
+        }
+        memcpy(filter->prev_frame, frame->data[0], frame_size);
         filter->has_prev = true;
     }
-    return frame; // Return unmodified frame
+    return frame;
 }
 
 static void fps_analyzer_video_tick(void *data, float seconds)
@@ -88,6 +114,8 @@ static void fps_analyzer_video_tick(void *data, float seconds)
 
 static void fps_analyzer_destroy(void *data)
 {
+    struct fps_analyzer_filter *filter = (struct fps_analyzer_filter *)data;
+    if (filter->prev_frame) free(filter->prev_frame);
     bfree(data);
 }
 
@@ -101,15 +129,16 @@ static void *fps_analyzer_create(obs_data_t *settings, obs_source_t *context)
     filter->prev_crc = 0;
     filter->has_prev = false;
     filter->output_path[0] = '\0';
-
-    // Odczytaj ścieżkę z ustawień (jeśli istnieje)
+    filter->sensitivity_percent = 0.0;
+    filter->prev_frame = NULL;
+    filter->prev_frame_size = 0;
     const char *path = obs_data_get_string(settings, "output_path");
     if (path) {
         strncpy(filter->output_path, path, sizeof(filter->output_path));
         filter->output_path[sizeof(filter->output_path)-1] = '\0';
         ensure_txt_extension(filter->output_path, sizeof(filter->output_path));
     }
-
+    filter->sensitivity_percent = obs_data_get_double(settings, "sensitivity_percent");
     return filter;
 }
 
@@ -125,6 +154,21 @@ static obs_properties_t *fps_analyzer_properties(void *data)
     obs_properties_t *props = obs_properties_create();
     obs_properties_add_path(props, "output_path", "FPS Output file",
                             OBS_PATH_FILE_SAVE, "Text File (*.txt)", NULL);
+
+    // Add info label above the slider
+    obs_properties_add_text(
+        props,
+        "sensitivity_info",
+        "",
+        OBS_TEXT_INFO
+    );
+    obs_property_t *slider = obs_properties_add_float_slider(
+        props, "sensitivity_percent", "Sensitivity threshold (%)", 0.0, 5.0, 0.01);
+    // Description for the label
+    obs_property_t *info = obs_properties_get(props, "sensitivity_info");
+    if (info) {
+        obs_property_set_description(info, "Minimal percent of changed bytes between frames to count as a new frame.\n0% = every change, 1% = ignore small noise, 5% = only big changes.");
+    }
     return props;
 }
 
@@ -138,6 +182,7 @@ static void fps_analyzer_update(void *data, obs_data_t *settings)
         filter->output_path[sizeof(filter->output_path)-1] = '\0';
         ensure_txt_extension(filter->output_path, sizeof(filter->output_path));
     }
+    filter->sensitivity_percent = obs_data_get_double(settings, "sensitivity_percent");
 }
 
 struct obs_source_info fps_analyzer_filter_info = {
