@@ -24,6 +24,8 @@ struct fps_analyzer_filter {
     double update_interval; // in seconds
     uint8_t *prev_frame;
     size_t prev_frame_size;
+    uint64_t last_unique_frame_time;
+    double last_frametime_ms;
 };
 
 // Helper: ensure .txt extension
@@ -65,6 +67,11 @@ static struct obs_source_frame *fps_analyzer_filter_video(void *data, struct obs
         }
         if (is_unique) {
             filter->unique_frame_count++;
+            uint64_t now = os_gettime_ns();
+            if (filter->last_unique_frame_time != 0) {
+                filter->last_frametime_ms = (now - filter->last_unique_frame_time) / 1000000.0;
+            }
+            filter->last_unique_frame_time = now;
         }
         // Save current frame for next comparison
         if (!filter->prev_frame || filter->prev_frame_size != frame_size) {
@@ -97,6 +104,7 @@ static void fps_analyzer_video_tick(void *data, float seconds)
         char path[512];
         int fps_int = (int)(filter->current_fps + 0.5); // rounded FPS
         double frametime_ms = (fps_int > 0) ? (1000.0 / fps_int) : 0.0;
+        double last_frametime_ms = filter->last_frametime_ms;
         if (filter->output_path[0]) {
             strncpy(path, filter->output_path, sizeof(path));
             path[sizeof(path)-1] = '\0';
@@ -106,7 +114,7 @@ static void fps_analyzer_video_tick(void *data, float seconds)
         }
         FILE *f = fopen(path, "w");
         if (f) {
-            fprintf(f, "FPS: %d\nFrametime: %.2f ms\n", fps_int, frametime_ms);
+            fprintf(f, "FPS: %d\nFrametime: %.2f ms\nLast frametime: %.2f ms\n", fps_int, frametime_ms, last_frametime_ms);
             fclose(f);
         }
     }
@@ -133,6 +141,8 @@ static void *fps_analyzer_create(obs_data_t *settings, obs_source_t *context)
     filter->update_interval = 1.0;
     filter->prev_frame = NULL;
     filter->prev_frame_size = 0;
+    filter->last_unique_frame_time = 0;
+    filter->last_frametime_ms = 0.0;
     const char *path = obs_data_get_string(settings, "output_path");
     if (path) {
         strncpy(filter->output_path, path, sizeof(filter->output_path));
