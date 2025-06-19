@@ -70,6 +70,7 @@ static void fps_analyzer_video_tick(void *data, float seconds)
         // Save FPS to file (user-defined path or default)
         char path[512];
         int fps_int = (int)(filter->current_fps + 0.5); // rounded FPS
+        double frametime_ms = (fps_int > 0) ? (1000.0 / fps_int) : 0.0;
         if (filter->output_path[0]) {
             strncpy(path, filter->output_path, sizeof(path));
             path[sizeof(path)-1] = '\0';
@@ -79,7 +80,7 @@ static void fps_analyzer_video_tick(void *data, float seconds)
         }
         FILE *f = fopen(path, "w");
         if (f) {
-            fprintf(f, "FPS: %d\n", fps_int);
+            fprintf(f, "FPS: %d\nFrametime: %.2f ms\n", fps_int, frametime_ms);
             fclose(f);
         }
     }
