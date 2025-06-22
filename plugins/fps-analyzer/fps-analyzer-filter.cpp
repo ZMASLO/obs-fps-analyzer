@@ -14,6 +14,7 @@
 extern struct obs_source_info fps_overlay_source_info;
 
 #define FPS_CSV_HISTORY_LIMIT 300
+#define ROLLING_MAX 120 // max 2 sekundy przy 60 FPS
 
 // Prototypes
 static void clear_csv_file(const char *csv_path);
@@ -34,6 +35,9 @@ struct fps_analyzer_filter {
     uint64_t last_unique_frame_time;
     double last_frametime_ms;
     bool clear_csv_on_start;
+    uint64_t rolling_times[ROLLING_MAX];
+    int rolling_count;
+    int rolling_start;
 };
 
 static size_t count_diff_bytes(const uint8_t *a, const uint8_t *b, size_t size)
@@ -61,8 +65,24 @@ static struct obs_source_frame *fps_analyzer_filter_video(void *data, struct obs
             is_unique = 1; // First frame or size changed
         }
         if (is_unique) {
-            filter->unique_frame_count++;
             uint64_t now = os_gettime_ns();
+            // Dodaj nowy timestamp do rolling window
+            int idx = (filter->rolling_start + filter->rolling_count) % ROLLING_MAX;
+            filter->rolling_times[idx] = now;
+            if (filter->rolling_count < ROLLING_MAX) {
+                filter->rolling_count++;
+            } else {
+                filter->rolling_start = (filter->rolling_start + 1) % ROLLING_MAX;
+            }
+            // Usuń stare klatki spoza okna 1s
+            while (filter->rolling_count > 0 &&
+                   now - filter->rolling_times[filter->rolling_start] > 1000000000ULL) {
+                filter->rolling_start = (filter->rolling_start + 1) % ROLLING_MAX;
+                filter->rolling_count--;
+            }
+            // FPS = rolling_count
+            filter->current_fps = (float)filter->rolling_count;
+            // Frametime (odstęp od poprzedniej unikalnej klatki)
             if (filter->last_unique_frame_time != 0) {
                 filter->last_frametime_ms = (now - filter->last_unique_frame_time) / 1000000.0;
             }
@@ -82,60 +102,47 @@ static struct obs_source_frame *fps_analyzer_filter_video(void *data, struct obs
 static void fps_analyzer_video_tick(void *data, float seconds)
 {
     struct fps_analyzer_filter *filter = (struct fps_analyzer_filter *)data;
-    uint64_t now = os_gettime_ns();
-    if (filter->last_frame_time == 0) {
-        filter->last_frame_time = now;
-        filter->unique_frame_count = 0;
-        filter->current_fps = 0.0f;
-        return;
-    }
-    double elapsed = (now - filter->last_frame_time) / 1000000000.0;
-    if (elapsed >= filter->update_interval) {
-        filter->current_fps = filter->unique_frame_count / (float)elapsed;
-        filter->last_frame_time = now;
-        filter->unique_frame_count = 0;
-
-        char path[512];
-        int fps_int = (int)(filter->current_fps + 0.5); // rounded FPS
-        double frametime_ms = (fps_int > 0) ? (1000.0 / fps_int) : 0.0;
-        double last_frametime_ms = filter->last_frametime_ms;
-        if (filter->output_path[0]) {
-            strncpy(path, filter->output_path, sizeof(path));
-            path[sizeof(path)-1] = '\0';
-            if (strlen(path) < 4 || strcasecmp(path + strlen(path) - 4, ".txt") != 0) {
-                if (strlen(path) + 4 < sizeof(path)) {
-                    strcat(path, ".txt");
-                }
+    // Rolling window: FPS już jest liczony na bieżąco w filter->current_fps
+    float fps = filter->current_fps;
+    double frametime_ms = (fps > 0.0f) ? (1000.0 / fps) : 0.0;
+    double last_frametime_ms = filter->last_frametime_ms;
+    char path[512];
+    if (filter->output_path[0]) {
+        strncpy(path, filter->output_path, sizeof(path));
+        path[sizeof(path)-1] = '\0';
+        if (strlen(path) < 4 || strcasecmp(path + strlen(path) - 4, ".txt") != 0) {
+            if (strlen(path) + 4 < sizeof(path)) {
+                strcat(path, ".txt");
             }
-        } else {
-            strcpy(path, "fps.txt");
         }
-        FILE *f = fopen(path, "w");
-        if (f) {
-            fprintf(f, "FPS: %d\nFrametime: %.2f ms\nLast frametime: %.2f ms\n", fps_int, frametime_ms, last_frametime_ms);
-            fclose(f);
-        }
-        char csv_path[512];
-        if (filter->output_path[0]) {
-            strncpy(csv_path, filter->output_path, sizeof(csv_path));
-            csv_path[sizeof(csv_path)-1] = '\0';
-            char *dot = strrchr(csv_path, '.');
-            if (dot) {
-                strcpy(dot, ".csv");
-            } else {
-                strcat(csv_path, ".csv");
-            }
-        } else {
-            strcpy(csv_path, "fps.csv");
-        }
-        FILE *csv = fopen(csv_path, "a");
-        if (csv) {
-            time_t t = time(NULL);
-            fprintf(csv, "%lld,%d,%.2f,%.2f\n", (long long)t, fps_int, frametime_ms, last_frametime_ms);
-            fclose(csv);
-        }
-        keep_last_n_lines(csv_path, FPS_CSV_HISTORY_LIMIT);
+    } else {
+        strcpy(path, "fps.txt");
     }
+    FILE *f = fopen(path, "w");
+    if (f) {
+        fprintf(f, "FPS: %.2f\nFrametime: %.2f ms\nLast frametime: %.2f ms\n", fps, frametime_ms, last_frametime_ms);
+        fclose(f);
+    }
+    char csv_path[512];
+    if (filter->output_path[0]) {
+        strncpy(csv_path, filter->output_path, sizeof(csv_path));
+        csv_path[sizeof(csv_path)-1] = '\0';
+        char *dot = strrchr(csv_path, '.');
+        if (dot) {
+            strcpy(dot, ".csv");
+        } else {
+            strcat(csv_path, ".csv");
+        }
+    } else {
+        strcpy(csv_path, "fps.csv");
+    }
+    FILE *csv = fopen(csv_path, "a");
+    if (csv) {
+        time_t t = time(NULL);
+        fprintf(csv, "%lld,%.2f,%.2f,%.2f\n", (long long)t, fps, frametime_ms, last_frametime_ms);
+        fclose(csv);
+    }
+    keep_last_n_lines(csv_path, FPS_CSV_HISTORY_LIMIT);
 }
 
 static void fps_analyzer_destroy(void *data)
@@ -176,6 +183,8 @@ static void *fps_analyzer_create(obs_data_t *settings, obs_source_t *context)
     filter->update_interval = obs_data_get_double(settings, "update_interval");
     if (filter->update_interval <= 0.0)
         filter->update_interval = 1.0;
+    filter->rolling_count = 0;
+    filter->rolling_start = 0;
     // --- czyszczenie pliku CSV jeśli trzeba ---
     char csv_path[512];
     if (filter->output_path[0]) {
