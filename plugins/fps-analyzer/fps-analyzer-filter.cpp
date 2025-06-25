@@ -44,14 +44,32 @@ static struct obs_source_frame *fps_analyzer_filter_video(void *data, struct obs
 {
     struct fps_analyzer_filter *filter = (struct fps_analyzer_filter *)data;
     if (frame && frame->data[0]) {
-        size_t frame_size = frame->linesize[0] * frame->height;
-        // --- Detekcja na podstawie hash wycinka obrazu (ostatnia linia) ---
+        // Automatyczna obsługa NV12 i YUY2
+        uint8_t *roi_ptr = NULL;
+        size_t roi_size = 0;
         const int roi_line = frame->height - 1; // ostatnia linia
         const int roi_lines = 1;                // liczba linii do analizy
-        const int roi_start = 0;                // początek (lewa krawędź)
         const int roi_width = frame->width;     // szerokość (cała linia)
-        uint8_t *roi_ptr = frame->data[0] + roi_line * frame->linesize[0];
-        size_t roi_size = roi_width * 4 * roi_lines; // zakładamy format RGBA (4 bajty na piksel)
+        if (frame->format == VIDEO_FORMAT_NV12) {
+            // NV12: luminancja (Y) w data[0], 1 bajt na piksel
+            roi_ptr = frame->data[0] + roi_line * frame->linesize[0];
+            roi_size = roi_width * roi_lines;
+        } else if (frame->format == VIDEO_FORMAT_YUY2) {
+            // YUY2: luminancja (Y) co drugi bajt, format Y0 U0 Y1 V0 Y2 U1 Y3 V1 ...
+            roi_ptr = frame->data[0] + roi_line * frame->linesize[0];
+            // Wyciągamy tylko bajty Y (co drugi bajt)
+            static uint8_t yuy2_luma[4096]; // max szerokość 4096 px, jeśli więcej - przyciąć
+            size_t max_width = sizeof(yuy2_luma);
+            size_t copy_width = roi_width < max_width ? roi_width : max_width;
+            for (size_t i = 0, j = 0; i < copy_width; ++i, j += 2) {
+                yuy2_luma[i] = roi_ptr[j];
+            }
+            roi_ptr = yuy2_luma;
+            roi_size = copy_width * roi_lines;
+        } else {
+            // Nieobsługiwany format - pomiń analizę
+            return frame;
+        }
         uint32_t crc = calc_crc32(0, roi_ptr, roi_size);
         int is_unique = 0;
         if (filter->has_prev) {
