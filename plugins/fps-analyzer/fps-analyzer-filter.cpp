@@ -17,6 +17,12 @@ extern struct obs_source_info fps_overlay_source_info;
 #define ROLLING_MAX 120 // max 2 sekundy przy 60 FPS
 #define FRAMETIME_HISTORY 60
 
+// Dodaj enum do wyboru metody analizy
+typedef enum {
+    ANALYZE_CRC32 = 0,
+    ANALYZE_DIFF = 1
+} analyze_method_t;
+
 // Prototypes
 static void clear_csv_file(const char *csv_path);
 static void keep_last_n_lines(const char *csv_path, int n);
@@ -38,48 +44,112 @@ struct fps_analyzer_filter {
     double frametime_history[FRAMETIME_HISTORY];
     int frametime_pos;
     int frametime_count;
+    analyze_method_t analyze_method;
+    double sensitivity;
+    uint8_t *prev_frame;
+    size_t prev_frame_size;
 };
+
+// Funkcja do liczenia różniących się bajtów
+static size_t count_diff_bytes(const uint8_t *a, const uint8_t *b, size_t size) {
+    size_t diff = 0;
+    for (size_t i = 0; i < size; ++i) {
+        if (a[i] != b[i]) ++diff;
+    }
+    return diff;
+}
 
 static struct obs_source_frame *fps_analyzer_filter_video(void *data, struct obs_source_frame *frame)
 {
     struct fps_analyzer_filter *filter = (struct fps_analyzer_filter *)data;
     if (frame && frame->data[0]) {
-        // Automatyczna obsługa NV12 i YUY2
+        int roi_line, roi_lines;
+        const int roi_width = frame->width;
         uint8_t *roi_ptr = NULL;
         size_t roi_size = 0;
-        const int roi_line = frame->height - 1; // ostatnia linia
-        const int roi_lines = 1;                // liczba linii do analizy
-        const int roi_width = frame->width;     // szerokość (cała linia)
-        if (frame->format == VIDEO_FORMAT_NV12) {
-            // NV12: luminancja (Y) w data[0], 1 bajt na piksel
-            roi_ptr = frame->data[0] + roi_line * frame->linesize[0];
-            roi_size = roi_width * roi_lines;
-        } else if (frame->format == VIDEO_FORMAT_YUY2) {
-            // YUY2: luminancja (Y) co drugi bajt, format Y0 U0 Y1 V0 Y2 U1 Y3 V1 ...
-            roi_ptr = frame->data[0] + roi_line * frame->linesize[0];
-            // Wyciągamy tylko bajty Y (co drugi bajt)
-            static uint8_t yuy2_luma[4096]; // max szerokość 4096 px, jeśli więcej - przyciąć
-            size_t max_width = sizeof(yuy2_luma);
-            size_t copy_width = roi_width < max_width ? roi_width : max_width;
-            for (size_t i = 0, j = 0; i < copy_width; ++i, j += 2) {
-                yuy2_luma[i] = roi_ptr[j];
-            }
-            roi_ptr = yuy2_luma;
-            roi_size = copy_width * roi_lines;
+        int is_unique = 0;
+        if (filter->analyze_method == ANALYZE_DIFF) {
+            // Pełna analiza: cała klatka
+            roi_line = 0;
+            roi_lines = frame->height;
         } else {
-            // Nieobsługiwany format - pomiń analizę
+            // CRC32: tylko ostatnia linia
+            roi_line = frame->height - 1;
+            roi_lines = 1;
+        }
+        if (frame->format == VIDEO_FORMAT_NV12) {
+            roi_ptr = frame->data[0] + roi_line * frame->linesize[0];
+            if (filter->analyze_method == ANALYZE_DIFF) {
+                // Cała klatka: kopiujemy całość luminancji do bufora
+                static uint8_t nv12_luma[4096*2160]; // max 4K, jeśli więcej - przyciąć
+                size_t max_size = sizeof(nv12_luma);
+                size_t full_size = roi_width * frame->height;
+                size_t copy_size = (full_size < max_size) ? full_size : max_size;
+                for (int y = 0; y < (int)frame->height && y*roi_width < (int)copy_size; ++y) {
+                    memcpy(nv12_luma + y*roi_width, frame->data[0] + y*frame->linesize[0], roi_width);
+                }
+                roi_ptr = nv12_luma;
+                roi_size = copy_size;
+            } else {
+                roi_size = roi_width * roi_lines;
+            }
+        } else if (frame->format == VIDEO_FORMAT_YUY2) {
+            roi_ptr = frame->data[0] + roi_line * frame->linesize[0];
+            if (filter->analyze_method == ANALYZE_DIFF) {
+                // Cała klatka: kopiujemy tylko bajty Y z każdej linii
+                static uint8_t yuy2_luma[4096*2160]; // max 4K, jeśli więcej - przyciąć
+                size_t max_size = sizeof(yuy2_luma);
+                size_t full_size = roi_width * frame->height;
+                size_t copy_size = (full_size < max_size) ? full_size : max_size;
+                for (int y = 0; y < (int)frame->height && y*roi_width < (int)copy_size; ++y) {
+                    uint8_t *src = frame->data[0] + y*frame->linesize[0];
+                    for (int x = 0; x < (int)roi_width && y*roi_width + x < (int)copy_size; ++x) {
+                        yuy2_luma[y*roi_width + x] = src[x*2];
+                    }
+                }
+                roi_ptr = yuy2_luma;
+                roi_size = copy_size;
+            } else {
+                // Ostatnia linia: tylko bajty Y
+                static uint8_t yuy2_luma[4096];
+                size_t max_width = sizeof(yuy2_luma);
+                size_t copy_width = roi_width < max_width ? roi_width : max_width;
+                for (size_t i = 0, j = 0; i < copy_width; ++i, j += 2) {
+                    yuy2_luma[i] = roi_ptr[j];
+                }
+                roi_ptr = yuy2_luma;
+                roi_size = copy_width * roi_lines;
+            }
+        } else {
             return frame;
         }
-        uint32_t crc = calc_crc32(0, roi_ptr, roi_size);
-        int is_unique = 0;
-        if (filter->has_prev) {
-            if (crc != filter->prev_line_crc) {
+        if (filter->analyze_method == ANALYZE_CRC32) {
+            uint32_t crc = calc_crc32(0, roi_ptr, roi_size);
+            if (filter->has_prev) {
+                if (crc != filter->prev_line_crc) {
+                    is_unique = 1;
+                }
+            } else {
                 is_unique = 1;
             }
-        } else {
-            is_unique = 1; // pierwsza klatka
+            filter->prev_line_crc = crc;
+        } else if (filter->analyze_method == ANALYZE_DIFF) {
+            // Porównanie całej klatki (luminancji)
+            if (!filter->prev_frame || filter->prev_frame_size != roi_size) {
+                if (filter->prev_frame) bfree(filter->prev_frame);
+                filter->prev_frame = (uint8_t*)bzalloc(roi_size);
+                filter->prev_frame_size = roi_size;
+                memcpy(filter->prev_frame, roi_ptr, roi_size);
+                is_unique = 1;
+            } else {
+                size_t diff = count_diff_bytes(roi_ptr, filter->prev_frame, roi_size);
+                double percent = (roi_size > 0) ? (100.0 * diff / roi_size) : 0.0;
+                if (percent >= filter->sensitivity) {
+                    is_unique = 1;
+                }
+                memcpy(filter->prev_frame, roi_ptr, roi_size);
+            }
         }
-        filter->prev_line_crc = crc;
         filter->has_prev = true;
         // --- rolling window i reszta logiki bez zmian ---
         if (is_unique) {
@@ -96,9 +166,8 @@ static struct obs_source_frame *fps_analyzer_filter_video(void *data, struct obs
                 filter->rolling_start = (filter->rolling_start + 1) % ROLLING_MAX;
                 filter->rolling_count--;
             }
-            // --- frametime history ---
             if (filter->last_unique_frame_time != 0) {
-                double ft = (now - filter->last_unique_frame_time) / 1000000.0; // ms
+                double ft = (now - filter->last_unique_frame_time) / 1000000.0;
                 filter->frametime_history[filter->frametime_pos] = ft;
                 filter->frametime_pos = (filter->frametime_pos + 1) % FRAMETIME_HISTORY;
                 if (filter->frametime_count < FRAMETIME_HISTORY)
@@ -202,6 +271,8 @@ static void *fps_analyzer_create(obs_data_t *settings, obs_source_t *context)
     filter->last_write_time = 0;
     filter->frametime_pos = 0;
     filter->frametime_count = 0;
+    filter->analyze_method = (analyze_method_t)obs_data_get_int(settings, "analyze_method");
+    filter->sensitivity = obs_data_get_double(settings, "sensitivity");
     return filter;
 }
 
@@ -209,6 +280,15 @@ static const char *fps_analyzer_get_name(void *unused)
 {
     UNUSED_PARAMETER(unused);
     return "FPS Analyzer";
+}
+
+// Callback do dynamicznego włączania/wyłączania slidera sensitivity
+static bool analyze_method_modified(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
+{
+    int method = (int)obs_data_get_int(settings, "analyze_method");
+    obs_property_t *slider = obs_properties_get(props, "sensitivity");
+    obs_property_set_visible(slider, method == ANALYZE_DIFF);
+    return true;
 }
 
 static obs_properties_t *fps_analyzer_properties(void *data)
@@ -230,6 +310,18 @@ static obs_properties_t *fps_analyzer_properties(void *data)
     obs_property_list_add_float(interval, "1", 1.0);
     obs_property_list_add_float(interval, "2", 2.0);
     obs_property_set_long_description(interval, "How often FPS/frametime is written to file.");
+    // Dropdown do wyboru metody analizy
+    obs_property_t *method = obs_properties_add_list(props, "analyze_method", "Analysis method",
+        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    obs_property_list_add_int(method, "CRC32 (only last line)", ANALYZE_CRC32);
+    obs_property_list_add_int(method, "Full frame diff (all lines)", ANALYZE_DIFF);
+    // Slider do progu czułości
+    obs_property_t *slider = obs_properties_add_float_slider(props, "sensitivity", "Sensitivity threshold (%)", 0.0, 5.0, 0.1);
+    // Ustaw widoczność na starcie
+    int method_val = data ? ((struct fps_analyzer_filter*)data)->analyze_method : ANALYZE_CRC32;
+    obs_property_set_visible(slider, method_val == ANALYZE_DIFF);
+    // Callback na dropdownie
+    obs_property_set_modified_callback(method, analyze_method_modified);
     return props;
 }
 
@@ -250,6 +342,8 @@ static void fps_analyzer_update(void *data, obs_data_t *settings)
     if (filter->update_interval <= 0.0)
         filter->update_interval = 1.0;
     filter->clear_csv_on_start = obs_data_get_bool(settings, "clear_csv_on_start");
+    filter->analyze_method = (analyze_method_t)obs_data_get_int(settings, "analyze_method");
+    filter->sensitivity = obs_data_get_double(settings, "sensitivity");
 }
 
 static void clear_csv_file(const char *csv_path) {
@@ -288,6 +382,8 @@ static void keep_last_n_lines(const char *csv_path, int n) {
 static void fps_analyzer_get_defaults(obs_data_t *settings)
 {
     obs_data_set_default_bool(settings, "clear_csv_on_start", true);
+    obs_data_set_default_int(settings, "analyze_method", ANALYZE_CRC32);
+    obs_data_set_default_double(settings, "sensitivity", 0.1);
 }
 
 struct obs_source_info fps_analyzer_filter_info = {
