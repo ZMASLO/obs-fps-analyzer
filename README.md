@@ -37,7 +37,7 @@ Copy `fps-analyzer.dll` to `C:\Program Files\obs-studio\obs-plugins\64bit`
 
 ## Analysis Methods:
 
-The plugin offers three different image analysis methods:
+The plugin offers two different image analysis methods:
 
 ### 1. Last line diff (pixel analysis) - **Default**
 - **Speed**: Fastest
@@ -53,12 +53,12 @@ The plugin offers three different image analysis methods:
 - **Description**: Analyzes every pixel in the frame and calculates the percentage of differences
 - **Settings**: "Sensitivity threshold" slider (0.0-5.0%)
 
-### 3. Multi-line (tearing detection)
-- **Speed**: Medium
-- **Accuracy**: High with tearing detection
-- **Use case**: Games without V-Sync where tearing occurs
-- **Description**: Analyzes 3 lines (top, middle, bottom) and detects tearing
-- **Settings**: "Sensitivity threshold" slider (0.0-5.0%)
+
+### Tearing Detection:
+- **Independent feature**: Works with any analysis method
+- **Description**: Detects screen tearing by analyzing 3 lines (top, middle, bottom)
+- **Settings**: "Enable tearing detection" checkbox (default: enabled)
+- **Output**: Adds warning to TXT file when tearing is detected
 
 ### Output Format:
 - **TXT**: `FPS: 60 | Frame Time: 16.67ms | Last Frame Time: 16.50ms`

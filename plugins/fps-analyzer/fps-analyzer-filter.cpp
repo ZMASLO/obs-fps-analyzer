@@ -19,8 +19,7 @@ extern struct obs_source_info fps_overlay_source_info;
 // Dodaj enum do wyboru metody analizy
 typedef enum {
     ANALYZE_LAST_LINE = 0,
-    ANALYZE_DIFF = 1,
-    ANALYZE_MULTI_LINE = 2
+    ANALYZE_DIFF = 1
 } analyze_method_t;
 
 // Prototypes
@@ -47,6 +46,9 @@ struct fps_analyzer_filter {
     uint8_t *prev_frame;
     size_t prev_frame_size;
     int tearing_detected;
+    bool enable_tearing_detection;
+    uint8_t *prev_lines[3];
+    size_t prev_lines_size;
 };
 
 // Funkcja do liczenia różniących się bajtów
@@ -56,6 +58,66 @@ static size_t count_diff_bytes(const uint8_t *a, const uint8_t *b, size_t size) 
         if (a[i] != b[i]) ++diff;
     }
     return diff;
+}
+
+// Funkcja do wykrywania tearingu na podstawie 3 linii
+static bool detect_tearing(struct fps_analyzer_filter *filter, struct obs_source_frame *frame) {
+    if (!filter->enable_tearing_detection) return false;
+    
+    const int roi_width = frame->width;
+    uint8_t lines_luma[3*4096];
+    int lines[3] = {0, (int)frame->height/2, (int)frame->height-1};
+    
+    // Pobierz 3 linie (góra, środek, dół)
+    if (frame->format == VIDEO_FORMAT_NV12) {
+        for (int i = 0; i < 3; ++i) {
+            int y = lines[i];
+            memcpy(lines_luma + i*roi_width, frame->data[0] + y*frame->linesize[0], roi_width);
+        }
+    } else if (frame->format == VIDEO_FORMAT_YUY2) {
+        for (int i = 0; i < 3; ++i) {
+            int y = lines[i];
+            uint8_t *src = frame->data[0] + y*frame->linesize[0];
+            for (int x = 0; x < (int)roi_width; ++x) {
+                lines_luma[i*roi_width + x] = src[x*2];
+            }
+        }
+    } else {
+        return false;
+    }
+    
+    // Sprawdź czy mamy poprzednie linie
+    if (!filter->prev_lines[0] || filter->prev_lines_size != roi_width) {
+        // Inicjalizacja buforów dla poprzednich linii
+        for (int i = 0; i < 3; ++i) {
+            if (filter->prev_lines[i]) bfree(filter->prev_lines[i]);
+            filter->prev_lines[i] = (uint8_t*)bzalloc(roi_width);
+        }
+        filter->prev_lines_size = roi_width;
+        memcpy(filter->prev_lines[0], lines_luma, roi_width);
+        memcpy(filter->prev_lines[1], lines_luma + roi_width, roi_width);
+        memcpy(filter->prev_lines[2], lines_luma + 2*roi_width, roi_width);
+        return false;
+    }
+    
+    // Porównaj 3 linie osobno
+    int changed[3] = {0,0,0};
+    for (int i = 0; i < 3; ++i) {
+        size_t diff = count_diff_bytes(lines_luma + i*roi_width, filter->prev_lines[i], roi_width);
+        changed[i] = (diff > 0);
+    }
+    
+    // Zapisz aktualne linie
+    memcpy(filter->prev_lines[0], lines_luma, roi_width);
+    memcpy(filter->prev_lines[1], lines_luma + roi_width, roi_width);
+    memcpy(filter->prev_lines[2], lines_luma + 2*roi_width, roi_width);
+    
+    // Wykryj tearing: jeśli nie wszystkie linie się zmieniły jednocześnie
+    if ((changed[0] && changed[1] && changed[2]) || (!changed[0] && !changed[1] && !changed[2])) {
+        return false; // Brak tearingu
+    } else {
+        return true; // Wykryto tearing
+    }
 }
 
 static struct obs_source_frame *fps_analyzer_filter_video(void *data, struct obs_source_frame *frame)
@@ -71,11 +133,8 @@ static struct obs_source_frame *fps_analyzer_filter_video(void *data, struct obs
             // Pełna analiza: cała klatka
             roi_line = 0;
             roi_lines = frame->height;
-        } else if (filter->analyze_method == ANALYZE_MULTI_LINE) {
-            // Multi-line: analizujemy 3 linie: górną, środkową, dolną
-            roi_lines = 1;
         } else {
-            // CRC32: tylko ostatnia linia
+            // Last line: tylko ostatnia linia
             roi_line = frame->height - 1;
             roi_lines = 1;
         }
@@ -91,16 +150,6 @@ static struct obs_source_frame *fps_analyzer_filter_video(void *data, struct obs
                 }
                 roi_ptr = nv12_luma;
                 roi_size = copy_size;
-            } else if (filter->analyze_method == ANALYZE_MULTI_LINE) {
-                // 3 linie: góra, środek, dół
-                static uint8_t lines_luma[3*4096];
-                int lines[3] = {0, (int)frame->height/2, (int)frame->height-1};
-                for (int i = 0; i < 3; ++i) {
-                    int y = lines[i];
-                    memcpy(lines_luma + i*roi_width, frame->data[0] + y*frame->linesize[0], roi_width);
-                }
-                roi_ptr = lines_luma;
-                roi_size = 3 * roi_width;
             } else {
                 roi_ptr = frame->data[0] + roi_line * frame->linesize[0];
                 roi_size = roi_width * roi_lines;
@@ -120,18 +169,6 @@ static struct obs_source_frame *fps_analyzer_filter_video(void *data, struct obs
                 }
                 roi_ptr = yuy2_luma;
                 roi_size = copy_size;
-            } else if (filter->analyze_method == ANALYZE_MULTI_LINE) {
-                static uint8_t lines_luma[3*4096];
-                int lines[3] = {0, (int)frame->height/2, (int)frame->height-1};
-                for (int i = 0; i < 3; ++i) {
-                    int y = lines[i];
-                    uint8_t *src = frame->data[0] + y*frame->linesize[0];
-                    for (int x = 0; x < (int)roi_width; ++x) {
-                        lines_luma[i*roi_width + x] = src[x*2];
-                    }
-                }
-                roi_ptr = lines_luma;
-                roi_size = 3 * roi_width;
             } else {
                 roi_ptr = frame->data[0] + roi_line * frame->linesize[0];
                 static uint8_t yuy2_luma[4096];
@@ -177,27 +214,10 @@ static struct obs_source_frame *fps_analyzer_filter_video(void *data, struct obs
                 }
                 memcpy(filter->prev_frame, roi_ptr, roi_size);
             }
-        } else if (filter->analyze_method == ANALYZE_MULTI_LINE) {
-            // Porównujemy 3 linie osobno
-            static uint8_t prev_lines[3*4096] = {0};
-            int changed[3] = {0,0,0};
-            for (int i = 0; i < 3; ++i) {
-                size_t offset = i*roi_width;
-                size_t diff = count_diff_bytes(roi_ptr+offset, prev_lines+offset, roi_width);
-                changed[i] = (diff > 0);
-            }
-            // Zapisz aktualne linie
-            memcpy(prev_lines, roi_ptr, 3*roi_width);
-            if (changed[0] && changed[1] && changed[2]) {
-                is_unique = 1;
-            } else if (changed[0] || changed[1] || changed[2]) {
-                // Wykryto tearing
-                filter->tearing_detected = 1;
-            }
-            else{
-                filter->tearing_detected = 0;
-            }
         }
+        
+        // Wykrywanie tearingu (niezależne od metody analizy)
+        filter->tearing_detected = detect_tearing(filter, frame);
         filter->has_prev = true;
         // --- rolling window i reszta logiki bez zmian ---
         if (is_unique) {
@@ -292,6 +312,12 @@ static void fps_analyzer_video_tick(void *data, float seconds)
 static void fps_analyzer_destroy(void *data)
 {
     struct fps_analyzer_filter *filter = (struct fps_analyzer_filter *)data;
+    if (filter) {
+        if (filter->prev_frame) bfree(filter->prev_frame);
+        for (int i = 0; i < 3; ++i) {
+            if (filter->prev_lines[i]) bfree(filter->prev_lines[i]);
+        }
+    }
     bfree(data);
 }
 
@@ -326,6 +352,11 @@ static void *fps_analyzer_create(obs_data_t *settings, obs_source_t *context)
     filter->analyze_method = (analyze_method_t)obs_data_get_int(settings, "analyze_method");
     filter->sensitivity = obs_data_get_double(settings, "sensitivity");
     filter->tearing_detected = 0;
+    filter->enable_tearing_detection = obs_data_get_bool(settings, "enable_tearing_detection");
+    filter->prev_lines[0] = NULL;
+    filter->prev_lines[1] = NULL;
+    filter->prev_lines[2] = NULL;
+    filter->prev_lines_size = 0;
     return filter;
 }
 
@@ -350,6 +381,7 @@ static obs_properties_t *fps_analyzer_properties(void *data)
     obs_properties_add_path(props, "output_path", "FPS Output file",
                             OBS_PATH_FILE_SAVE, "Text File (*.txt)", NULL);
     obs_properties_add_bool(props, "clear_csv_on_start", "Clear CSV file on start (default: yes)");
+    obs_properties_add_bool(props, "enable_tearing_detection", "Tearing detection (default: yes)");
     obs_properties_add_text(
         props,
         "sensitivity_info",
@@ -368,12 +400,11 @@ static obs_properties_t *fps_analyzer_properties(void *data)
         OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
     obs_property_list_add_int(method, "Last line diff (pixel analysis)", ANALYZE_LAST_LINE);
     obs_property_list_add_int(method, "Full frame diff (all lines)", ANALYZE_DIFF);
-    obs_property_list_add_int(method, "Multi-line (tearing detect)", ANALYZE_MULTI_LINE);
     // Slider do progu czułości
     obs_property_t *slider = obs_properties_add_float_slider(props, "sensitivity", "Sensitivity threshold (%)", 0.0, 5.0, 0.1);
     // Ustaw widoczność na starcie
     int method_val = data ? ((struct fps_analyzer_filter*)data)->analyze_method : ANALYZE_LAST_LINE;
-    obs_property_set_visible(slider, method_val == ANALYZE_DIFF || method_val == ANALYZE_LAST_LINE || method_val == ANALYZE_MULTI_LINE);
+    obs_property_set_visible(slider, method_val == ANALYZE_DIFF || method_val == ANALYZE_LAST_LINE);
     // Callback na dropdownie
     obs_property_set_modified_callback(method, analyze_method_modified);
     return props;
@@ -396,6 +427,7 @@ static void fps_analyzer_update(void *data, obs_data_t *settings)
     if (filter->update_interval <= 0.0)
         filter->update_interval = 1.0;
     filter->clear_csv_on_start = obs_data_get_bool(settings, "clear_csv_on_start");
+    filter->enable_tearing_detection = obs_data_get_bool(settings, "enable_tearing_detection");
     filter->analyze_method = (analyze_method_t)obs_data_get_int(settings, "analyze_method");
     filter->sensitivity = obs_data_get_double(settings, "sensitivity");
 }
@@ -436,6 +468,7 @@ static void keep_last_n_lines(const char *csv_path, int n) {
 static void fps_analyzer_get_defaults(obs_data_t *settings)
 {
     obs_data_set_default_bool(settings, "clear_csv_on_start", true);
+    obs_data_set_default_bool(settings, "enable_tearing_detection", true);
     obs_data_set_default_int(settings, "analyze_method", ANALYZE_LAST_LINE);
     obs_data_set_default_double(settings, "sensitivity", 0.1);
 }
