@@ -1,5 +1,4 @@
 #include <obs-module.h>
-#include <graphics/graphics.h>
 #include <util/platform.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -23,13 +22,12 @@ typedef enum {
 } analyze_method_t;
 
 // Prototypes
-static void clear_csv_file(const char *csv_path);
 static void keep_last_n_lines(const char *csv_path, int n);
+static void build_txt_path(const char *output_path, char *txt_path, size_t txt_path_size);
+static void build_csv_path(const char *output_path, char *csv_path, size_t csv_path_size);
 
 struct fps_analyzer_filter {
     obs_source_t *context;
-    uint64_t last_frame_time;
-    bool has_prev;
     char output_path[512];
     double update_interval;
     uint64_t last_unique_frame_time;
@@ -63,6 +61,23 @@ static size_t count_diff_bytes(const uint8_t *a, const uint8_t *b, size_t size) 
     return diff;
 }
 
+// Funkcja do inicjalizacji buforów dla poprzednich linii
+static void init_prev_lines_buffers(struct fps_analyzer_filter *filter, int roi_width) {
+    for (int i = 0; i < 3; ++i) {
+        if (filter->prev_lines[i]) bfree(filter->prev_lines[i]);
+        filter->prev_lines[i] = (uint8_t*)bzalloc(roi_width);
+    }
+    filter->prev_lines_size = roi_width;
+}
+
+// Funkcja do inicjalizacji bufora poprzedniej klatki
+static void init_prev_frame_buffer(struct fps_analyzer_filter *filter, size_t roi_size, const uint8_t *roi_ptr) {
+    if (filter->prev_frame) bfree(filter->prev_frame);
+    filter->prev_frame = (uint8_t*)bzalloc(roi_size);
+    filter->prev_frame_size = roi_size;
+    memcpy(filter->prev_frame, roi_ptr, roi_size);
+}
+
 // Funkcja do wykrywania tearingu na podstawie 3 linii
 static bool detect_tearing(struct fps_analyzer_filter *filter, struct obs_source_frame *frame) {
     if (!filter->enable_tearing_detection) return false;
@@ -91,12 +106,7 @@ static bool detect_tearing(struct fps_analyzer_filter *filter, struct obs_source
     
     // Sprawdź czy mamy poprzednie linie
     if (!filter->prev_lines[0] || filter->prev_lines_size != roi_width) {
-        // Inicjalizacja buforów dla poprzednich linii
-        for (int i = 0; i < 3; ++i) {
-            if (filter->prev_lines[i]) bfree(filter->prev_lines[i]);
-            filter->prev_lines[i] = (uint8_t*)bzalloc(roi_width);
-        }
-        filter->prev_lines_size = roi_width;
+        init_prev_lines_buffers(filter, roi_width);
         memcpy(filter->prev_lines[0], lines_luma, roi_width);
         memcpy(filter->prev_lines[1], lines_luma + roi_width, roi_width);
         memcpy(filter->prev_lines[2], lines_luma + 2*roi_width, roi_width);
@@ -203,42 +213,21 @@ static struct obs_source_frame *fps_analyzer_filter_video(void *data, struct obs
         } else {
             return frame;
         }
-        if (filter->analyze_method == ANALYZE_LAST_LINE) {
-            // Analiza różnic pikseli w ostatniej linii
-            if (!filter->prev_frame || filter->prev_frame_size != roi_size) {
-                if (filter->prev_frame) bfree(filter->prev_frame);
-                filter->prev_frame = (uint8_t*)bzalloc(roi_size);
-                filter->prev_frame_size = roi_size;
-                memcpy(filter->prev_frame, roi_ptr, roi_size);
+        // Wspólna logika analizy dla obu metod
+        if (!filter->prev_frame || filter->prev_frame_size != roi_size) {
+            init_prev_frame_buffer(filter, roi_size, roi_ptr);
+            is_unique = 1;
+        } else {
+            size_t diff = count_diff_bytes(roi_ptr, filter->prev_frame, roi_size);
+            double percent = (roi_size > 0) ? (100.0 * diff / roi_size) : 0.0;
+            if (percent >= filter->sensitivity) {
                 is_unique = 1;
-            } else {
-                size_t diff = count_diff_bytes(roi_ptr, filter->prev_frame, roi_size);
-                double percent = (roi_size > 0) ? (100.0 * diff / roi_size) : 0.0;
-                if (percent >= filter->sensitivity) {
-                    is_unique = 1;
-                }
-                memcpy(filter->prev_frame, roi_ptr, roi_size);
             }
-        } else if (filter->analyze_method == ANALYZE_DIFF) {
-            if (!filter->prev_frame || filter->prev_frame_size != roi_size) {
-                if (filter->prev_frame) bfree(filter->prev_frame);
-                filter->prev_frame = (uint8_t*)bzalloc(roi_size);
-                filter->prev_frame_size = roi_size;
-                memcpy(filter->prev_frame, roi_ptr, roi_size);
-                is_unique = 1;
-            } else {
-                size_t diff = count_diff_bytes(roi_ptr, filter->prev_frame, roi_size);
-                double percent = (roi_size > 0) ? (100.0 * diff / roi_size) : 0.0;
-                if (percent >= filter->sensitivity) {
-                    is_unique = 1;
-                }
-                memcpy(filter->prev_frame, roi_ptr, roi_size);
-            }
+            memcpy(filter->prev_frame, roi_ptr, roi_size);
         }
         
         // Wykrywanie tearingu (niezależne od metody analizy)
         filter->tearing_detected = detect_tearing(filter, frame);
-        filter->has_prev = true;
         // --- rolling window i reszta logiki bez zmian ---
         if (is_unique) {
             uint64_t now = os_gettime_ns();
@@ -285,18 +274,10 @@ static void fps_analyzer_video_tick(void *data, float seconds)
     // zaokrąglenie do liczby całkowitej po to żeby nie mieć FPS z przecinkami
     int fps_smooth = (int)round(fps);
     double frametime_ms = avg_frametime;
+    
+    // Zapisz do pliku TXT
     char path[512];
-    if (filter->output_path[0]) {
-        strncpy(path, filter->output_path, sizeof(path));
-        path[sizeof(path)-1] = '\0';
-        if (strlen(path) < 4 || strcasecmp(path + strlen(path) - 4, ".txt") != 0) {
-            if (strlen(path) + 4 < sizeof(path)) {
-                strcat(path, ".txt");
-            }
-        }
-    } else {
-        strcpy(path, "fps.txt");
-    }
+    build_txt_path(filter->output_path, path, sizeof(path));
     FILE *f = fopen(path, "w");
     if (f) {
         if (filter->tearing_detected) {
@@ -307,19 +288,10 @@ static void fps_analyzer_video_tick(void *data, float seconds)
         }
         fclose(f);
     }
+    
+    // Zapisz do pliku CSV
     char csv_path[512];
-    if (filter->output_path[0]) {
-        strncpy(csv_path, filter->output_path, sizeof(csv_path));
-        csv_path[sizeof(csv_path)-1] = '\0';
-        char *dot = strrchr(csv_path, '.');
-        if (dot) {
-            strcpy(dot, ".csv");
-        } else {
-            strcat(csv_path, ".csv");
-        }
-    } else {
-        strcpy(csv_path, "fps.csv");
-    }
+    build_csv_path(filter->output_path, csv_path, sizeof(csv_path));
     FILE *csv = fopen(csv_path, "a");
     if (csv) {
         time_t t = time(NULL);
@@ -345,8 +317,6 @@ static void *fps_analyzer_create(obs_data_t *settings, obs_source_t *context)
 {
     struct fps_analyzer_filter *filter = (struct fps_analyzer_filter *)bzalloc(sizeof(struct fps_analyzer_filter));
     filter->context = context;
-    filter->last_frame_time = 0;
-    filter->has_prev = false;
     filter->output_path[0] = '\0';
     filter->update_interval = 1.0;
     filter->last_unique_frame_time = 0;
@@ -355,11 +325,6 @@ static void *fps_analyzer_create(obs_data_t *settings, obs_source_t *context)
     if (path) {
         strncpy(filter->output_path, path, sizeof(filter->output_path));
         filter->output_path[sizeof(filter->output_path)-1] = '\0';
-        if (strlen(filter->output_path) < 4 || strcasecmp(filter->output_path + strlen(filter->output_path) - 4, ".txt") != 0) {
-            if (strlen(filter->output_path) + 4 < sizeof(filter->output_path)) {
-                strcat(filter->output_path, ".txt");
-            }
-        }
     }
     filter->update_interval = obs_data_get_double(settings, "update_interval");
     if (filter->update_interval <= 0.0)
@@ -443,11 +408,6 @@ static void fps_analyzer_update(void *data, obs_data_t *settings)
     if (path) {
         strncpy(filter->output_path, path, sizeof(filter->output_path));
         filter->output_path[sizeof(filter->output_path)-1] = '\0';
-        if (strlen(filter->output_path) < 4 || strcasecmp(filter->output_path + strlen(filter->output_path) - 4, ".txt") != 0) {
-            if (strlen(filter->output_path) + 4 < sizeof(filter->output_path)) {
-                strcat(filter->output_path, ".txt");
-            }
-        }
     }
     filter->update_interval = obs_data_get_double(settings, "update_interval");
     if (filter->update_interval <= 0.0)
@@ -459,9 +419,37 @@ static void fps_analyzer_update(void *data, obs_data_t *settings)
     filter->sensitivity = obs_data_get_double(settings, "sensitivity");
 }
 
-static void clear_csv_file(const char *csv_path) {
-    FILE *f = fopen(csv_path, "w");
-    if (f) fclose(f);
+
+
+// Funkcja do budowania ścieżki pliku TXT
+static void build_txt_path(const char *output_path, char *txt_path, size_t txt_path_size) {
+    if (output_path[0]) {
+        strncpy(txt_path, output_path, txt_path_size);
+        txt_path[txt_path_size-1] = '\0';
+        if (strlen(txt_path) < 4 || strcasecmp(txt_path + strlen(txt_path) - 4, ".txt") != 0) {
+            if (strlen(txt_path) + 4 < txt_path_size) {
+                strcat(txt_path, ".txt");
+            }
+        }
+    } else {
+        strcpy(txt_path, "fps.txt");
+    }
+}
+
+// Funkcja do budowania ścieżki pliku CSV
+static void build_csv_path(const char *output_path, char *csv_path, size_t csv_path_size) {
+    if (output_path[0]) {
+        strncpy(csv_path, output_path, csv_path_size);
+        csv_path[csv_path_size-1] = '\0';
+        char *dot = strrchr(csv_path, '.');
+        if (dot) {
+            strcpy(dot, ".csv");
+        } else {
+            strcat(csv_path, ".csv");
+        }
+    } else {
+        strcpy(csv_path, "fps.csv");
+    }
 }
 
 static void keep_last_n_lines(const char *csv_path, int n) {
