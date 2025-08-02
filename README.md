@@ -30,7 +30,7 @@ Copy `fps-analyzer.dll` to `C:\Program Files\obs-studio\obs-plugins\64bit`
 
 ### Basic Configuration:
 1. **Add filter** to source (e.g., Elgato HD60 X)
-2. **Select analysis method** (recommended: CRC32 for most cases)
+2. **Select analysis method** (recommended: Last line diff for most cases)
 3. **Set output file path**
 4. **Configure update interval** (default: 1 second)
 5. add **Text (GDI+)**: Use TXT file as text source
@@ -39,11 +39,12 @@ Copy `fps-analyzer.dll` to `C:\Program Files\obs-studio\obs-plugins\64bit`
 
 The plugin offers three different image analysis methods:
 
-### 1. CRC32 (last line only) - **Default**
+### 1. Last line diff (pixel analysis) - **Default**
 - **Speed**: Fastest
 - **Accuracy**: High for stable sources
 - **Use case**: Ideal for most games with V-Sync
-- **Description**: Calculates CRC32 from only the last line of the image (luminance)
+- **Description**: Analyzes pixel differences in the last line of the image (luminance)
+- **Settings**: "Sensitivity threshold" slider (0.0-5.0%)
 
 ### 2. Full frame analysis (all lines)
 - **Speed**: Medium
@@ -76,7 +77,7 @@ The plugin offers three different image analysis methods:
 - Try "Full frame diff" method
 
 ### Unstable FPS readings:
-- Use CRC32 method for stable sources
+- Use Last line diff method for stable sources
 - Check if V-Sync is enabled
 - Increase update interval
 

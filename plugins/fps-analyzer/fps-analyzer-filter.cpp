@@ -1,7 +1,6 @@
 #include <obs-module.h>
 #include <graphics/graphics.h>
 #include <util/platform.h>
-#include <util/crc32.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -19,7 +18,7 @@ extern struct obs_source_info fps_overlay_source_info;
 
 // Dodaj enum do wyboru metody analizy
 typedef enum {
-    ANALYZE_CRC32 = 0,
+    ANALYZE_LAST_LINE = 0,
     ANALYZE_DIFF = 1,
     ANALYZE_MULTI_LINE = 2
 } analyze_method_t;
@@ -39,7 +38,6 @@ struct fps_analyzer_filter {
     uint64_t rolling_times[ROLLING_MAX];
     int rolling_count;
     int rolling_start;
-    uint32_t prev_line_crc;
     uint64_t last_write_time;
     double frametime_history[FRAMETIME_HISTORY];
     int frametime_pos;
@@ -148,16 +146,22 @@ static struct obs_source_frame *fps_analyzer_filter_video(void *data, struct obs
         } else {
             return frame;
         }
-        if (filter->analyze_method == ANALYZE_CRC32) {
-            uint32_t crc = calc_crc32(0, roi_ptr, roi_size);
-            if (filter->has_prev) {
-                if (crc != filter->prev_line_crc) {
+        if (filter->analyze_method == ANALYZE_LAST_LINE) {
+            // Analiza różnic pikseli w ostatniej linii
+            if (!filter->prev_frame || filter->prev_frame_size != roi_size) {
+                if (filter->prev_frame) bfree(filter->prev_frame);
+                filter->prev_frame = (uint8_t*)bzalloc(roi_size);
+                filter->prev_frame_size = roi_size;
+                memcpy(filter->prev_frame, roi_ptr, roi_size);
+                is_unique = 1;
+            } else {
+                size_t diff = count_diff_bytes(roi_ptr, filter->prev_frame, roi_size);
+                double percent = (roi_size > 0) ? (100.0 * diff / roi_size) : 0.0;
+                if (percent >= filter->sensitivity) {
                     is_unique = 1;
                 }
-            } else {
-                is_unique = 1;
+                memcpy(filter->prev_frame, roi_ptr, roi_size);
             }
-            filter->prev_line_crc = crc;
         } else if (filter->analyze_method == ANALYZE_DIFF) {
             if (!filter->prev_frame || filter->prev_frame_size != roi_size) {
                 if (filter->prev_frame) bfree(filter->prev_frame);
@@ -316,7 +320,6 @@ static void *fps_analyzer_create(obs_data_t *settings, obs_source_t *context)
         filter->update_interval = 1.0;
     filter->rolling_count = 0;
     filter->rolling_start = 0;
-    filter->prev_line_crc = 0;
     filter->last_write_time = 0;
     filter->frametime_pos = 0;
     filter->frametime_count = 0;
@@ -329,7 +332,7 @@ static void *fps_analyzer_create(obs_data_t *settings, obs_source_t *context)
 static const char *fps_analyzer_get_name(void *unused)
 {
     UNUSED_PARAMETER(unused);
-    return "FPS Analyzer 0.1";
+    return "FPS Analyzer 0.2";
 }
 
 // Callback do dynamicznego włączania/wyłączania slidera sensitivity
@@ -337,7 +340,7 @@ static bool analyze_method_modified(obs_properties_t *props, obs_property_t *p, 
 {
     int method = (int)obs_data_get_int(settings, "analyze_method");
     obs_property_t *slider = obs_properties_get(props, "sensitivity");
-    obs_property_set_visible(slider, method == ANALYZE_DIFF);
+    obs_property_set_visible(slider, method == ANALYZE_DIFF || method == ANALYZE_LAST_LINE);
     return true;
 }
 
@@ -363,14 +366,14 @@ static obs_properties_t *fps_analyzer_properties(void *data)
     // Dropdown do wyboru metody analizy
     obs_property_t *method = obs_properties_add_list(props, "analyze_method", "Analysis method",
         OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-    obs_property_list_add_int(method, "CRC32 (only last line)", ANALYZE_CRC32);
+    obs_property_list_add_int(method, "Last line diff (pixel analysis)", ANALYZE_LAST_LINE);
     obs_property_list_add_int(method, "Full frame diff (all lines)", ANALYZE_DIFF);
     obs_property_list_add_int(method, "Multi-line (tearing detect)", ANALYZE_MULTI_LINE);
     // Slider do progu czułości
     obs_property_t *slider = obs_properties_add_float_slider(props, "sensitivity", "Sensitivity threshold (%)", 0.0, 5.0, 0.1);
     // Ustaw widoczność na starcie
-    int method_val = data ? ((struct fps_analyzer_filter*)data)->analyze_method : ANALYZE_CRC32;
-    obs_property_set_visible(slider, method_val == ANALYZE_DIFF || method_val == ANALYZE_MULTI_LINE);
+    int method_val = data ? ((struct fps_analyzer_filter*)data)->analyze_method : ANALYZE_LAST_LINE;
+    obs_property_set_visible(slider, method_val == ANALYZE_DIFF || method_val == ANALYZE_LAST_LINE || method_val == ANALYZE_MULTI_LINE);
     // Callback na dropdownie
     obs_property_set_modified_callback(method, analyze_method_modified);
     return props;
@@ -433,7 +436,7 @@ static void keep_last_n_lines(const char *csv_path, int n) {
 static void fps_analyzer_get_defaults(obs_data_t *settings)
 {
     obs_data_set_default_bool(settings, "clear_csv_on_start", true);
-    obs_data_set_default_int(settings, "analyze_method", ANALYZE_CRC32);
+    obs_data_set_default_int(settings, "analyze_method", ANALYZE_LAST_LINE);
     obs_data_set_default_double(settings, "sensitivity", 0.1);
 }
 
