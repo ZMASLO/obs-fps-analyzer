@@ -17,7 +17,7 @@ struct fps_overlay_source {
 static const char *fps_overlay_get_name(void *unused)
 {
     UNUSED_PARAMETER(unused);
-    return "FPS Overlay";
+    return "FPS Overlay (not working yet)";
 }
 
 static void *fps_overlay_create(obs_data_t *settings, obs_source_t *source)

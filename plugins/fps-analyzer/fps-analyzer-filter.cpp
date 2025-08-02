@@ -329,7 +329,7 @@ static void *fps_analyzer_create(obs_data_t *settings, obs_source_t *context)
 static const char *fps_analyzer_get_name(void *unused)
 {
     UNUSED_PARAMETER(unused);
-    return "FPS Analyzer";
+    return "FPS Analyzer 0.1";
 }
 
 // Callback do dynamicznego włączania/wyłączania slidera sensitivity
