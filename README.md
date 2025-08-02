@@ -57,7 +57,10 @@ The plugin offers two different image analysis methods:
 ### Tearing Detection:
 - **Independent feature**: Works with any analysis method
 - **Description**: Detects screen tearing by analyzing 3 lines (top, middle, bottom)
-- **Settings**: "Enable tearing detection" checkbox (default: enabled)
+- **Settings**: 
+  - "Enable tearing detection" checkbox (default: enabled)
+  - "Tearing sensitivity threshold" slider (0.1-10.0%, default: 1.0%)
+- **Algorithm**: Uses history of 5 frames to reduce false positives
 - **Output**: Adds warning to TXT file when tearing is detected
 
 ### Output Format:

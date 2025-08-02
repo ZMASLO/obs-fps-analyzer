@@ -47,8 +47,11 @@ struct fps_analyzer_filter {
     size_t prev_frame_size;
     int tearing_detected;
     bool enable_tearing_detection;
+    double tearing_sensitivity;
     uint8_t *prev_lines[3];
     size_t prev_lines_size;
+    int tearing_history[5];
+    int tearing_history_pos;
 };
 
 // Funkcja do liczenia różniących się bajtów
@@ -100,11 +103,11 @@ static bool detect_tearing(struct fps_analyzer_filter *filter, struct obs_source
         return false;
     }
     
-    // Porównaj 3 linie osobno
-    int changed[3] = {0,0,0};
+    // Porównaj 3 linie osobno z progiem czułości
+    double change_percent[3] = {0.0, 0.0, 0.0};
     for (int i = 0; i < 3; ++i) {
         size_t diff = count_diff_bytes(lines_luma + i*roi_width, filter->prev_lines[i], roi_width);
-        changed[i] = (diff > 0);
+        change_percent[i] = (roi_width > 0) ? (100.0 * diff / roi_width) : 0.0;
     }
     
     // Zapisz aktualne linie
@@ -112,12 +115,29 @@ static bool detect_tearing(struct fps_analyzer_filter *filter, struct obs_source
     memcpy(filter->prev_lines[1], lines_luma + roi_width, roi_width);
     memcpy(filter->prev_lines[2], lines_luma + 2*roi_width, roi_width);
     
-    // Wykryj tearing: jeśli nie wszystkie linie się zmieniły jednocześnie
-    if ((changed[0] && changed[1] && changed[2]) || (!changed[0] && !changed[1] && !changed[2])) {
-        return false; // Brak tearingu
-    } else {
-        return true; // Wykryto tearing
+    // Ulepszona logika wykrywania tearingu
+    bool significant_change[3] = {false, false, false};
+    for (int i = 0; i < 3; ++i) {
+        significant_change[i] = (change_percent[i] >= filter->tearing_sensitivity);
     }
+    
+    // Wykryj tearing: jeśli nie wszystkie linie się zmieniły jednocześnie
+    bool all_changed = significant_change[0] && significant_change[1] && significant_change[2];
+    bool none_changed = !significant_change[0] && !significant_change[1] && !significant_change[2];
+    
+    bool tearing_detected = !(all_changed || none_changed);
+    
+    // Dodaj do historii tearingu
+    filter->tearing_history[filter->tearing_history_pos] = tearing_detected ? 1 : 0;
+    filter->tearing_history_pos = (filter->tearing_history_pos + 1) % 5;
+    
+    // Sprawdź czy w ostatnich 5 klatkach było więcej niż 2 wykrycia tearingu
+    int recent_tears = 0;
+    for (int i = 0; i < 5; ++i) {
+        recent_tears += filter->tearing_history[i];
+    }
+    
+    return (recent_tears >= 2); // Zwróć true tylko jeśli w ostatnich 5 klatkach było co najmniej 2 wykrycia
 }
 
 static struct obs_source_frame *fps_analyzer_filter_video(void *data, struct obs_source_frame *frame)
@@ -353,10 +373,15 @@ static void *fps_analyzer_create(obs_data_t *settings, obs_source_t *context)
     filter->sensitivity = obs_data_get_double(settings, "sensitivity");
     filter->tearing_detected = 0;
     filter->enable_tearing_detection = obs_data_get_bool(settings, "enable_tearing_detection");
+    filter->tearing_sensitivity = obs_data_get_double(settings, "tearing_sensitivity");
     filter->prev_lines[0] = NULL;
     filter->prev_lines[1] = NULL;
     filter->prev_lines[2] = NULL;
     filter->prev_lines_size = 0;
+    filter->tearing_history_pos = 0;
+    for (int i = 0; i < 5; ++i) {
+        filter->tearing_history[i] = 0;
+    }
     return filter;
 }
 
@@ -382,6 +407,7 @@ static obs_properties_t *fps_analyzer_properties(void *data)
                             OBS_PATH_FILE_SAVE, "Text File (*.txt)", NULL);
     obs_properties_add_bool(props, "clear_csv_on_start", "Clear CSV file on start (default: yes)");
     obs_properties_add_bool(props, "enable_tearing_detection", "Tearing detection (default: yes)");
+    obs_properties_add_float_slider(props, "tearing_sensitivity", "Tearing sensitivity threshold (%)", 0.1, 10.0, 0.1);
     obs_properties_add_text(
         props,
         "sensitivity_info",
@@ -428,6 +454,7 @@ static void fps_analyzer_update(void *data, obs_data_t *settings)
         filter->update_interval = 1.0;
     filter->clear_csv_on_start = obs_data_get_bool(settings, "clear_csv_on_start");
     filter->enable_tearing_detection = obs_data_get_bool(settings, "enable_tearing_detection");
+    filter->tearing_sensitivity = obs_data_get_double(settings, "tearing_sensitivity");
     filter->analyze_method = (analyze_method_t)obs_data_get_int(settings, "analyze_method");
     filter->sensitivity = obs_data_get_double(settings, "sensitivity");
 }
@@ -469,6 +496,7 @@ static void fps_analyzer_get_defaults(obs_data_t *settings)
 {
     obs_data_set_default_bool(settings, "clear_csv_on_start", true);
     obs_data_set_default_bool(settings, "enable_tearing_detection", true);
+    obs_data_set_default_double(settings, "tearing_sensitivity", 1.0);
     obs_data_set_default_int(settings, "analyze_method", ANALYZE_LAST_LINE);
     obs_data_set_default_double(settings, "sensitivity", 0.1);
 }
