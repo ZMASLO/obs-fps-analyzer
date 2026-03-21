@@ -9,7 +9,7 @@ on:
 
 env:
   OBS_VERSION: '31.0.0'
-  OBS_DEPS_VERSION: '2024-12-02'
+  OBS_DEPS_VERSION: '2024-09-12'
 
 jobs:
   build:
