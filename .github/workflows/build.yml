@@ -112,23 +112,16 @@ jobs:
           name: fps-analyzer-dll
           path: release/fps-analyzer.dll
 
-      - name: Create release zip
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          cd release
-          7z a ../fps-analyzer-${{ github.ref_name }}.zip fps-analyzer.dll
-
       - name: Create draft release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           draft: true
-          files: fps-analyzer-${{ github.ref_name }}.zip
+          files: release/fps-analyzer.dll
           body: |
             ## obs-fps-analyzer ${{ github.ref_name }}
 
             ### Installation
-            1. Download `fps-analyzer-${{ github.ref_name }}.zip`
-            2. Extract `fps-analyzer.dll`
-            3. Copy to `C:\Program Files\obs-studio\obs-plugins\64bit`
-            4. Restart OBS Studio
+            1. Download `fps-analyzer.dll`
+            2. Copy to `C:\Program Files\obs-studio\obs-plugins\64bit`
+            3. Restart OBS Studio
