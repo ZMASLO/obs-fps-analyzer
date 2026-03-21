@@ -23,10 +23,14 @@ build/
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
+CMakeUserPresets.json
 Makefile
 
 # Visual Studio Code
 .vscode/
+
+# Claude Code
+.claude/
 
 # OS
 .DS_Store

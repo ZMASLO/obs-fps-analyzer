@@ -67,6 +67,33 @@ The plugin offers two different image analysis methods:
 - **TXT**: `FPS: 60 | Frame Time: 16.67ms | Last Frame Time: 16.50ms`
 - **CSV**: `timestamp,fps,frametime_ms` (or with additional tearing data)
 
+## Building from source
+
+### Requirements
+- CMake 3.16+
+- Visual Studio 2022 (or Build Tools)
+- OBS Studio SDK (headers + import library)
+
+### Local build
+
+```bash
+# 1. Build or obtain OBS SDK (headers + obs.lib)
+# 2. Configure with CMAKE_PREFIX_PATH pointing to the SDK
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_PREFIX_PATH="path/to/obs-sdk"
+cmake --build build --config Release
+```
+
+The output `fps-analyzer.dll` will be in `build/plugins/fps-analyzer/Release/`.
+
+### CI/CD
+
+GitHub Actions automatically builds the plugin on every push to `main` and on pull requests. To create a release:
+
+1. Update the version in the root `CMakeLists.txt`
+2. Commit and tag: `git tag v0.3.0`
+3. Push with tag: `git push origin main --tags`
+4. A draft GitHub Release will be created with the DLL zip
+
 ## Troubleshooting:
 
 ### How to check if it works correctly?
