@@ -11,6 +11,10 @@ env:
   OBS_VERSION: '31.0.0'
   OBS_DEPS_VERSION: '2024-09-12'
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   build:
     runs-on: windows-2022
@@ -24,97 +28,70 @@ jobs:
         uses: actions/cache@v4
         with:
           path: obs-sdk
-          key: obs-sdk-${{ env.OBS_VERSION }}-${{ env.OBS_DEPS_VERSION }}
+          key: obs-sdk-${{ env.OBS_VERSION }}-${{ env.OBS_DEPS_VERSION }}-v2
 
-      - name: Download OBS deps
+      - name: Setup OBS SDK
         if: steps.cache-obs.outputs.cache-hit != 'true'
         run: |
-          curl -L -o obs-deps.zip "https://github.com/obsproject/obs-deps/releases/download/${{ env.OBS_DEPS_VERSION }}/windows-deps-x64-${{ env.OBS_DEPS_VERSION }}.zip"
-          mkdir obs-deps
-          cd obs-deps && unzip ../obs-deps.zip
+          # Download OBS deps (FFmpeg, jansson, zlib, etc.)
+          curl -L -o obs-deps.zip \
+            "https://github.com/obsproject/obs-deps/releases/download/${{ env.OBS_DEPS_VERSION }}/windows-deps-${{ env.OBS_DEPS_VERSION }}-x64.zip"
+          7z x obs-deps.zip -oobs-deps
 
-      - name: Download OBS source
-        if: steps.cache-obs.outputs.cache-hit != 'true'
-        run: |
-          curl -L -o obs-studio.tar.gz "https://github.com/obsproject/obs-studio/archive/refs/tags/${{ env.OBS_VERSION }}.tar.gz"
-          tar xzf obs-studio.tar.gz
+          # Clone OBS source with submodules (shallow to save time)
+          git clone --recursive --shallow-submodules --depth 1 \
+            --branch ${{ env.OBS_VERSION }} \
+            https://github.com/obsproject/obs-studio.git obs-src
 
-      - name: Build libobs
-        if: steps.cache-obs.outputs.cache-hit != 'true'
-        run: |
-          cmake -S obs-studio-${{ env.OBS_VERSION }} -B obs-build \
+          # Configure OBS - only what's needed for libobs
+          cmake -S obs-src -B obs-build \
             -G "Visual Studio 17 2022" -A x64 \
             -DCMAKE_PREFIX_PATH="${{ github.workspace }}/obs-deps" \
             -DENABLE_PLUGINS=OFF \
-            -DENABLE_FRONTEND=OFF \
-            -DENABLE_SCRIPTING=OFF \
-            -DENABLE_UI=OFF
+            -DENABLE_UI=OFF \
+            -DENABLE_SCRIPTING=OFF
+
+          # Build only libobs
           cmake --build obs-build --config Release --target libobs
 
-      - name: Install OBS SDK
-        if: steps.cache-obs.outputs.cache-hit != 'true'
-        run: |
-          cmake --install obs-build --prefix "${{ github.workspace }}/obs-sdk" --component Development --config Release || true
-          cmake --install obs-build --prefix "${{ github.workspace }}/obs-sdk" --config Release || true
+          # Assemble SDK: headers + import library + cmake config
+          mkdir -p obs-sdk/include obs-sdk/lib obs-sdk/lib/cmake/libobs
 
-          # Verify key files exist
-          echo "=== Checking installed SDK ==="
-          find obs-sdk -name "libobs.lib" -o -name "obs-config.h" -o -name "libobsConfig.cmake" 2>/dev/null || true
-          ls -la obs-sdk/ || true
+          # Copy headers from source
+          cp obs-src/libobs/*.h obs-sdk/include/
+          for dir in util callback media-io graphics; do
+            mkdir -p "obs-sdk/include/$dir"
+            cp obs-src/libobs/$dir/*.h "obs-sdk/include/$dir/" 2>/dev/null || true
+          done
 
-          # If cmake config not generated, create a minimal one
-          if [ ! -f "obs-sdk/lib/cmake/libobs/libobsConfig.cmake" ]; then
-            echo "Creating manual SDK layout..."
+          # Copy generated config header
+          find obs-build -name "obs-config.h" -exec cp {} obs-sdk/include/ \;
 
-            # Copy headers from source
-            mkdir -p obs-sdk/include
-            cp -r obs-studio-${{ env.OBS_VERSION }}/libobs/*.h obs-sdk/include/ 2>/dev/null || true
-            mkdir -p obs-sdk/include/util
-            cp -r obs-studio-${{ env.OBS_VERSION }}/libobs/util/*.h obs-sdk/include/util/ 2>/dev/null || true
-            mkdir -p obs-sdk/include/callback
-            cp -r obs-studio-${{ env.OBS_VERSION }}/libobs/callback/*.h obs-sdk/include/callback/ 2>/dev/null || true
-            mkdir -p obs-sdk/include/media-io
-            cp -r obs-studio-${{ env.OBS_VERSION }}/libobs/media-io/*.h obs-sdk/include/media-io/ 2>/dev/null || true
-            mkdir -p obs-sdk/include/graphics
-            cp -r obs-studio-${{ env.OBS_VERSION }}/libobs/graphics/*.h obs-sdk/include/graphics/ 2>/dev/null || true
+          # Copy import library
+          find obs-build -name "obs.lib" -exec cp {} obs-sdk/lib/ \;
 
-            # Copy generated config header
-            cp obs-build/config/*.h obs-sdk/include/ 2>/dev/null || true
-            find obs-build -name "obs-config.h" -exec cp {} obs-sdk/include/ \; 2>/dev/null || true
-            find obs-build -name "obsconfig.h" -exec cp {} obs-sdk/include/ \; 2>/dev/null || true
+          # Verify import library was found
+          ls -la obs-sdk/lib/obs.lib
 
-            # Copy import library
-            mkdir -p obs-sdk/lib
-            find obs-build -name "obs.lib" -exec cp {} obs-sdk/lib/ \; 2>/dev/null || true
-            find obs-build -name "libobs.lib" -exec cp {} obs-sdk/lib/ \; 2>/dev/null || true
-
-            # Create cmake config
-            mkdir -p obs-sdk/lib/cmake/libobs
-            cat > obs-sdk/lib/cmake/libobs/libobsConfig.cmake << 'CMAKEOF'
+          # Create cmake config for find_package(libobs)
+          cat > obs-sdk/lib/cmake/libobs/libobsConfig.cmake << 'CMAKECFG'
           if(TARGET OBS::libobs)
             return()
           endif()
-
-          get_filename_component(_import_prefix "${CMAKE_CURRENT_LIST_DIR}/../../../" ABSOLUTE)
-
+          get_filename_component(_prefix "${CMAKE_CURRENT_LIST_DIR}/../../../" ABSOLUTE)
           add_library(OBS::libobs SHARED IMPORTED)
-
           set_target_properties(OBS::libobs PROPERTIES
-            INTERFACE_INCLUDE_DIRECTORIES "${_import_prefix}/include"
+            INTERFACE_INCLUDE_DIRECTORIES "${_prefix}/include"
           )
-
-          # Find the import library
-          find_library(_libobs_lib NAMES obs libobs PATHS "${_import_prefix}/lib" NO_DEFAULT_PATH)
+          find_library(_libobs_lib NAMES obs libobs PATHS "${_prefix}/lib" NO_DEFAULT_PATH)
           if(_libobs_lib)
             set_target_properties(OBS::libobs PROPERTIES IMPORTED_IMPLIB "${_libobs_lib}")
           endif()
+          unset(_prefix)
+          CMAKECFG
 
-          unset(_import_prefix)
-          CMAKEOF
-          fi
-
-          echo "=== Final SDK layout ==="
-          find obs-sdk -type f | head -50
+          echo "=== OBS SDK ready ==="
+          find obs-sdk -type f | head -30
 
       - name: Build plugin
         run: |
@@ -127,6 +104,7 @@ jobs:
         run: |
           mkdir -p release
           find build -name "fps-analyzer.dll" -exec cp {} release/ \;
+          ls -la release/fps-analyzer.dll
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
