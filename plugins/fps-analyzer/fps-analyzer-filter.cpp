@@ -57,7 +57,7 @@ struct fps_analyzer_filter {
     size_t luma_buffer_size;
     // GPU staging resources for sync sources (video_render path)
     gs_texrender_t *texrender;
-    gs_stagesurface_t *stagesurface;
+    gs_stagesurf_t *stagesurface;
     uint32_t staged_width;
     uint32_t staged_height;
 };
@@ -785,6 +785,6 @@ struct obs_source_info fps_analyzer_filter_info = {
     .get_properties = fps_analyzer_properties,
     .update = fps_analyzer_update,
     .video_tick = fps_analyzer_video_tick,
-    .filter_video = fps_analyzer_filter_video,
     .video_render = fps_analyzer_video_render,
+    .filter_video = fps_analyzer_filter_video,
 };
