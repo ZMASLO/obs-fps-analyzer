@@ -13,14 +13,14 @@
 #include "fps-shared-data.h"
 
 // Global shared data — read by fps-analyzer-overlay.cpp
-struct fps_shared_data g_fps_shared = {0, 0.0, false, 0, 0, -1};
+struct fps_shared_data g_fps_shared = {0, 0.0, false, 0, 0, -1, {}, 0};
 
 // Declare overlay info for registration in overlay file
 extern struct obs_source_info fps_overlay_source_info;
 
 #define FPS_CSV_HISTORY_LIMIT 300
 #define ROLLING_MAX 120 // max 2 sekundy przy 60 FPS
-#define FRAMETIME_HISTORY 60
+#define FRAMETIME_HISTORY 960
 
 // Dodaj enum do wyboru metody analizy
 typedef enum {
@@ -67,6 +67,8 @@ struct fps_analyzer_filter {
     uint32_t staged_height;
     // Debug: log format once
     int last_logged_format;
+    // Tearing history per-frame (aligned with frametime_history)
+    bool tearing_per_frame[FRAMETIME_HISTORY];
 };
 
 // --- Utility functions ---
@@ -167,6 +169,7 @@ static void analyze_luma_frame(struct fps_analyzer_filter *filter,
         if (filter->last_unique_frame_time != 0) {
             double ft = (now - filter->last_unique_frame_time) / 1000000.0;
             filter->frametime_history[filter->frametime_pos] = ft;
+            filter->tearing_per_frame[filter->frametime_pos] = filter->tearing_detected;
             filter->frametime_pos = (filter->frametime_pos + 1) % FRAMETIME_HISTORY;
             if (filter->frametime_count < FRAMETIME_HISTORY)
                 filter->frametime_count++;
@@ -522,6 +525,7 @@ static void fps_analyzer_video_render(void *data, gs_effect_t *effect)
         }
 
         analyze_luma_frame(filter, filter->luma_buffer, luma_size);
+        g_fps_shared.unsupported_format = -1;
 
         gs_stagesurface_unmap(filter->stagesurface);
     }
@@ -571,6 +575,16 @@ static void fps_analyzer_video_tick(void *data, float seconds)
     g_fps_shared.frametime_ms = frametime_ms;
     g_fps_shared.tearing_detected = filter->tearing_detected;
     g_fps_shared.last_update_ns = now;
+
+    // Linearize circular frametime buffer for graph (oldest → newest)
+    int count = filter->frametime_count;
+    if (count > FPS_GRAPH_HISTORY) count = FPS_GRAPH_HISTORY;
+    for (int i = 0; i < count; i++) {
+        int idx = (filter->frametime_pos - count + i + FRAMETIME_HISTORY) % FRAMETIME_HISTORY;
+        g_fps_shared.graph_frametimes[i] = filter->frametime_history[idx];
+        g_fps_shared.graph_tearing[i] = filter->tearing_per_frame[idx];
+    }
+    g_fps_shared.graph_count = count;
 
     // Optional CSV logging
     if (filter->enable_csv) {
@@ -658,7 +672,7 @@ static void *fps_analyzer_create(obs_data_t *settings, obs_source_t *context)
 static const char *fps_analyzer_get_name(void *unused)
 {
     UNUSED_PARAMETER(unused);
-    return "FPS Analyzer 0.3";
+    return "FPS Analyzer 0.4";
 }
 
 // --- Properties ---
