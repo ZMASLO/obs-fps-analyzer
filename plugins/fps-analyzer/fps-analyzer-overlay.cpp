@@ -55,7 +55,7 @@ static void *fps_overlay_create(obs_data_t *settings, obs_source_t *source)
 
     ctx->font_size = (int)obs_data_get_int(settings, "font_size");
     if (ctx->font_size <= 0)
-        ctx->font_size = 32;
+        ctx->font_size = 64;
 
     ctx->last_text[0] = '\0';
 
@@ -101,7 +101,7 @@ static obs_properties_t *fps_overlay_properties(void *data)
 
 static void fps_overlay_get_defaults(obs_data_t *settings)
 {
-    obs_data_set_default_int(settings, "font_size", 32);
+    obs_data_set_default_int(settings, "font_size", 64);
 }
 
 static void fps_overlay_update(void *data, obs_data_t *settings)
@@ -109,7 +109,7 @@ static void fps_overlay_update(void *data, obs_data_t *settings)
     struct fps_overlay_source *ctx = (struct fps_overlay_source *)data;
     ctx->font_size = (int)obs_data_get_int(settings, "font_size");
     if (ctx->font_size <= 0)
-        ctx->font_size = 32;
+        ctx->font_size = 64;
 
     // Force text re-render with new font size
     if (ctx->last_text[0])
