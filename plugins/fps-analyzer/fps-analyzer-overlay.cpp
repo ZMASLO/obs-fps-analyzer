@@ -11,28 +11,45 @@
 // Declare filter info for registration
 extern struct obs_source_info fps_analyzer_filter_info;
 
-#define GRAPH_PLOT_WIDTH 1920
-#define GRAPH_PLOT_HEIGHT 360
 #define GRAPH_MARGIN 20
 #define GRAPH_LEGEND_WIDTH 80
-#define GRAPH_TOTAL_WIDTH (GRAPH_MARGIN + GRAPH_PLOT_WIDTH + GRAPH_MARGIN + GRAPH_LEGEND_WIDTH)
-#define GRAPH_TOTAL_HEIGHT (GRAPH_MARGIN + GRAPH_PLOT_HEIGHT + GRAPH_MARGIN)
+#define MAX_GRID_LABELS 16
 #define LINE_THICKNESS 2
+
+// Graph styles
+#define GRAPH_STYLE_BIG 0
+#define GRAPH_STYLE_COMPACT 1
+
+// Big: 1920x360
+#define BIG_PLOT_W 1920
+#define BIG_PLOT_H 360
+// Compact: 300x80
+#define COMPACT_PLOT_W 300
+#define COMPACT_PLOT_H 80
 
 struct fps_overlay_source
 {
     obs_source_t *text_source;
     obs_source_t *label_frametime;
     obs_source_t *label_fps;
-    // Reference line labels
-    obs_source_t *label_ft_ref1; // "16.67ms"
-    obs_source_t *label_ft_ref2; // "33.33ms"
-    obs_source_t *label_fps_ref1; // "60"
-    obs_source_t *label_fps_ref2; // "30"
     int font_size;
-    bool show_background;
+    bool show_text_background;
+    bool show_fps_text;
+    bool show_frametime_text;
+    bool show_tearing_text;
     bool show_frametime_graph;
     bool show_fps_graph;
+    int frametime_style; // GRAPH_STYLE_BIG or GRAPH_STYLE_COMPACT
+    int fps_style;
+    double frametime_scale; // 0 = auto, otherwise fixed max (e.g. 16.67, 33.33)
+    double fps_scale;       // 0 = auto, otherwise fixed max (e.g. 60, 120)
+    // Grid label pools
+    obs_source_t *ft_grid_labels[MAX_GRID_LABELS];
+    int ft_grid_count;
+    double ft_grid_values[MAX_GRID_LABELS];
+    obs_source_t *fps_grid_labels[MAX_GRID_LABELS];
+    int fps_grid_count;
+    double fps_grid_values[MAX_GRID_LABELS];
     char last_text[512];
 };
 
@@ -66,7 +83,7 @@ static void update_text_source(struct fps_overlay_source *ctx, const char *text)
 
     // Background
     obs_data_set_int(settings, "bk_color", 0x000000);
-    obs_data_set_int(settings, "bk_opacity", ctx->show_background ? 80 : 0);
+    obs_data_set_int(settings, "bk_opacity", ctx->show_text_background ? 80 : 0);
 
     obs_source_update(ctx->text_source, settings);
 
@@ -100,42 +117,121 @@ static obs_source_t *create_label_source(const char *text, const char *name, int
     return src;
 }
 
+// Build grid labels for a given step and max value
+// is_ms: true = format as "Xms", false = format as integer
+static void build_grid_labels(obs_source_t **labels, double *values, int *out_count,
+                              double step, double max_val, bool is_ms)
+{
+    // Free old labels
+    for (int i = 0; i < *out_count; i++)
+    {
+        if (labels[i])
+            obs_source_release(labels[i]);
+        labels[i] = NULL;
+    }
+    *out_count = 0;
+
+    if (step <= 0 || max_val <= 0)
+        return;
+
+    // Include 0 and go up to and including max_val
+    // Use multiplication to avoid floating point accumulation errors
+    for (int n = 0; n * step <= max_val + 0.01 && *out_count < MAX_GRID_LABELS; n++)
+    {
+        double v = n * step;
+
+        char text[32];
+        if (is_ms)
+        {
+            // Display as clean frametime: show what FPS this corresponds to
+            double rounded = round(v * 100.0) / 100.0;
+            // Snap common values: 8.33, 16.67, 33.33, 50.00, 66.67
+            if (fabs(rounded - 8.33) < 0.02)
+                rounded = 8.33;
+            else if (fabs(rounded - 16.67) < 0.02)
+                rounded = 16.67;
+            else if (fabs(rounded - 33.33) < 0.02)
+                rounded = 33.33;
+            else if (fabs(rounded - 50.00) < 0.02)
+                rounded = 50.00;
+            else if (fabs(rounded - 66.67) < 0.02)
+                rounded = 66.67;
+            snprintf(text, sizeof(text), "%.2fms", rounded);
+        }
+        else
+            snprintf(text, sizeof(text), "%d", (int)round(v));
+
+        char name[64];
+        snprintf(name, sizeof(name), "grid_%d", *out_count);
+
+        values[*out_count] = v;
+        labels[*out_count] = create_label_source(text, name, 18, true);
+        (*out_count)++;
+    }
+}
+
+static void get_graph_dims(int style, int *pw, int *ph, int *total_w, int *total_h)
+{
+    if (style == GRAPH_STYLE_COMPACT)
+    {
+        *pw = COMPACT_PLOT_W;
+        *ph = COMPACT_PLOT_H;
+    }
+    else
+    {
+        *pw = BIG_PLOT_W;
+        *ph = BIG_PLOT_H;
+    }
+    *total_w = GRAPH_MARGIN + *pw + GRAPH_MARGIN + GRAPH_LEGEND_WIDTH;
+    *total_h = GRAPH_MARGIN + *ph + GRAPH_MARGIN;
+}
+
 // --- Graph rendering ---
 
 // ref_label1/ref_label2: text sources for reference line labels
+// max_override: if >0, use as fixed Y-axis max; if 0, auto-scale
+// ref_step: distance between reference lines (e.g. 10 for every 10 units). 0 = no grid.
 static void render_line_graph(const double *values, int count,
-                              double ref1, double ref2,
+                              double ref_step,
                               bool show_tearing, bool higher_is_better,
                               double green_thresh, double yellow_thresh,
-                              obs_source_t *ref_label1, obs_source_t *ref_label2)
+                              double max_override,
+                              obs_source_t **grid_labels, double *grid_values, int grid_count,
+                              int style)
 {
     if (count < 2)
         return;
 
-    int gh = GRAPH_PLOT_HEIGHT;
-    int gw = GRAPH_PLOT_WIDTH;
+    int gw, gh, total_w, total_h;
+    get_graph_dims(style, &gw, &gh, &total_w, &total_h);
     float step = (float)gw / (float)(FPS_GRAPH_HISTORY - 1);
 
-    // Find max value for scaling
-    double max_val = 1.0;
-    for (int i = 0; i < count; i++) {
-        if (values[i] > max_val)
-            max_val = values[i];
+    // Y-axis scaling
+    double max_val;
+    if (max_override > 0)
+    {
+        max_val = max_override;
     }
-    if (ref1 > 0 && ref1 * 1.1 > max_val) max_val = ref1 * 1.1;
-    if (ref2 > 0 && ref2 * 1.1 > max_val) max_val = ref2 * 1.1;
+    else
+    {
+        max_val = 1.0;
+        for (int i = 0; i < count; i++)
+        {
+            if (values[i] > max_val)
+                max_val = values[i];
+        }
+        max_val *= 1.1; // 10% headroom
+    }
 
     gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
-    if (!solid) return;
+    if (!solid)
+        return;
     gs_eparam_t *color_param = gs_effect_get_param_by_name(solid, "color");
     gs_technique_t *tech = gs_effect_get_technique(solid, "Solid");
-    if (!color_param || !tech) return;
+    if (!color_param || !tech)
+        return;
 
     struct vec4 col;
-
-    // Compute reference line Y positions (in plot coordinates)
-    int y_ref1 = (ref1 > 0) ? gh - (int)((ref1 / max_val) * gh) : -1;
-    int y_ref2 = (ref2 > 0) ? gh - (int)((ref2 / max_val) * gh) : -1;
 
     // === PASS 1: All solid geometry ===
     gs_technique_begin(tech);
@@ -144,38 +240,45 @@ static void render_line_graph(const double *values, int count,
     // Panel background
     vec4_set(&col, 0.0f, 0.0f, 0.0f, 0.8f);
     gs_effect_set_vec4(color_param, &col);
-    gs_draw_sprite(0, 0, (uint32_t)GRAPH_TOTAL_WIDTH, (uint32_t)GRAPH_TOTAL_HEIGHT);
+    gs_draw_sprite(0, 0, (uint32_t)total_w, (uint32_t)total_h);
 
     // Enter plot area
     gs_matrix_push();
     gs_matrix_translate3f((float)GRAPH_MARGIN, (float)GRAPH_MARGIN, 0.0f);
 
-    // Reference lines
-    vec4_set(&col, 1.0f, 1.0f, 1.0f, 0.3f);
-    gs_effect_set_vec4(color_param, &col);
-    if (y_ref1 >= 0 && y_ref1 < gh) {
-        gs_matrix_push();
-        gs_matrix_translate3f(0.0f, (float)y_ref1, 0.0f);
-        gs_draw_sprite(0, 0, (uint32_t)gw, 1);
-        gs_matrix_pop();
-    }
-    if (y_ref2 >= 0 && y_ref2 < gh) {
-        gs_matrix_push();
-        gs_matrix_translate3f(0.0f, (float)y_ref2, 0.0f);
-        gs_draw_sprite(0, 0, (uint32_t)gw, 1);
-        gs_matrix_pop();
+    // Reference grid lines (including 0 at bottom)
+    if (ref_step > 0)
+    {
+        vec4_set(&col, 1.0f, 1.0f, 1.0f, 0.15f);
+        gs_effect_set_vec4(color_param, &col);
+        for (int n = 0; n * ref_step <= max_val + 0.01; n++)
+        {
+            double v = n * ref_step;
+            int y_ref = gh - (int)((v / max_val) * gh);
+            if (y_ref >= 0 && y_ref < gh)
+            {
+                gs_matrix_push();
+                gs_matrix_translate3f(0.0f, (float)y_ref, 0.0f);
+                gs_draw_sprite(0, 0, (uint32_t)gw, 1);
+                gs_matrix_pop();
+            }
+        }
     }
 
     // Tearing indicators
     int data_offset = FPS_GRAPH_HISTORY - count;
-    if (show_tearing) {
+    if (show_tearing)
+    {
         vec4_set(&col, 1.0f, 0.0f, 0.0f, 0.4f);
         gs_effect_set_vec4(color_param, &col);
-        for (int i = 0; i < count; i++) {
-            if (g_fps_shared.graph_tearing[i]) {
+        for (int i = 0; i < count; i++)
+        {
+            if (g_fps_shared.graph_tearing[i])
+            {
                 float x = (float)(data_offset + i) * step;
                 int seg_w = (int)(step + 1.0f);
-                if (seg_w < 2) seg_w = 2;
+                if (seg_w < 2)
+                    seg_w = 2;
                 gs_matrix_push();
                 gs_matrix_translate3f(x, 0.0f, 0.0f);
                 gs_draw_sprite(0, 0, (uint32_t)seg_w, (uint32_t)gh);
@@ -185,34 +288,52 @@ static void render_line_graph(const double *values, int count,
     }
 
     // Data line
-    for (int i = 0; i < count - 1; i++) {
+    for (int i = 0; i < count - 1; i++)
+    {
         double v0 = values[i];
         double v1 = values[i + 1];
         float x0 = (float)(data_offset + i) * step;
         float x1 = (float)(data_offset + i + 1) * step;
         float fy0 = (float)(gh - (v0 / max_val) * gh);
         float fy1 = (float)(gh - (v1 / max_val) * gh);
-        if (fy0 < 0) fy0 = 0; if (fy0 > gh) fy0 = (float)gh;
-        if (fy1 < 0) fy1 = 0; if (fy1 > gh) fy1 = (float)gh;
+        if (fy0 < 0)
+            fy0 = 0;
+        if (fy0 > gh)
+            fy0 = (float)gh;
+        if (fy1 < 0)
+            fy1 = 0;
+        if (fy1 > gh)
+            fy1 = (float)gh;
 
         double v_worst = higher_is_better ? (v0 < v1 ? v0 : v1) : (v0 > v1 ? v0 : v1);
-        if (higher_is_better) {
-            if (v_worst >= green_thresh) vec4_set(&col, 0.0f, 1.0f, 0.0f, 1.0f);
-            else if (v_worst >= yellow_thresh) vec4_set(&col, 1.0f, 1.0f, 0.0f, 1.0f);
-            else vec4_set(&col, 1.0f, 0.0f, 0.0f, 1.0f);
-        } else {
-            if (v_worst <= green_thresh) vec4_set(&col, 0.0f, 1.0f, 0.0f, 1.0f);
-            else if (v_worst <= yellow_thresh) vec4_set(&col, 1.0f, 1.0f, 0.0f, 1.0f);
-            else vec4_set(&col, 1.0f, 0.0f, 0.0f, 1.0f);
+        if (higher_is_better)
+        {
+            if (v_worst >= green_thresh)
+                vec4_set(&col, 0.0f, 1.0f, 0.0f, 1.0f);
+            else if (v_worst >= yellow_thresh)
+                vec4_set(&col, 1.0f, 1.0f, 0.0f, 1.0f);
+            else
+                vec4_set(&col, 1.0f, 0.0f, 0.0f, 1.0f);
+        }
+        else
+        {
+            if (v_worst <= green_thresh)
+                vec4_set(&col, 0.0f, 1.0f, 0.0f, 1.0f);
+            else if (v_worst <= yellow_thresh)
+                vec4_set(&col, 1.0f, 1.0f, 0.0f, 1.0f);
+            else
+                vec4_set(&col, 1.0f, 0.0f, 0.0f, 1.0f);
         }
         gs_effect_set_vec4(color_param, &col);
 
         float top = fy0 < fy1 ? fy0 : fy1;
         float bot = fy0 > fy1 ? fy0 : fy1;
         float seg_h = bot - top;
-        if (seg_h < LINE_THICKNESS) seg_h = (float)LINE_THICKNESS;
+        if (seg_h < LINE_THICKNESS)
+            seg_h = (float)LINE_THICKNESS;
         float seg_w = x1 - x0;
-        if (seg_w < 1.0f) seg_w = 1.0f;
+        if (seg_w < 1.0f)
+            seg_w = 1.0f;
 
         gs_matrix_push();
         gs_matrix_translate3f(x0, top, 0.0f);
@@ -226,27 +347,44 @@ static void render_line_graph(const double *values, int count,
     gs_technique_end_pass(tech);
     gs_technique_end(tech);
 
-    // === PASS 2: Text labels (outside technique) ===
+    // Grid labels — rendered right of plot area
+    for (int g = 0; g < grid_count; g++)
+    {
+        if (!grid_labels[g])
+            continue;
+        double v = grid_values[g];
+        int y_ref = gh - (int)((v / max_val) * gh);
+        if (y_ref < 0 || y_ref >= gh)
+            continue;
 
-    // Reference label 1 — right side, aligned to ref line
-    if (ref_label1 && y_ref1 >= 0 && y_ref1 < gh) {
-        uint32_t lh = obs_source_get_height(ref_label1);
+        uint32_t lh = obs_source_get_height(grid_labels[g]);
         gs_matrix_push();
         gs_matrix_translate3f((float)(GRAPH_MARGIN + gw + 8),
-                              (float)(GRAPH_MARGIN + y_ref1 - (int)lh / 2), 0.0f);
-        obs_source_video_render(ref_label1);
+                              (float)(GRAPH_MARGIN + y_ref - (int)lh / 2), 0.0f);
+        obs_source_video_render(grid_labels[g]);
         gs_matrix_pop();
     }
+}
 
-    // Reference label 2
-    if (ref_label2 && y_ref2 >= 0 && y_ref2 < gh) {
-        uint32_t lh = obs_source_get_height(ref_label2);
-        gs_matrix_push();
-        gs_matrix_translate3f((float)(GRAPH_MARGIN + gw + 8),
-                              (float)(GRAPH_MARGIN + y_ref2 - (int)lh / 2), 0.0f);
-        obs_source_video_render(ref_label2);
-        gs_matrix_pop();
-    }
+static void rebuild_grid_labels(struct fps_overlay_source *ctx)
+{
+    // Frametime grid — step depends on scale range
+    double ft_max = ctx->frametime_scale > 0 ? ctx->frametime_scale : 50.0;
+    double ft_step = (ft_max > 33.33) ? (1000.0 / 60.0) : (1000.0 / 120.0);
+    build_grid_labels(ctx->ft_grid_labels, ctx->ft_grid_values, &ctx->ft_grid_count,
+                      ft_step, ft_max, true);
+
+    // FPS grid
+    double fps_max = ctx->fps_scale > 0 ? ctx->fps_scale : 120.0;
+    double fps_step = 0;
+    if (fps_max >= 120.0)
+        fps_step = 20.0;
+    else if (fps_max >= 60.0)
+        fps_step = 10.0;
+    else
+        fps_step = 10.0;
+    build_grid_labels(ctx->fps_grid_labels, ctx->fps_grid_values, &ctx->fps_grid_count,
+                      fps_step, fps_max, false);
 }
 
 // --- Source callbacks ---
@@ -259,9 +397,16 @@ static void *fps_overlay_create(obs_data_t *settings, obs_source_t *source)
     ctx->font_size = (int)obs_data_get_int(settings, "font_size");
     if (ctx->font_size <= 0)
         ctx->font_size = 64;
-    ctx->show_background = obs_data_get_bool(settings, "show_background");
+    ctx->show_text_background = obs_data_get_bool(settings, "show_text_background");
+    ctx->show_fps_text = obs_data_get_bool(settings, "show_fps_text");
+    ctx->show_frametime_text = obs_data_get_bool(settings, "show_frametime_text");
+    ctx->show_tearing_text = obs_data_get_bool(settings, "show_tearing_text");
     ctx->show_frametime_graph = obs_data_get_bool(settings, "show_frametime_graph");
+    ctx->frametime_style = (int)obs_data_get_int(settings, "frametime_style");
     ctx->show_fps_graph = obs_data_get_bool(settings, "show_fps_graph");
+    ctx->fps_style = (int)obs_data_get_int(settings, "fps_style");
+    ctx->frametime_scale = obs_data_get_double(settings, "frametime_scale");
+    ctx->fps_scale = obs_data_get_double(settings, "fps_scale");
 
     ctx->last_text[0] = '\0';
 
@@ -278,10 +423,7 @@ static void *fps_overlay_create(obs_data_t *settings, obs_source_t *source)
 
     ctx->label_frametime = create_label_source("FRAMETIME", "fps_label_ft", 18, true);
     ctx->label_fps = create_label_source("FRAMERATE", "fps_label_fps", 18, true);
-    ctx->label_ft_ref1 = create_label_source("16.67ms", "fps_label_ft_r1", 14, false);
-    ctx->label_ft_ref2 = create_label_source("33.33ms", "fps_label_ft_r2", 14, false);
-    ctx->label_fps_ref1 = create_label_source("60", "fps_label_fps_r1", 14, false);
-    ctx->label_fps_ref2 = create_label_source("30", "fps_label_fps_r2", 14, false);
+    rebuild_grid_labels(ctx);
 
     return ctx;
 }
@@ -297,16 +439,26 @@ static void fps_overlay_destroy(void *data)
             obs_source_release(ctx->label_frametime);
         if (ctx->label_fps)
             obs_source_release(ctx->label_fps);
-        if (ctx->label_ft_ref1)
-            obs_source_release(ctx->label_ft_ref1);
-        if (ctx->label_ft_ref2)
-            obs_source_release(ctx->label_ft_ref2);
-        if (ctx->label_fps_ref1)
-            obs_source_release(ctx->label_fps_ref1);
-        if (ctx->label_fps_ref2)
-            obs_source_release(ctx->label_fps_ref2);
+        for (int i = 0; i < ctx->ft_grid_count; i++)
+            if (ctx->ft_grid_labels[i])
+                obs_source_release(ctx->ft_grid_labels[i]);
+        for (int i = 0; i < ctx->fps_grid_count; i++)
+            if (ctx->fps_grid_labels[i])
+                obs_source_release(ctx->fps_grid_labels[i]);
     }
     bfree(data);
+}
+
+static bool graph_toggle_modified(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
+{
+    UNUSED_PARAMETER(p);
+    bool ft_on = obs_data_get_bool(settings, "show_frametime_graph");
+    bool fps_on = obs_data_get_bool(settings, "show_fps_graph");
+    obs_property_set_visible(obs_properties_get(props, "frametime_style"), ft_on);
+    obs_property_set_visible(obs_properties_get(props, "frametime_scale"), ft_on);
+    obs_property_set_visible(obs_properties_get(props, "fps_style"), fps_on);
+    obs_property_set_visible(obs_properties_get(props, "fps_scale"), fps_on);
+    return true;
 }
 
 static obs_properties_t *fps_overlay_properties(void *data)
@@ -323,10 +475,52 @@ static obs_properties_t *fps_overlay_properties(void *data)
     obs_property_list_add_int(font, "48", 48);
     obs_property_list_add_int(font, "64", 64);
 
-    obs_properties_add_bool(props, "show_background", "Show background");
+    obs_properties_add_bool(props, "show_fps_text", "Show FPS text");
+    obs_properties_add_bool(props, "show_frametime_text", "Show Frametime text");
+    obs_properties_add_bool(props, "show_tearing_text", "Show Tearing warning");
+    obs_properties_add_bool(props, "show_text_background", "Show text background");
 
-    obs_properties_add_bool(props, "show_frametime_graph", "Show frametime graph");
-    obs_properties_add_bool(props, "show_fps_graph", "Show framerate graph");
+    obs_property_t *ft_toggle = obs_properties_add_bool(props, "show_frametime_graph", "Show frametime graph");
+    obs_property_set_modified_callback(ft_toggle, graph_toggle_modified);
+
+    obs_property_t *ft_style = obs_properties_add_list(
+        props, "frametime_style", "Frametime graph style",
+        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    obs_property_list_add_int(ft_style, "Big (1920x360)", GRAPH_STYLE_BIG);
+    obs_property_list_add_int(ft_style, "Compact (300x80)", GRAPH_STYLE_COMPACT);
+
+    obs_property_t *ft_scale = obs_properties_add_list(
+        props, "frametime_scale", "Frametime scale",
+        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_FLOAT);
+    obs_property_list_add_float(ft_scale, "Auto", 0.0);
+    obs_property_list_add_float(ft_scale, "16.67 ms", 16.67);
+    obs_property_list_add_float(ft_scale, "33.33 ms", 33.33);
+    obs_property_list_add_float(ft_scale, "66.67 ms", 66.67);
+
+    obs_property_t *fps_toggle = obs_properties_add_bool(props, "show_fps_graph", "Show framerate graph");
+    obs_property_set_modified_callback(fps_toggle, graph_toggle_modified);
+
+    obs_property_t *fps_style_prop = obs_properties_add_list(
+        props, "fps_style", "Framerate graph style",
+        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    obs_property_list_add_int(fps_style_prop, "Big (1920x360)", GRAPH_STYLE_BIG);
+    obs_property_list_add_int(fps_style_prop, "Compact (300x80)", GRAPH_STYLE_COMPACT);
+
+    obs_property_t *fps_scale = obs_properties_add_list(
+        props, "fps_scale", "Framerate scale",
+        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_FLOAT);
+    obs_property_list_add_float(fps_scale, "Auto", 0.0);
+    obs_property_list_add_float(fps_scale, "120 FPS", 120.0);
+    obs_property_list_add_float(fps_scale, "60 FPS", 60.0);
+    obs_property_list_add_float(fps_scale, "30 FPS", 30.0);
+
+    // Initial visibility
+    bool ft_on = data ? ((struct fps_overlay_source *)data)->show_frametime_graph : false;
+    bool fps_on = data ? ((struct fps_overlay_source *)data)->show_fps_graph : false;
+    obs_property_set_visible(ft_style, ft_on);
+    obs_property_set_visible(ft_scale, ft_on);
+    obs_property_set_visible(fps_style_prop, fps_on);
+    obs_property_set_visible(fps_scale, fps_on);
 
     return props;
 }
@@ -334,9 +528,16 @@ static obs_properties_t *fps_overlay_properties(void *data)
 static void fps_overlay_get_defaults(obs_data_t *settings)
 {
     obs_data_set_default_int(settings, "font_size", 64);
-    obs_data_set_default_bool(settings, "show_background", true);
+    obs_data_set_default_bool(settings, "show_fps_text", true);
+    obs_data_set_default_bool(settings, "show_frametime_text", true);
+    obs_data_set_default_bool(settings, "show_tearing_text", true);
+    obs_data_set_default_bool(settings, "show_text_background", true);
     obs_data_set_default_bool(settings, "show_frametime_graph", false);
+    obs_data_set_default_int(settings, "frametime_style", GRAPH_STYLE_BIG);
+    obs_data_set_default_double(settings, "frametime_scale", 0.0);
     obs_data_set_default_bool(settings, "show_fps_graph", false);
+    obs_data_set_default_int(settings, "fps_style", GRAPH_STYLE_BIG);
+    obs_data_set_default_double(settings, "fps_scale", 0.0);
 }
 
 static void fps_overlay_update(void *data, obs_data_t *settings)
@@ -345,9 +546,18 @@ static void fps_overlay_update(void *data, obs_data_t *settings)
     ctx->font_size = (int)obs_data_get_int(settings, "font_size");
     if (ctx->font_size <= 0)
         ctx->font_size = 64;
-    ctx->show_background = obs_data_get_bool(settings, "show_background");
+    ctx->show_text_background = obs_data_get_bool(settings, "show_text_background");
+    ctx->show_fps_text = obs_data_get_bool(settings, "show_fps_text");
+    ctx->show_frametime_text = obs_data_get_bool(settings, "show_frametime_text");
+    ctx->show_tearing_text = obs_data_get_bool(settings, "show_tearing_text");
     ctx->show_frametime_graph = obs_data_get_bool(settings, "show_frametime_graph");
+    ctx->frametime_style = (int)obs_data_get_int(settings, "frametime_style");
     ctx->show_fps_graph = obs_data_get_bool(settings, "show_fps_graph");
+    ctx->fps_style = (int)obs_data_get_int(settings, "fps_style");
+    ctx->frametime_scale = obs_data_get_double(settings, "frametime_scale");
+    ctx->fps_scale = obs_data_get_double(settings, "fps_scale");
+
+    rebuild_grid_labels(ctx);
 
     // Force re-render with new settings
     update_text_source(ctx, ctx->last_text[0] ? ctx->last_text : "FPS: --");
@@ -385,18 +595,24 @@ static void fps_overlay_tick(void *data, float seconds)
     }
     else
     {
-        if (g_fps_shared.tearing_detected)
+        text[0] = '\0';
+        int pos = 0;
+        if (ctx->show_fps_text)
+            pos += snprintf(text + pos, sizeof(text) - pos, "FPS: %d", g_fps_shared.fps);
+        if (ctx->show_frametime_text)
         {
-            snprintf(text, sizeof(text),
-                     "FPS: %d\nFrametime: %.2f ms\nWarning: Tearing detected",
-                     g_fps_shared.fps, g_fps_shared.frametime_ms);
+            if (pos > 0)
+                pos += snprintf(text + pos, sizeof(text) - pos, "\n");
+            pos += snprintf(text + pos, sizeof(text) - pos, "Frametime: %.2f ms", g_fps_shared.frametime_ms);
         }
-        else
+        if (ctx->show_tearing_text && g_fps_shared.tearing_detected)
         {
-            snprintf(text, sizeof(text),
-                     "FPS: %d\nFrametime: %.2f ms",
-                     g_fps_shared.fps, g_fps_shared.frametime_ms);
+            if (pos > 0)
+                pos += snprintf(text + pos, sizeof(text) - pos, "\n");
+            pos += snprintf(text + pos, sizeof(text) - pos, "Warning: Tearing detected");
         }
+        if (pos == 0)
+            snprintf(text, sizeof(text), " "); // at least a space so text source has content
     }
 
     // Only update the text source if the text actually changed
@@ -415,14 +631,20 @@ static void fps_overlay_render(void *data, gs_effect_t *effect)
     int count = g_fps_shared.graph_count;
     bool any_graph = (ctx->show_frametime_graph || ctx->show_fps_graph) && count >= 2;
 
-    // 1. Render text at top
-    if (ctx->text_source)
+    // 1. Render text at top with margin
+    bool any_text = ctx->show_fps_text || ctx->show_frametime_text || ctx->show_tearing_text;
+    uint32_t y_offset = 0;
+    if (any_text && ctx->text_source)
+    {
+        gs_matrix_push();
+        gs_matrix_translate3f((float)GRAPH_MARGIN, (float)GRAPH_MARGIN, 0.0f);
         obs_source_video_render(ctx->text_source);
+        gs_matrix_pop();
+        y_offset = obs_source_get_height(ctx->text_source) + GRAPH_MARGIN * 2;
+    }
 
     if (!any_graph)
         return;
-
-    uint32_t y_offset = ctx->text_source ? obs_source_get_height(ctx->text_source) : 0;
 
     gs_blend_state_push();
     gs_reset_blend_state();
@@ -434,9 +656,13 @@ static void fps_overlay_render(void *data, gs_effect_t *effect)
     {
         gs_matrix_push();
         gs_matrix_translate3f(0.0f, (float)y_offset, 0.0f);
+        double ft_step = (ctx->frametime_scale > 33.33) ? 16.67 : 8.33;
+
         render_line_graph(g_fps_shared.graph_frametimes, count,
-                          16.67, 33.33, true, false, 16.67, 33.33,
-                          ctx->label_ft_ref1, ctx->label_ft_ref2);
+                          ft_step, true, false, 16.67, 33.33,
+                          ctx->frametime_scale,
+                          ctx->ft_grid_labels, ctx->ft_grid_values, ctx->ft_grid_count,
+                          ctx->frametime_style);
         // Title label
         if (ctx->label_frametime)
         {
@@ -446,7 +672,11 @@ static void fps_overlay_render(void *data, gs_effect_t *effect)
             gs_matrix_pop();
         }
         gs_matrix_pop();
-        y_offset += GRAPH_TOTAL_HEIGHT;
+        {
+            int pw, ph, tw, th;
+            get_graph_dims(ctx->frametime_style, &pw, &ph, &tw, &th);
+            y_offset += th + GRAPH_MARGIN;
+        }
     }
 
     // 3. FPS graph
@@ -454,9 +684,22 @@ static void fps_overlay_render(void *data, gs_effect_t *effect)
     {
         gs_matrix_push();
         gs_matrix_translate3f(0.0f, (float)y_offset, 0.0f);
+        // FPS ref_step: based on scale
+        double fps_step = 0;
+        if (ctx->fps_scale >= 120.0)
+            fps_step = 20.0;
+        else if (ctx->fps_scale >= 60.0)
+            fps_step = 10.0;
+        else if (ctx->fps_scale >= 30.0)
+            fps_step = 10.0;
+        else
+            fps_step = 10.0; // auto: every 10 FPS
+
         render_line_graph(g_fps_shared.graph_fps, count,
-                          60.0, 30.0, true, true, 60.0, 30.0,
-                          ctx->label_fps_ref1, ctx->label_fps_ref2);
+                          fps_step, true, true, 60.0, 30.0,
+                          ctx->fps_scale,
+                          ctx->fps_grid_labels, ctx->fps_grid_values, ctx->fps_grid_count,
+                          ctx->fps_style);
         // Title label
         if (ctx->label_fps)
         {
@@ -474,26 +717,58 @@ static void fps_overlay_render(void *data, gs_effect_t *effect)
 static uint32_t fps_overlay_get_width(void *data)
 {
     struct fps_overlay_source *ctx = (struct fps_overlay_source *)data;
+    bool any_text = ctx->show_fps_text || ctx->show_frametime_text || ctx->show_tearing_text;
     uint32_t text_w = 0;
-    if (ctx->text_source)
-        text_w = obs_source_get_width(ctx->text_source);
+    if (any_text && ctx->text_source)
+        text_w = obs_source_get_width(ctx->text_source) + GRAPH_MARGIN * 2;
     if (ctx->show_frametime_graph || ctx->show_fps_graph)
-        return text_w > GRAPH_TOTAL_WIDTH ? text_w : GRAPH_TOTAL_WIDTH;
+    {
+        int pw, ph, tw, th;
+        uint32_t max_gw = 0;
+        if (ctx->show_frametime_graph)
+        {
+            get_graph_dims(ctx->frametime_style, &pw, &ph, &tw, &th);
+            if ((uint32_t)tw > max_gw)
+                max_gw = (uint32_t)tw;
+        }
+        if (ctx->show_fps_graph)
+        {
+            get_graph_dims(ctx->fps_style, &pw, &ph, &tw, &th);
+            if ((uint32_t)tw > max_gw)
+                max_gw = (uint32_t)tw;
+        }
+        return text_w > max_gw ? text_w : max_gw;
+    }
     return text_w;
 }
 
 static uint32_t fps_overlay_get_height(void *data)
 {
     struct fps_overlay_source *ctx = (struct fps_overlay_source *)data;
+    bool any_text = ctx->show_fps_text || ctx->show_frametime_text || ctx->show_tearing_text;
     uint32_t text_h = 0;
-    if (ctx->text_source)
-        text_h = obs_source_get_height(ctx->text_source);
+    if (any_text && ctx->text_source)
+        text_h = obs_source_get_height(ctx->text_source) + GRAPH_MARGIN * 2;
     int graphs = 0;
     if (ctx->show_frametime_graph)
         graphs++;
     if (ctx->show_fps_graph)
         graphs++;
-    return text_h + (uint32_t)(graphs * GRAPH_TOTAL_HEIGHT);
+    uint32_t graph_h = 0;
+    int pw, ph, tw, th;
+    if (ctx->show_frametime_graph)
+    {
+        get_graph_dims(ctx->frametime_style, &pw, &ph, &tw, &th);
+        graph_h += (uint32_t)th;
+    }
+    if (ctx->show_fps_graph)
+    {
+        get_graph_dims(ctx->fps_style, &pw, &ph, &tw, &th);
+        if (ctx->show_frametime_graph)
+            graph_h += GRAPH_MARGIN;
+        graph_h += (uint32_t)th;
+    }
+    return text_h + graph_h;
 }
 
 struct obs_source_info fps_overlay_source_info = {
