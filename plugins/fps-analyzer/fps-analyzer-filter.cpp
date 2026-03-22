@@ -13,7 +13,7 @@
 #include "fps-shared-data.h"
 
 // Global shared data — read by fps-analyzer-overlay.cpp
-struct fps_shared_data g_fps_shared = {0, 0.0, false, 0, 0};
+struct fps_shared_data g_fps_shared = {0, 0.0, false, 0, 0, -1};
 
 // Declare overlay info for registration in overlay file
 extern struct obs_source_info fps_overlay_source_info;
@@ -65,6 +65,8 @@ struct fps_analyzer_filter {
     gs_stagesurf_t *stagesurface;
     uint32_t staged_width;
     uint32_t staged_height;
+    // Debug: log format once
+    int last_logged_format;
 };
 
 // --- Utility functions ---
@@ -238,6 +240,7 @@ static bool detect_tearing_async(struct fps_analyzer_filter *filter,
     case VIDEO_FORMAT_NV12:
     case VIDEO_FORMAT_I420:
     case VIDEO_FORMAT_I444:
+    case VIDEO_FORMAT_I422:
         for (int i = 0; i < 3; ++i) {
             int y = line_ys[i];
             memcpy(lines_luma + i * roi_width,
@@ -325,6 +328,13 @@ static struct obs_source_frame *fps_analyzer_filter_video(void *data,
     if (!frame || !frame->data[0])
         return frame;
 
+    // Log format changes for debugging
+    if ((int)frame->format != filter->last_logged_format) {
+        blog(LOG_INFO, "[FPS Analyzer] Video format: %d, resolution: %ux%u",
+             (int)frame->format, frame->width, frame->height);
+        filter->last_logged_format = (int)frame->format;
+    }
+
     const uint32_t width = frame->width;
     const uint32_t height = frame->height;
     int roi_line, roi_lines;
@@ -347,6 +357,7 @@ static struct obs_source_frame *fps_analyzer_filter_video(void *data,
     case VIDEO_FORMAT_NV12:
     case VIDEO_FORMAT_I420:
     case VIDEO_FORMAT_I444:
+    case VIDEO_FORMAT_I422:
         // Y plane in data[0] with linesize[0] stride
         if (filter->analyze_method == ANALYZE_DIFF) {
             for (uint32_t y = 0; y < height; ++y) {
@@ -410,8 +421,11 @@ static struct obs_source_frame *fps_analyzer_filter_video(void *data,
         break;
     }
 
-    if (!format_ok)
+    if (!format_ok) {
+        g_fps_shared.unsupported_format = (int)frame->format;
         return frame;
+    }
+    g_fps_shared.unsupported_format = -1;
 
     // Wykrywanie tearingu (niezależne od metody analizy)
     filter->tearing_detected = detect_tearing_async(filter, frame);
@@ -532,6 +546,16 @@ static void fps_analyzer_video_tick(void *data, float seconds)
     if (elapsed < filter->update_interval)
         return;
     filter->last_write_time = now;
+
+    // Stale data check — if no unique frame detected for >2s, reset to 0
+    if (filter->last_unique_frame_time != 0 &&
+        now - filter->last_unique_frame_time > 2000000000ULL) {
+        filter->frametime_count = 0;
+        filter->frametime_pos = 0;
+        filter->rolling_count = 0;
+        filter->rolling_start = 0;
+    }
+
     // --- FPS jako odwrotność średniego frametime z ostatnich 60 klatek ---
     double avg_frametime = 0.0;
     for (int i = 0; i < filter->frametime_count; ++i)
@@ -539,7 +563,6 @@ static void fps_analyzer_video_tick(void *data, float seconds)
     if (filter->frametime_count > 0)
         avg_frametime /= filter->frametime_count;
     double fps = (avg_frametime > 0.0) ? (1000.0 / avg_frametime) : 0.0;
-    // zaokrąglenie do liczby całkowitej po to żeby nie mieć FPS z przecinkami
     int fps_smooth = (int)round(fps);
     double frametime_ms = avg_frametime;
 
@@ -625,6 +648,7 @@ static void *fps_analyzer_create(obs_data_t *settings, obs_source_t *context)
     filter->stagesurface = NULL;
     filter->staged_width = 0;
     filter->staged_height = 0;
+    filter->last_logged_format = -1;
     // CSV logging
     filter->enable_csv = obs_data_get_bool(settings, "enable_csv");
     g_fps_shared.active_filter_count++;

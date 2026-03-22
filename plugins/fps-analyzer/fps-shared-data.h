@@ -10,6 +10,7 @@ struct fps_shared_data {
     bool tearing_detected;
     uint64_t last_update_ns;
     int active_filter_count;
+    int unsupported_format; // -1 = ok, otherwise video_format enum value
 };
 
 // Defined in fps-analyzer-filter.cpp

@@ -143,6 +143,12 @@ static void fps_overlay_tick(void *data, float seconds)
             "Use only one filter at a time\n"
             "for accurate results.",
             g_fps_shared.active_filter_count);
+    } else if (g_fps_shared.unsupported_format >= 0) {
+        snprintf(text, sizeof(text),
+            "Unsupported video format (id: %d).\n"
+            "Supported: NV12, I420, I422, I444,\n"
+            "YUY2, UYVY, BGRA, RGBA.",
+            g_fps_shared.unsupported_format);
     } else {
         if (g_fps_shared.tearing_detected) {
             snprintf(text, sizeof(text),
