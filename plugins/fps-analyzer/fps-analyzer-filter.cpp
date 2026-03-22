@@ -10,6 +10,11 @@
 #define strcasecmp _stricmp
 #endif
 
+#include "fps-shared-data.h"
+
+// Global shared data — read by fps-analyzer-overlay.cpp
+struct fps_shared_data g_fps_shared = {0, 0.0, false, 0, 0};
+
 // Declare overlay info for registration in overlay file
 extern struct obs_source_info fps_overlay_source_info;
 
@@ -25,7 +30,6 @@ typedef enum {
 
 // Prototypes
 static void keep_last_n_lines(const char *csv_path, int n);
-static void build_txt_path(const char *output_path, char *txt_path, size_t txt_path_size);
 static void build_csv_path(const char *output_path, char *csv_path, size_t csv_path_size);
 
 struct fps_analyzer_filter {
@@ -34,6 +38,7 @@ struct fps_analyzer_filter {
     double update_interval;
     uint64_t last_unique_frame_time;
     bool clear_csv_on_start;
+    bool enable_csv;
     uint64_t rolling_times[ROLLING_MAX];
     int rolling_count;
     int rolling_start;
@@ -538,30 +543,24 @@ static void fps_analyzer_video_tick(void *data, float seconds)
     int fps_smooth = (int)round(fps);
     double frametime_ms = avg_frametime;
 
-    // Zapisz do pliku TXT
-    char path[512];
-    build_txt_path(filter->output_path, path, sizeof(path));
-    FILE *f = fopen(path, "w");
-    if (f) {
-        if (filter->tearing_detected) {
-            fprintf(f, "FPS: %d\nFrametime: %.2f ms\nWarning: Tearing detected", fps_smooth, frametime_ms);
-        }
-        else{
-            fprintf(f, "FPS: %d\nFrametime: %.2f ms\n", fps_smooth, frametime_ms);
-        }
-        fclose(f);
-    }
+    // Update shared data for overlay source
+    g_fps_shared.fps = fps_smooth;
+    g_fps_shared.frametime_ms = frametime_ms;
+    g_fps_shared.tearing_detected = filter->tearing_detected;
+    g_fps_shared.last_update_ns = now;
 
-    // Zapisz do pliku CSV
-    char csv_path[512];
-    build_csv_path(filter->output_path, csv_path, sizeof(csv_path));
-    FILE *csv = fopen(csv_path, "a");
-    if (csv) {
-        time_t t = time(NULL);
-        fprintf(csv, "%lld,%d,%.2f\n", (long long)t, fps_smooth, frametime_ms);
-        fclose(csv);
+    // Optional CSV logging
+    if (filter->enable_csv) {
+        char csv_path[512];
+        build_csv_path(filter->output_path, csv_path, sizeof(csv_path));
+        FILE *csv = fopen(csv_path, "a");
+        if (csv) {
+            time_t t = time(NULL);
+            fprintf(csv, "%lld,%d,%.2f\n", (long long)t, fps_smooth, frametime_ms);
+            fclose(csv);
+        }
+        keep_last_n_lines(csv_path, FPS_CSV_HISTORY_LIMIT);
     }
-    keep_last_n_lines(csv_path, FPS_CSV_HISTORY_LIMIT);
 }
 
 // --- Lifecycle ---
@@ -570,6 +569,7 @@ static void fps_analyzer_destroy(void *data)
 {
     struct fps_analyzer_filter *filter = (struct fps_analyzer_filter *)data;
     if (filter) {
+        g_fps_shared.active_filter_count--;
         if (filter->prev_frame) bfree(filter->prev_frame);
         for (int i = 0; i < 3; ++i) {
             if (filter->prev_lines[i]) bfree(filter->prev_lines[i]);
@@ -625,18 +625,20 @@ static void *fps_analyzer_create(obs_data_t *settings, obs_source_t *context)
     filter->stagesurface = NULL;
     filter->staged_width = 0;
     filter->staged_height = 0;
+    // CSV logging
+    filter->enable_csv = obs_data_get_bool(settings, "enable_csv");
+    g_fps_shared.active_filter_count++;
     return filter;
 }
 
 static const char *fps_analyzer_get_name(void *unused)
 {
     UNUSED_PARAMETER(unused);
-    return "FPS Analyzer 0.2.1";
+    return "FPS Analyzer 0.3";
 }
 
 // --- Properties ---
 
-// Callback do dynamicznego włączania/wyłączania slidera sensitivity
 static bool analyze_method_modified(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
 {
     UNUSED_PARAMETER(p);
@@ -646,39 +648,56 @@ static bool analyze_method_modified(obs_properties_t *props, obs_property_t *p, 
     return true;
 }
 
+static bool enable_csv_modified(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
+{
+    UNUSED_PARAMETER(p);
+    bool csv_on = obs_data_get_bool(settings, "enable_csv");
+    obs_property_set_visible(obs_properties_get(props, "output_path"), csv_on);
+    obs_property_set_visible(obs_properties_get(props, "clear_csv_on_start"), csv_on);
+    return true;
+}
+
 static obs_properties_t *fps_analyzer_properties(void *data)
 {
     obs_properties_t *props = obs_properties_create();
-    obs_properties_add_path(props, "output_path", "FPS Output file",
-                            OBS_PATH_FILE_SAVE, "Text File (*.txt)", NULL);
-    obs_properties_add_bool(props, "clear_csv_on_start", "Clear CSV file on start (default: yes)");
-    obs_properties_add_bool(props, "enable_tearing_detection", "Tearing detection (default: yes)");
-    obs_properties_add_float_slider(props, "tearing_sensitivity", "Tearing sensitivity threshold (%)", 0.1, 10.0, 0.1);
-    obs_properties_add_text(
-        props,
-        "sensitivity_info",
-        "",
-        OBS_TEXT_INFO
-    );
+
+    // Analysis method
+    obs_property_t *method = obs_properties_add_list(props, "analyze_method", "Analysis method",
+        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    obs_property_list_add_int(method, "Last line diff (pixel analysis)", ANALYZE_LAST_LINE);
+    obs_property_list_add_int(method, "Full frame diff (all lines)", ANALYZE_DIFF);
+    obs_property_set_modified_callback(method, analyze_method_modified);
+
+    // Sensitivity threshold
+    obs_property_t *slider = obs_properties_add_float_slider(props, "sensitivity", "Sensitivity threshold (%)", 0.0, 5.0, 0.1);
+    int method_val = data ? ((struct fps_analyzer_filter*)data)->analyze_method : ANALYZE_LAST_LINE;
+    obs_property_set_visible(slider, method_val == ANALYZE_DIFF || method_val == ANALYZE_LAST_LINE);
+
+    // Update interval
     obs_property_t *interval = obs_properties_add_list(
         props, "update_interval", "Update interval (seconds)",
         OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_FLOAT);
     obs_property_list_add_float(interval, "0.5", 0.5);
     obs_property_list_add_float(interval, "1", 1.0);
     obs_property_list_add_float(interval, "2", 2.0);
-    obs_property_set_long_description(interval, "How often FPS/frametime is written to file.");
-    // Dropdown do wyboru metody analizy
-    obs_property_t *method = obs_properties_add_list(props, "analyze_method", "Analysis method",
-        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-    obs_property_list_add_int(method, "Last line diff (pixel analysis)", ANALYZE_LAST_LINE);
-    obs_property_list_add_int(method, "Full frame diff (all lines)", ANALYZE_DIFF);
-    // Slider do progu czułości
-    obs_property_t *slider = obs_properties_add_float_slider(props, "sensitivity", "Sensitivity threshold (%)", 0.0, 5.0, 0.1);
-    // Ustaw widoczność na starcie
-    int method_val = data ? ((struct fps_analyzer_filter*)data)->analyze_method : ANALYZE_LAST_LINE;
-    obs_property_set_visible(slider, method_val == ANALYZE_DIFF || method_val == ANALYZE_LAST_LINE);
-    // Callback na dropdownie
-    obs_property_set_modified_callback(method, analyze_method_modified);
+
+    // Tearing detection
+    obs_properties_add_bool(props, "enable_tearing_detection", "Tearing detection");
+    obs_properties_add_float_slider(props, "tearing_sensitivity", "Tearing sensitivity threshold (%)", 0.1, 10.0, 0.1);
+
+    // CSV logging
+    obs_property_t *csv_toggle = obs_properties_add_bool(props, "enable_csv", "Enable CSV logging");
+    obs_property_set_modified_callback(csv_toggle, enable_csv_modified);
+
+    obs_property_t *path_prop = obs_properties_add_path(props, "output_path", "CSV Output file",
+                            OBS_PATH_FILE_SAVE, "CSV File (*.csv)", NULL);
+    obs_property_t *clear_prop = obs_properties_add_bool(props, "clear_csv_on_start", "Clear CSV file on start");
+
+    // Set initial CSV fields visibility
+    bool csv_on = data ? ((struct fps_analyzer_filter*)data)->enable_csv : false;
+    obs_property_set_visible(path_prop, csv_on);
+    obs_property_set_visible(clear_prop, csv_on);
+
     return props;
 }
 
@@ -698,24 +717,10 @@ static void fps_analyzer_update(void *data, obs_data_t *settings)
     filter->tearing_sensitivity = obs_data_get_double(settings, "tearing_sensitivity");
     filter->analyze_method = (analyze_method_t)obs_data_get_int(settings, "analyze_method");
     filter->sensitivity = obs_data_get_double(settings, "sensitivity");
+    filter->enable_csv = obs_data_get_bool(settings, "enable_csv");
 }
 
 // --- File helpers ---
-
-// Funkcja do budowania ścieżki pliku TXT
-static void build_txt_path(const char *output_path, char *txt_path, size_t txt_path_size) {
-    if (output_path[0]) {
-        strncpy(txt_path, output_path, txt_path_size);
-        txt_path[txt_path_size-1] = '\0';
-        if (strlen(txt_path) < 4 || strcasecmp(txt_path + strlen(txt_path) - 4, ".txt") != 0) {
-            if (strlen(txt_path) + 4 < txt_path_size) {
-                strcat(txt_path, ".txt");
-            }
-        }
-    } else {
-        strcpy(txt_path, "fps.txt");
-    }
-}
 
 // Funkcja do budowania ścieżki pliku CSV
 static void build_csv_path(const char *output_path, char *csv_path, size_t csv_path_size) {
@@ -765,6 +770,7 @@ static void keep_last_n_lines(const char *csv_path, int n) {
 
 static void fps_analyzer_get_defaults(obs_data_t *settings)
 {
+    obs_data_set_default_bool(settings, "enable_csv", false);
     obs_data_set_default_bool(settings, "clear_csv_on_start", true);
     obs_data_set_default_bool(settings, "enable_tearing_detection", true);
     obs_data_set_default_double(settings, "tearing_sensitivity", 1.0);

@@ -1,117 +1,175 @@
 #include <obs-module.h>
-#include <graphics/graphics.h>
 #include <util/platform.h>
 #include <stdio.h>
 #include <string.h>
+
+#include "fps-shared-data.h"
 
 // Declare filter info for registration
 extern struct obs_source_info fps_analyzer_filter_info;
 
 struct fps_overlay_source {
-    char input_path[512];
-    char last_text[256];
-    uint64_t last_read_time;
-    double update_interval;
+    obs_source_t *text_source;
+    int font_size;
+    char last_text[512];
 };
 
 static const char *fps_overlay_get_name(void *unused)
 {
     UNUSED_PARAMETER(unused);
-    return "FPS Overlay (not working yet)";
+    return "FPS Analyzer 0.3";
+}
+
+static void update_text_source(struct fps_overlay_source *ctx, const char *text)
+{
+    if (!ctx->text_source)
+        return;
+
+    obs_data_t *font_obj = obs_data_create();
+    obs_data_set_string(font_obj, "face", "Arial");
+    obs_data_set_int(font_obj, "size", ctx->font_size);
+    obs_data_set_int(font_obj, "flags", 1); // bold
+    obs_data_set_string(font_obj, "style", "Bold");
+
+    obs_data_t *settings = obs_data_create();
+    obs_data_set_string(settings, "text", text);
+    obs_data_set_obj(settings, "font", font_obj);
+    obs_data_set_int(settings, "color1", 0xFFFFFF);
+    obs_data_set_int(settings, "color2", 0xFFFFFF);
+    obs_data_set_int(settings, "opacity", 100);
+    obs_data_set_bool(settings, "outline", true);
+    obs_data_set_int(settings, "outline_size", 2);
+    obs_data_set_int(settings, "outline_color", 0x000000);
+    obs_data_set_int(settings, "outline_opacity", 100);
+
+    obs_source_update(ctx->text_source, settings);
+
+    obs_data_release(font_obj);
+    obs_data_release(settings);
 }
 
 static void *fps_overlay_create(obs_data_t *settings, obs_source_t *source)
 {
+    UNUSED_PARAMETER(source);
     struct fps_overlay_source *ctx = (fps_overlay_source *)bzalloc(sizeof(struct fps_overlay_source));
-    ctx->input_path[0] = '\0';
+
+    ctx->font_size = (int)obs_data_get_int(settings, "font_size");
+    if (ctx->font_size <= 0)
+        ctx->font_size = 32;
+
     ctx->last_text[0] = '\0';
-    ctx->last_read_time = 0;
-    ctx->update_interval = 0.2;
-    const char *path = obs_data_get_string(settings, "input_path");
-    if (path) {
-        strncpy(ctx->input_path, path, sizeof(ctx->input_path));
-        ctx->input_path[sizeof(ctx->input_path)-1] = '\0';
+
+    // Create private text_gdiplus source (not visible in OBS source list)
+    obs_data_t *text_settings = obs_data_create();
+    obs_data_set_string(text_settings, "text", "Initializing...");
+    ctx->text_source = obs_source_create_private("text_gdiplus", "fps_overlay_text", text_settings);
+    obs_data_release(text_settings);
+
+    if (ctx->text_source) {
+        update_text_source(ctx, "Initializing...");
     }
-    ctx->update_interval = obs_data_get_double(settings, "update_interval");
-    if (ctx->update_interval <= 0.0)
-        ctx->update_interval = 0.2;
+
     return ctx;
 }
 
 static void fps_overlay_destroy(void *data)
 {
+    struct fps_overlay_source *ctx = (struct fps_overlay_source *)data;
+    if (ctx) {
+        if (ctx->text_source)
+            obs_source_release(ctx->text_source);
+    }
     bfree(data);
 }
 
 static obs_properties_t *fps_overlay_properties(void *data)
 {
+    UNUSED_PARAMETER(data);
     obs_properties_t *props = obs_properties_create();
-    obs_properties_add_path(props, "input_path", "FPS Data file",
-                            OBS_PATH_FILE, "Text File (*.txt)", NULL);
-    obs_property_t *interval = obs_properties_add_list(
-        props, "update_interval", "Update interval (seconds)",
-        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_FLOAT);
-    obs_property_list_add_float(interval, "0.1", 0.1);
-    obs_property_list_add_float(interval, "0.2", 0.2);
-    obs_property_list_add_float(interval, "0.5", 0.5);
-    obs_property_list_add_float(interval, "1", 1.0);
-    obs_property_set_long_description(interval, "How often overlay reads the file.");
+
+    obs_property_t *font = obs_properties_add_list(
+        props, "font_size", "Font size",
+        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    obs_property_list_add_int(font, "16", 16);
+    obs_property_list_add_int(font, "24", 24);
+    obs_property_list_add_int(font, "32", 32);
+    obs_property_list_add_int(font, "48", 48);
+    obs_property_list_add_int(font, "64", 64);
+
     return props;
+}
+
+static void fps_overlay_get_defaults(obs_data_t *settings)
+{
+    obs_data_set_default_int(settings, "font_size", 32);
 }
 
 static void fps_overlay_update(void *data, obs_data_t *settings)
 {
     struct fps_overlay_source *ctx = (struct fps_overlay_source *)data;
-    const char *path = obs_data_get_string(settings, "input_path");
-    if (path) {
-        strncpy(ctx->input_path, path, sizeof(ctx->input_path));
-        ctx->input_path[sizeof(ctx->input_path)-1] = '\0';
-    }
-    ctx->update_interval = obs_data_get_double(settings, "update_interval");
-    if (ctx->update_interval <= 0.0)
-        ctx->update_interval = 0.2;
+    ctx->font_size = (int)obs_data_get_int(settings, "font_size");
+    if (ctx->font_size <= 0)
+        ctx->font_size = 32;
+
+    // Force text re-render with new font size
+    if (ctx->last_text[0])
+        update_text_source(ctx, ctx->last_text);
 }
 
 static void fps_overlay_tick(void *data, float seconds)
 {
+    UNUSED_PARAMETER(seconds);
     struct fps_overlay_source *ctx = (struct fps_overlay_source *)data;
-    uint64_t now = os_gettime_ns();
-    double elapsed = (now - ctx->last_read_time) / 1000000000.0;
-    if (elapsed >= ctx->update_interval && ctx->input_path[0]) {
-        FILE *f = fopen(ctx->input_path, "r");
-        if (f) {
-            fgets(ctx->last_text, sizeof(ctx->last_text), f);
-            fclose(f);
+
+    char text[512];
+
+    if (g_fps_shared.active_filter_count <= 0) {
+        snprintf(text, sizeof(text),
+            "No FPS Analyzer filter active.\n"
+            "Add the \"FPS Analyzer 0.3\" filter\n"
+            "to a video source to start.");
+    } else {
+        if (g_fps_shared.tearing_detected) {
+            snprintf(text, sizeof(text),
+                "FPS: %d\nFrametime: %.2f ms\nWarning: Tearing detected",
+                g_fps_shared.fps, g_fps_shared.frametime_ms);
+        } else {
+            snprintf(text, sizeof(text),
+                "FPS: %d\nFrametime: %.2f ms",
+                g_fps_shared.fps, g_fps_shared.frametime_ms);
         }
-        ctx->last_read_time = now;
+    }
+
+    // Only update the text source if the text actually changed
+    if (strcmp(text, ctx->last_text) != 0) {
+        strncpy(ctx->last_text, text, sizeof(ctx->last_text));
+        ctx->last_text[sizeof(ctx->last_text) - 1] = '\0';
+        update_text_source(ctx, text);
     }
 }
 
 static void fps_overlay_render(void *data, gs_effect_t *effect)
 {
+    UNUSED_PARAMETER(effect);
     struct fps_overlay_source *ctx = (struct fps_overlay_source *)data;
-    // Draw simple white rectangle as background
-    gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
-    if (solid) {
-        gs_eparam_t *color = gs_effect_get_param_by_name(solid, "color");
-        gs_effect_set_color(color, 0xFFFFFFFF); // white
-        while (gs_effect_loop(solid, "Draw")) {
-            gs_draw_sprite(NULL, 0, 200, 40);
-        }
-    }
-    // Draw FPS text (for now, just log to OBS log)
-    // TODO: Replace with actual text rendering if needed
-    blog(LOG_INFO, "FPS Overlay: %s", ctx->last_text);
+    if (ctx->text_source)
+        obs_source_video_render(ctx->text_source);
 }
 
-static uint32_t fps_overlay_get_width(void *data) {
-    UNUSED_PARAMETER(data);
-    return 200; // overlay width in px
+static uint32_t fps_overlay_get_width(void *data)
+{
+    struct fps_overlay_source *ctx = (struct fps_overlay_source *)data;
+    if (ctx->text_source)
+        return obs_source_get_width(ctx->text_source);
+    return 0;
 }
 
-static uint32_t fps_overlay_get_height(void *data) {
-    UNUSED_PARAMETER(data);
-    return 40; // overlay height in px
+static uint32_t fps_overlay_get_height(void *data)
+{
+    struct fps_overlay_source *ctx = (struct fps_overlay_source *)data;
+    if (ctx->text_source)
+        return obs_source_get_height(ctx->text_source);
+    return 0;
 }
 
 struct obs_source_info fps_overlay_source_info = {
@@ -123,6 +181,7 @@ struct obs_source_info fps_overlay_source_info = {
     .destroy = fps_overlay_destroy,
     .get_width = fps_overlay_get_width,
     .get_height = fps_overlay_get_height,
+    .get_defaults = fps_overlay_get_defaults,
     .get_properties = fps_overlay_properties,
     .update = fps_overlay_update,
     .video_tick = fps_overlay_tick,
@@ -136,6 +195,6 @@ bool obs_module_load(void)
 {
     obs_register_source(&fps_analyzer_filter_info);
     obs_register_source(&fps_overlay_source_info);
-    blog(LOG_INFO, "FPS Analyzer filter and overlay loaded!");
+    blog(LOG_INFO, "FPS Analyzer 0.3 loaded");
     return true;
-} 
+}
