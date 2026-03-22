@@ -855,6 +855,7 @@ static void keep_last_n_lines(const char *csv_path, int n) {
 
 static void fps_analyzer_get_defaults(obs_data_t *settings)
 {
+    obs_data_set_default_double(settings, "update_interval", 1.0 / 30.0);
     obs_data_set_default_bool(settings, "enable_csv", false);
     obs_data_set_default_bool(settings, "clear_csv_on_start", true);
     obs_data_set_default_bool(settings, "enable_tearing_detection", true);

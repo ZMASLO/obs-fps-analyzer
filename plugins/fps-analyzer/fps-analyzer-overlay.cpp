@@ -396,7 +396,7 @@ static void *fps_overlay_create(obs_data_t *settings, obs_source_t *source)
 
     ctx->font_size = (int)obs_data_get_int(settings, "font_size");
     if (ctx->font_size <= 0)
-        ctx->font_size = 64;
+        ctx->font_size = 32;
     ctx->show_text_background = obs_data_get_bool(settings, "show_text_background");
     ctx->show_fps_text = obs_data_get_bool(settings, "show_fps_text");
     ctx->show_frametime_text = obs_data_get_bool(settings, "show_frametime_text");
@@ -527,16 +527,16 @@ static obs_properties_t *fps_overlay_properties(void *data)
 
 static void fps_overlay_get_defaults(obs_data_t *settings)
 {
-    obs_data_set_default_int(settings, "font_size", 64);
+    obs_data_set_default_int(settings, "font_size", 32);
     obs_data_set_default_bool(settings, "show_fps_text", true);
     obs_data_set_default_bool(settings, "show_frametime_text", true);
     obs_data_set_default_bool(settings, "show_tearing_text", true);
     obs_data_set_default_bool(settings, "show_text_background", true);
-    obs_data_set_default_bool(settings, "show_frametime_graph", false);
-    obs_data_set_default_int(settings, "frametime_style", GRAPH_STYLE_BIG);
+    obs_data_set_default_bool(settings, "show_frametime_graph", true);
+    obs_data_set_default_int(settings, "frametime_style", GRAPH_STYLE_COMPACT);
     obs_data_set_default_double(settings, "frametime_scale", 0.0);
-    obs_data_set_default_bool(settings, "show_fps_graph", false);
-    obs_data_set_default_int(settings, "fps_style", GRAPH_STYLE_BIG);
+    obs_data_set_default_bool(settings, "show_fps_graph", true);
+    obs_data_set_default_int(settings, "fps_style", GRAPH_STYLE_COMPACT);
     obs_data_set_default_double(settings, "fps_scale", 0.0);
 }
 
@@ -545,7 +545,7 @@ static void fps_overlay_update(void *data, obs_data_t *settings)
     struct fps_overlay_source *ctx = (struct fps_overlay_source *)data;
     ctx->font_size = (int)obs_data_get_int(settings, "font_size");
     if (ctx->font_size <= 0)
-        ctx->font_size = 64;
+        ctx->font_size = 32;
     ctx->show_text_background = obs_data_get_bool(settings, "show_text_background");
     ctx->show_fps_text = obs_data_get_bool(settings, "show_fps_text");
     ctx->show_frametime_text = obs_data_get_bool(settings, "show_frametime_text");
