@@ -11,6 +11,7 @@ extern struct obs_source_info fps_analyzer_filter_info;
 struct fps_overlay_source {
     obs_source_t *text_source;
     int font_size;
+    bool show_background;
     char last_text[512];
 };
 
@@ -42,6 +43,10 @@ static void update_text_source(struct fps_overlay_source *ctx, const char *text)
     obs_data_set_int(settings, "outline_color", 0x000000);
     obs_data_set_int(settings, "outline_opacity", 100);
 
+    // Background
+    obs_data_set_int(settings, "bk_color", 0x000000);
+    obs_data_set_int(settings, "bk_opacity", ctx->show_background ? 80 : 0);
+
     obs_source_update(ctx->text_source, settings);
 
     obs_data_release(font_obj);
@@ -56,6 +61,7 @@ static void *fps_overlay_create(obs_data_t *settings, obs_source_t *source)
     ctx->font_size = (int)obs_data_get_int(settings, "font_size");
     if (ctx->font_size <= 0)
         ctx->font_size = 64;
+    ctx->show_background = obs_data_get_bool(settings, "show_background");
 
     ctx->last_text[0] = '\0';
 
@@ -96,12 +102,15 @@ static obs_properties_t *fps_overlay_properties(void *data)
     obs_property_list_add_int(font, "48", 48);
     obs_property_list_add_int(font, "64", 64);
 
+    obs_properties_add_bool(props, "show_background", "Show background");
+
     return props;
 }
 
 static void fps_overlay_get_defaults(obs_data_t *settings)
 {
     obs_data_set_default_int(settings, "font_size", 64);
+    obs_data_set_default_bool(settings, "show_background", true);
 }
 
 static void fps_overlay_update(void *data, obs_data_t *settings)
@@ -110,10 +119,10 @@ static void fps_overlay_update(void *data, obs_data_t *settings)
     ctx->font_size = (int)obs_data_get_int(settings, "font_size");
     if (ctx->font_size <= 0)
         ctx->font_size = 64;
+    ctx->show_background = obs_data_get_bool(settings, "show_background");
 
-    // Force text re-render with new font size
-    if (ctx->last_text[0])
-        update_text_source(ctx, ctx->last_text);
+    // Force re-render with new settings
+    update_text_source(ctx, ctx->last_text[0] ? ctx->last_text : "FPS: --");
 }
 
 static void fps_overlay_tick(void *data, float seconds)
