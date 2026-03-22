@@ -637,7 +637,7 @@ static void fps_overlay_render(void *data, gs_effect_t *effect)
     if (any_text && ctx->text_source)
     {
         gs_matrix_push();
-        gs_matrix_translate3f((float)GRAPH_MARGIN, (float)GRAPH_MARGIN, 0.0f);
+        gs_matrix_translate3f(0.0f, (float)GRAPH_MARGIN, 0.0f);
         obs_source_video_render(ctx->text_source);
         gs_matrix_pop();
         y_offset = obs_source_get_height(ctx->text_source) + GRAPH_MARGIN * 2;

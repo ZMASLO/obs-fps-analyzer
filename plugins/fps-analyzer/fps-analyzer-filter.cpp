@@ -760,9 +760,11 @@ static obs_properties_t *fps_analyzer_properties(void *data)
     obs_property_t *interval = obs_properties_add_list(
         props, "update_interval", "Update interval (seconds)",
         OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_FLOAT);
-    obs_property_list_add_float(interval, "0.5", 0.5);
-    obs_property_list_add_float(interval, "1", 1.0);
-    obs_property_list_add_float(interval, "2", 2.0);
+    obs_property_list_add_float(interval, "60 FPS (0.017s)", 1.0 / 60.0);
+    obs_property_list_add_float(interval, "30 FPS (0.033s)", 1.0 / 30.0);
+    obs_property_list_add_float(interval, "0.5s", 0.5);
+    obs_property_list_add_float(interval, "1s", 1.0);
+    obs_property_list_add_float(interval, "2s", 2.0);
 
     // Tearing detection
     obs_properties_add_bool(props, "enable_tearing_detection", "Tearing detection");
