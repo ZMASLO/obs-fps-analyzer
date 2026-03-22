@@ -70,6 +70,8 @@ struct fps_analyzer_filter {
     // Tearing history per-frame (aligned with frametime_history)
     bool tearing_per_frame[FRAMETIME_HISTORY];
     double fps_per_frame[FRAMETIME_HISTORY];
+    double smoothed_frametime[FRAMETIME_HISTORY];
+    double ema_frametime; // EMA state for frametime smoothing
 };
 
 // --- Utility functions ---
@@ -171,6 +173,17 @@ static void analyze_luma_frame(struct fps_analyzer_filter *filter,
             double ft = (now - filter->last_unique_frame_time) / 1000000.0;
             filter->frametime_history[filter->frametime_pos] = ft;
             filter->tearing_per_frame[filter->frametime_pos] = filter->tearing_detected;
+
+            // Smoothed frametime: EMA (exponential moving average)
+            // alpha=0.15 — responsive enough to show stutters, smooth enough to reduce noise
+            {
+                const double alpha = 0.15;
+                if (filter->ema_frametime <= 0.0)
+                    filter->ema_frametime = ft; // init to first value
+                else
+                    filter->ema_frametime = filter->ema_frametime * (1.0 - alpha) + ft * alpha;
+                filter->smoothed_frametime[filter->frametime_pos] = filter->ema_frametime;
+            }
 
             // Compute smoothed FPS for this point: average frametime over ~1s window
             // Window size based on instantaneous FPS estimate
@@ -610,7 +623,8 @@ static void fps_analyzer_video_tick(void *data, float seconds)
     if (count > FPS_GRAPH_HISTORY) count = FPS_GRAPH_HISTORY;
     for (int i = 0; i < count; i++) {
         int idx = (filter->frametime_pos - count + i + FRAMETIME_HISTORY) % FRAMETIME_HISTORY;
-        g_fps_shared.graph_frametimes[i] = filter->frametime_history[idx];
+        g_fps_shared.graph_frametimes[i] = filter->smoothed_frametime[idx];
+        g_fps_shared.graph_frametimes_raw[i] = filter->frametime_history[idx];
         g_fps_shared.graph_fps[i] = filter->fps_per_frame[idx];
         g_fps_shared.graph_tearing[i] = filter->tearing_per_frame[idx];
     }
@@ -693,6 +707,7 @@ static void *fps_analyzer_create(obs_data_t *settings, obs_source_t *context)
     filter->staged_width = 0;
     filter->staged_height = 0;
     filter->last_logged_format = -1;
+    filter->ema_frametime = 0.0;
     // CSV logging
     filter->enable_csv = obs_data_get_bool(settings, "enable_csv");
     g_fps_shared.active_filter_count++;
