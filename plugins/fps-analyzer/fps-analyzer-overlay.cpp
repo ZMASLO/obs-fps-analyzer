@@ -452,32 +452,9 @@ static void fps_overlay_render(void *data, gs_effect_t *effect)
     // 3. FPS graph
     if (ctx->show_fps_graph)
     {
-        // Smooth FPS: window size = current FPS (1 second of samples)
-        double fps_values[FPS_GRAPH_HISTORY];
-        int smooth_window = g_fps_shared.fps > 0 ? g_fps_shared.fps : 30;
-        if (smooth_window < 5)
-            smooth_window = 5;
-        if (smooth_window > count)
-            smooth_window = count;
-        for (int i = 0; i < count; i++)
-        {
-            double sum = 0.0;
-            int n = 0;
-            for (int j = i - smooth_window + 1; j <= i; j++)
-            {
-                if (j >= 0 && j < count)
-                {
-                    sum += g_fps_shared.graph_frametimes[j];
-                    n++;
-                }
-            }
-            double avg_ft = (n > 0) ? (sum / n) : 0.0;
-            fps_values[i] = (avg_ft > 0.0) ? round(1000.0 / avg_ft) : 0.0;
-        }
-
         gs_matrix_push();
         gs_matrix_translate3f(0.0f, (float)y_offset, 0.0f);
-        render_line_graph(fps_values, count,
+        render_line_graph(g_fps_shared.graph_fps, count,
                           60.0, 30.0, true, true, 60.0, 30.0,
                           ctx->label_fps_ref1, ctx->label_fps_ref2);
         // Title label

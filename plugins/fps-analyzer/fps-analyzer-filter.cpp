@@ -69,6 +69,7 @@ struct fps_analyzer_filter {
     int last_logged_format;
     // Tearing history per-frame (aligned with frametime_history)
     bool tearing_per_frame[FRAMETIME_HISTORY];
+    double fps_per_frame[FRAMETIME_HISTORY];
 };
 
 // --- Utility functions ---
@@ -170,6 +171,23 @@ static void analyze_luma_frame(struct fps_analyzer_filter *filter,
             double ft = (now - filter->last_unique_frame_time) / 1000000.0;
             filter->frametime_history[filter->frametime_pos] = ft;
             filter->tearing_per_frame[filter->frametime_pos] = filter->tearing_detected;
+
+            // Compute smoothed FPS for this point: average frametime over ~1s window
+            // Window size based on instantaneous FPS estimate
+            int inst_fps = (ft > 0.0) ? (int)round(1000.0 / ft) : 30;
+            if (inst_fps < 10) inst_fps = 10;
+            if (inst_fps > 120) inst_fps = 120;
+            int window = inst_fps;
+            if (window > filter->frametime_count) window = filter->frametime_count;
+            if (window < 1) window = 1;
+            double sum = 0.0;
+            for (int w = 0; w < window; w++) {
+                int idx = (filter->frametime_pos - w + FRAMETIME_HISTORY) % FRAMETIME_HISTORY;
+                sum += filter->frametime_history[idx];
+            }
+            double avg_ft = sum / window;
+            filter->fps_per_frame[filter->frametime_pos] = (avg_ft > 0.0) ? round(1000.0 / avg_ft) : 0.0;
+
             filter->frametime_pos = (filter->frametime_pos + 1) % FRAMETIME_HISTORY;
             if (filter->frametime_count < FRAMETIME_HISTORY)
                 filter->frametime_count++;
@@ -593,6 +611,7 @@ static void fps_analyzer_video_tick(void *data, float seconds)
     for (int i = 0; i < count; i++) {
         int idx = (filter->frametime_pos - count + i + FRAMETIME_HISTORY) % FRAMETIME_HISTORY;
         g_fps_shared.graph_frametimes[i] = filter->frametime_history[idx];
+        g_fps_shared.graph_fps[i] = filter->fps_per_frame[idx];
         g_fps_shared.graph_tearing[i] = filter->tearing_per_frame[idx];
     }
     g_fps_shared.graph_count = count;

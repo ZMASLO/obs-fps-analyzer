@@ -15,6 +15,7 @@ struct fps_shared_data {
     int unsupported_format; // -1 = ok, otherwise video_format enum value
     // Graph data — linearized (oldest to newest), ready for rendering
     double graph_frametimes[FPS_GRAPH_HISTORY];
+    double graph_fps[FPS_GRAPH_HISTORY];
     bool graph_tearing[FPS_GRAPH_HISTORY];
     int graph_count;
 };
