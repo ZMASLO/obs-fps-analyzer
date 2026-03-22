@@ -128,6 +128,12 @@ static void fps_overlay_tick(void *data, float seconds)
             "No FPS Analyzer filter active.\n"
             "Add the \"FPS Analyzer 0.3\" filter\n"
             "to a video source to start.");
+    } else if (g_fps_shared.active_filter_count > 1) {
+        snprintf(text, sizeof(text),
+            "Warning: %d FPS Analyzer filters active.\n"
+            "Use only one filter at a time\n"
+            "for accurate results.",
+            g_fps_shared.active_filter_count);
     } else {
         if (g_fps_shared.tearing_detected) {
             snprintf(text, sizeof(text),
