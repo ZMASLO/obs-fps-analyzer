@@ -560,12 +560,23 @@ static void fps_analyzer_video_tick(void *data, float seconds)
         filter->rolling_start = 0;
     }
 
-    // --- FPS jako odwrotność średniego frametime z ostatnich 60 klatek ---
+    // --- FPS from rolling window: average last ~1 second of frametimes ---
+    // Use min(frametime_count, last_fps) as window, minimum 10, maximum 120
+    int window = filter->frametime_count;
+    if (window > 120) window = 120;
+    // Dynamically shrink window to ~1 second based on previous FPS
+    if (g_fps_shared.fps > 10 && g_fps_shared.fps < window)
+        window = g_fps_shared.fps;
+    if (window < 10 && filter->frametime_count >= 10) window = 10;
+    if (window > filter->frametime_count) window = filter->frametime_count;
+
     double avg_frametime = 0.0;
-    for (int i = 0; i < filter->frametime_count; ++i)
-        avg_frametime += filter->frametime_history[i];
-    if (filter->frametime_count > 0)
-        avg_frametime /= filter->frametime_count;
+    for (int i = 0; i < window; ++i) {
+        int idx = (filter->frametime_pos - window + i + FRAMETIME_HISTORY) % FRAMETIME_HISTORY;
+        avg_frametime += filter->frametime_history[idx];
+    }
+    if (window > 0)
+        avg_frametime /= window;
     double fps = (avg_frametime > 0.0) ? (1000.0 / avg_frametime) : 0.0;
     int fps_smooth = (int)round(fps);
     double frametime_ms = avg_frametime;
