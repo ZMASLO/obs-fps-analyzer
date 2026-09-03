@@ -38,3 +38,6 @@ Thumbs.db
 
 # OBS Studio
 rundir/ 
+# Debug frame dumps (test corpus, hundreds of MB)
+debug_dump/
+*.pgm

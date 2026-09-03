@@ -1,0 +1,11 @@
+# resdet-cli manifest example. One case per line:
+#   dir ; expected (WxH | native) ; tolerance px ; note
+# `dir` is a frame-dump folder written by the filter's "Debug options"
+# (frame_NNNN.pgm + frames.csv), relative to this file.
+# Prefix the expectation with "xfail:" for a known limitation: the case
+# still runs and is reported, but a failure does not count as a regression
+# (and a pass is flagged as XPASS so you can un-mark it).
+# Run:  resdet-cli --manifest cases.txt [--verbose]
+game_menu_1080p_20260903_120000 ; 1920x1080 ; 16 ; 1080p borderless on a 1440p desktop
+game_native_20260903_120100 ; native ; 0 ; native, no scaling expected
+game_cas_50pct_20260903_120200 ; xfail:1280x720 ; 16 ; adaptive sharpen-upscaler at 2x - known limitation
