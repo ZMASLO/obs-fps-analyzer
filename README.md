@@ -69,6 +69,13 @@ The plugin offers two different image analysis methods:
 - **Output**: `Source res: ~1280x720 -> 1920x1080 (95%)` or `Source res: native 1920x1080`
 - **Limitations**: Detects traditional scaling (nearest/bilinear/bicubic/lanczos) even under HUD/film grain. Temporal/AI upscalers (DLSS, FSR 2+, TSR, PSSR) partially rebuild the spectrum — the knee may still show through (weaker, fluctuating), but results are approximate. Letterbox/pillarbox black bars distort the spectrum and can produce wrong values.
 
+### Debug options (frame dump):
+- **Settings** (filter, under the "Debug options" checkbox): "Frame dump folder", "Dump label (case name)", "Frames per dump" (default 16), "Start delay after button" (default 5 s — time to Alt+Tab back into the game) and a "Dump frames now" button
+- **Status**: a "Dump status" label under the button counts down the delay, shows the frame being written and reports completion with the output folder
+- **Hotkey**: "FPS Analyzer: dump frames (debug)" in Settings → Hotkeys (top, global section) starts a dump immediately, without leaving the game
+- **What it writes**: the next N full-frame luma planes fed to the resolution detector (one every 0.5 s) as `frame_NNNN.pgm` (binary PGM, 8-bit) into `<folder>/<label>_<timestamp>/`, plus `frames.csv` with time, frame size, video format and the detection result at each frame
+- **Purpose**: build a test corpus of real captured frames for the offline detector harness — the dumps are byte-for-byte what the detector sees in OBS (unlike screenshots, which miss capture-card processing; never use JPG — its 8x8 block compression creates fake cutoffs)
+
 ### Tearing Detection:
 - **Independent feature**: Works with any analysis method
 - **Description**: Detects screen tearing by analyzing 3 lines (top, middle, bottom)

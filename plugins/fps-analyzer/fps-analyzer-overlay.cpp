@@ -10,6 +10,9 @@
 
 // Declare filter info for registration
 extern struct obs_source_info fps_analyzer_filter_info;
+// Global hotkeys owned by the filter module (fps-analyzer-filter.cpp)
+void fps_analyzer_register_hotkeys(void);
+void fps_analyzer_unregister_hotkeys(void);
 
 #define GRAPH_MARGIN 20
 #define GRAPH_LEGEND_WIDTH 80
@@ -1072,6 +1075,12 @@ bool obs_module_load(void)
 {
     obs_register_source(&fps_analyzer_filter_info);
     obs_register_source(&fps_overlay_source_info);
+    fps_analyzer_register_hotkeys();
     blog(LOG_INFO, "FPS Analyzer 0.5 loaded");
     return true;
+}
+
+void obs_module_unload(void)
+{
+    fps_analyzer_unregister_hotkeys();
 }

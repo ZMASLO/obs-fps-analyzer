@@ -2,6 +2,8 @@
 #include <graphics/graphics.h>
 #include <graphics/vec4.h>
 #include <util/platform.h>
+#include <util/threading.h>
+#include <atomic>
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -80,6 +82,21 @@ struct fps_analyzer_filter {
     int spectrum_fps;             // 0 = follow analysis rate (~2/s), else 30/60
     uint64_t last_spec_submit_ns;
     uint8_t *crop_buffer;         // RESDET_FAST_CROP_W*H luma for the fast spectrum path
+    // Debug: frame dump (the exact luma planes fed to the detector)
+    bool debug_options;
+    char dump_dir[512];
+    char dump_label[128];
+    int dump_count;
+    int dump_delay;               // seconds between the button click and the first frame
+    volatile long dump_remaining; // >0 while a dump session is active (set from the UI thread)
+    uint64_t dump_not_before_ns;  // frames are written only once os_gettime_ns() passes this
+    int dump_done_frames;         // frames written by the last finished session (0 = none)
+    bool dump_status_dirty;       // status label needs a properties refresh
+    uint64_t dump_status_refresh_ns;
+    int dump_index;
+    char dump_session_dir[640];
+    FILE *dump_csv;
+    uint64_t dump_start_ns;
 };
 
 // --- Utility functions ---
@@ -279,6 +296,154 @@ static void fast_spectrum_crop(uint32_t w, uint32_t h,
     *ch = h < RESDET_FAST_CROP_H ? h : RESDET_FAST_CROP_H;
     *x0 = (w - *cw) / 2;
     *y0 = (h - *ch) / 2;
+}
+
+// --- Debug: frame dump ---
+// Writes the exact full-frame luma planes that go to the resolution
+// detector (one per ~0.5 s) as PGM files plus frames.csv with the
+// detection result at that moment. Test corpus for the offline harness.
+
+static void read_debug_settings(struct fps_analyzer_filter *filter, obs_data_t *settings) {
+    filter->debug_options = obs_data_get_bool(settings, "debug_options");
+    const char *dd = obs_data_get_string(settings, "debug_dump_dir");
+    snprintf(filter->dump_dir, sizeof(filter->dump_dir), "%s", dd ? dd : "");
+    const char *dl = obs_data_get_string(settings, "debug_dump_label");
+    snprintf(filter->dump_label, sizeof(filter->dump_label), "%s", dl ? dl : "");
+    // keep the label safe as a folder name
+    for (char *c = filter->dump_label; *c; ++c) {
+        bool ok = (*c >= '0' && *c <= '9') || (*c >= 'a' && *c <= 'z') ||
+                  (*c >= 'A' && *c <= 'Z') || *c == '-' || *c == '_';
+        if (!ok) *c = '_';
+    }
+    filter->dump_count = (int)obs_data_get_int(settings, "debug_dump_count");
+    filter->dump_delay = (int)obs_data_get_int(settings, "debug_dump_delay");
+}
+
+// Starts a dump session after `delay_sec`. Called from the UI thread
+// (button) or the hotkey thread; the video thread does the writing.
+static void debug_dump_request(struct fps_analyzer_filter *filter, int delay_sec) {
+    if (os_atomic_load_long(&filter->dump_remaining) > 0) {
+        blog(LOG_INFO, "[FPS Analyzer] Frame dump already in progress");
+        return;
+    }
+    if (delay_sec < 0) delay_sec = 0;
+    long n = filter->dump_count > 0 ? filter->dump_count : 16;
+    filter->dump_index = 0;
+    filter->dump_done_frames = 0;
+    filter->dump_not_before_ns = os_gettime_ns() + (uint64_t)delay_sec * 1000000000ULL;
+    os_atomic_set_long(&filter->dump_remaining, n);
+    filter->dump_status_dirty = true;
+    blog(LOG_INFO, "[FPS Analyzer] Frame dump requested: %ld frames, starting in %d s", n, delay_sec);
+}
+
+// Global (frontend) hotkey: OBS only lists hotkeys registered on regular
+// sources in its settings, not on filters, so the hotkey is registered once
+// per module and targets the most recently created filter instance.
+static std::atomic<struct fps_analyzer_filter *> g_dump_hotkey_target{nullptr};
+static obs_hotkey_id g_dump_hotkey = OBS_INVALID_HOTKEY_ID;
+
+static void debug_dump_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed) {
+    UNUSED_PARAMETER(data);
+    UNUSED_PARAMETER(id);
+    UNUSED_PARAMETER(hotkey);
+    struct fps_analyzer_filter *filter = g_dump_hotkey_target.load();
+    if (pressed && filter)
+        debug_dump_request(filter, 0);
+}
+
+void fps_analyzer_register_hotkeys(void) {
+    g_dump_hotkey = obs_hotkey_register_frontend("fps_analyzer.debug_dump",
+                                                 "FPS Analyzer: dump frames (debug)",
+                                                 debug_dump_hotkey, NULL);
+}
+
+void fps_analyzer_unregister_hotkeys(void) {
+    if (g_dump_hotkey != OBS_INVALID_HOTKEY_ID) {
+        obs_hotkey_unregister(g_dump_hotkey);
+        g_dump_hotkey = OBS_INVALID_HOTKEY_ID;
+    }
+}
+
+static void debug_dump_finish(struct fps_analyzer_filter *filter) {
+    if (filter->dump_csv) {
+        fclose(filter->dump_csv);
+        filter->dump_csv = NULL;
+    }
+    blog(LOG_INFO, "[FPS Analyzer] Frame dump finished: %d frames in %s",
+         filter->dump_index, filter->dump_session_dir);
+    filter->dump_done_frames = filter->dump_index;
+    filter->dump_index = 0;
+    os_atomic_set_long(&filter->dump_remaining, 0);
+    filter->dump_status_dirty = true;
+}
+
+// Text for the status label in the properties dialog
+static void debug_dump_status_text(struct fps_analyzer_filter *filter, char *buf, size_t size) {
+    long remaining = os_atomic_load_long(&filter->dump_remaining);
+    uint64_t now = os_gettime_ns();
+    if (remaining > 0) {
+        if (now < filter->dump_not_before_ns) {
+            uint64_t left = filter->dump_not_before_ns - now;
+            snprintf(buf, size, "Dump status: starting in %d s...",
+                     (int)((left + 999999999ULL) / 1000000000ULL));
+        } else {
+            snprintf(buf, size, "Dump status: writing frame %d/%d...",
+                     filter->dump_index + 1, filter->dump_index + (int)remaining);
+        }
+    } else if (filter->dump_done_frames > 0) {
+        snprintf(buf, size, "Dump status: complete - %d frames in %s",
+                 filter->dump_done_frames, filter->dump_session_dir);
+    } else {
+        snprintf(buf, size, "Dump status: idle");
+    }
+}
+
+static void debug_dump_frame(struct fps_analyzer_filter *filter, const uint8_t *luma,
+                             uint32_t width, uint32_t height, int format, uint64_t now) {
+    if (filter->dump_index == 0) {
+        // New session folder: <dir>/<label>_<timestamp>/
+        char stamp[32];
+        time_t t = time(NULL);
+        struct tm *tmv = localtime(&t);
+        strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", tmv);
+        const char *base = filter->dump_dir;
+        char *fallback = NULL;
+        if (!base[0]) {
+            fallback = obs_module_get_config_path(obs_current_module(), "dumps");
+            base = fallback;
+        }
+        snprintf(filter->dump_session_dir, sizeof(filter->dump_session_dir), "%s/%s%s%s",
+                 base, filter->dump_label, filter->dump_label[0] ? "_" : "", stamp);
+        if (fallback) bfree(fallback);
+        os_mkdirs(filter->dump_session_dir);
+
+        char csv_path[700];
+        snprintf(csv_path, sizeof(csv_path), "%s/frames.csv", filter->dump_session_dir);
+        filter->dump_csv = fopen(csv_path, "w");
+        if (filter->dump_csv)
+            fprintf(filter->dump_csv,
+                    "index,t_ms,width,height,video_format,res_valid,src_w,src_h,conf_w,conf_h\n");
+        filter->dump_start_ns = now;
+        blog(LOG_INFO, "[FPS Analyzer] Frame dump started: %s", filter->dump_session_dir);
+    }
+
+    char path[700];
+    snprintf(path, sizeof(path), "%s/frame_%04d.pgm", filter->dump_session_dir, filter->dump_index);
+    FILE *f = fopen(path, "wb");
+    if (f) {
+        fprintf(f, "P5\n%u %u\n255\n", width, height);
+        fwrite(luma, 1, (size_t)width * height, f);
+        fclose(f);
+    }
+    if (filter->dump_csv)
+        fprintf(filter->dump_csv, "%d,%.1f,%u,%u,%d,%d,%d,%d,%.3f,%.3f\n",
+                filter->dump_index, (now - filter->dump_start_ns) / 1000000.0,
+                width, height, format, g_fps_shared.res_valid ? 1 : 0,
+                g_fps_shared.res_src_w, g_fps_shared.res_src_h,
+                g_fps_shared.res_conf_w, g_fps_shared.res_conf_h);
+    filter->dump_index++;
+    if (os_atomic_dec_long(&filter->dump_remaining) <= 0)
+        debug_dump_finish(filter);
 }
 
 // --- Shared analysis logic ---
@@ -547,16 +712,28 @@ static struct obs_source_frame *fps_analyzer_filter_video(void *data,
     // Analiza klatki
     analyze_luma_frame(filter, luma, luma_size);
 
-    // Detekcja rozdzielczości źródłowej (upscale) — pełna klatka co ~0.5s
-    if (filter->enable_resolution_detection && filter->res_detector) {
+    // Detekcja rozdzielczości źródłowej (upscale) — pełna klatka co ~0.5s;
+    // tym samym torem idzie debugowy zrzut klatek
+    {
         uint64_t now = os_gettime_ns();
-        if (now - filter->last_resdet_submit_ns >= 500000000ULL) {
+        bool detect = filter->enable_resolution_detection && filter->res_detector;
+        bool dump = os_atomic_load_long(&filter->dump_remaining) > 0 &&
+                    now >= filter->dump_not_before_ns;
+        if ((detect || dump) && now - filter->last_resdet_submit_ns >= 500000000ULL) {
             bool have_full = (filter->analyze_method == ANALYZE_DIFF);
             if (!have_full)
                 have_full = extract_full_luma_async(frame, luma);
-            if (have_full &&
-                resdet_submit(filter->res_detector, luma, width, height))
-                filter->last_resdet_submit_ns = now;
+            if (have_full) {
+                bool consumed = false;
+                if (detect && resdet_submit(filter->res_detector, luma, width, height))
+                    consumed = true;
+                if (dump) {
+                    debug_dump_frame(filter, luma, width, height, (int)frame->format, now);
+                    consumed = true;
+                }
+                if (consumed)
+                    filter->last_resdet_submit_ns = now;
+            }
         }
         // Szybka ścieżka widma (30/60 FPS) — centralny wycinek na osobnym wątku
         if (fast_spectrum_due(filter, now)) {
@@ -659,17 +836,29 @@ static void fps_analyzer_video_render(void *data, gs_effect_t *effect)
         analyze_luma_frame(filter, filter->luma_buffer, luma_size);
         g_fps_shared.unsupported_format = -1;
 
-        // Detekcja rozdzielczości źródłowej (upscale) — pełna klatka co ~0.5s
-        if (filter->enable_resolution_detection && filter->res_detector) {
+        // Detekcja rozdzielczości źródłowej (upscale) — pełna klatka co ~0.5s;
+        // tym samym torem idzie debugowy zrzut klatek
+        {
             uint64_t now = os_gettime_ns();
-            if (now - filter->last_resdet_submit_ns >= 500000000ULL) {
+            bool detect = filter->enable_resolution_detection && filter->res_detector;
+            bool dump = os_atomic_load_long(&filter->dump_remaining) > 0 &&
+                    now >= filter->dump_not_before_ns;
+            if ((detect || dump) && now - filter->last_resdet_submit_ns >= 500000000ULL) {
                 if (filter->analyze_method != ANALYZE_DIFF) {
                     ensure_luma_buffer(filter, (size_t)width * height);
                     bgra_to_luma(video_data, video_linesize,
                                  filter->luma_buffer, width, height);
                 }
-                if (resdet_submit(filter->res_detector, filter->luma_buffer,
-                                  width, height))
+                bool consumed = false;
+                if (detect && resdet_submit(filter->res_detector, filter->luma_buffer,
+                                            width, height))
+                    consumed = true;
+                if (dump) {
+                    debug_dump_frame(filter, filter->luma_buffer, width, height,
+                                     (int)VIDEO_FORMAT_BGRA, now);
+                    consumed = true;
+                }
+                if (consumed)
                     filter->last_resdet_submit_ns = now;
             }
             // Szybka ścieżka widma (30/60 FPS) — centralny wycinek z BGRA
@@ -702,6 +891,19 @@ static void fps_analyzer_video_tick(void *data, float seconds)
     UNUSED_PARAMETER(seconds);
     struct fps_analyzer_filter *filter = (struct fps_analyzer_filter *)data;
     uint64_t now = os_gettime_ns();
+
+    // Debug dump: keep the properties dialog's status label fresh — once per
+    // second while a session is pending/active, and once when it finishes.
+    // (OBS rebuilds the dialog on the update_properties signal.)
+    if (filter->debug_options) {
+        bool active = os_atomic_load_long(&filter->dump_remaining) > 0;
+        if (filter->dump_status_dirty ||
+            (active && now - filter->dump_status_refresh_ns >= 1000000000ULL)) {
+            filter->dump_status_dirty = false;
+            filter->dump_status_refresh_ns = now;
+            obs_source_update_properties(filter->context);
+        }
+    }
 
     // Spectrum thumbnail — polled every tick (not gated by update_interval)
     // so the 30/60 FPS fast path reaches the overlay at full rate
@@ -806,6 +1008,9 @@ static void fps_analyzer_destroy(void *data)
         }
         if (filter->luma_buffer) bfree(filter->luma_buffer);
         if (filter->crop_buffer) bfree(filter->crop_buffer);
+        if (filter->dump_csv) fclose(filter->dump_csv);
+        struct fps_analyzer_filter *expected = filter;
+        g_dump_hotkey_target.compare_exchange_strong(expected, nullptr);
         if (filter->res_detector) resdet_destroy(filter->res_detector);
         obs_enter_graphics();
         if (filter->texrender) gs_texrender_destroy(filter->texrender);
@@ -872,6 +1077,17 @@ static void *fps_analyzer_create(obs_data_t *settings, obs_source_t *context)
         filter->res_detector = resdet_create();
         resdet_set_fast_spectrum(filter->res_detector, filter->spectrum_fps > 0);
     }
+    // Debug frame dump (session state starts idle); the global hotkey targets
+    // the most recently created filter
+    read_debug_settings(filter, settings);
+    filter->dump_remaining = 0;
+    filter->dump_not_before_ns = 0;
+    filter->dump_done_frames = 0;
+    filter->dump_status_dirty = false;
+    filter->dump_status_refresh_ns = 0;
+    filter->dump_index = 0;
+    filter->dump_csv = NULL;
+    g_dump_hotkey_target.store(filter);
     g_fps_shared.active_filter_count++;
     return filter;
 }
@@ -900,6 +1116,31 @@ static bool enable_csv_modified(obs_properties_t *props, obs_property_t *p, obs_
     obs_property_set_visible(obs_properties_get(props, "output_path"), csv_on);
     obs_property_set_visible(obs_properties_get(props, "clear_csv_on_start"), csv_on);
     return true;
+}
+
+static bool debug_options_modified(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
+{
+    UNUSED_PARAMETER(p);
+    bool on = obs_data_get_bool(settings, "debug_options");
+    obs_property_set_visible(obs_properties_get(props, "debug_dump_dir"), on);
+    obs_property_set_visible(obs_properties_get(props, "debug_dump_label"), on);
+    obs_property_set_visible(obs_properties_get(props, "debug_dump_count"), on);
+    obs_property_set_visible(obs_properties_get(props, "debug_dump_delay"), on);
+    obs_property_set_visible(obs_properties_get(props, "debug_dump_now"), on);
+    obs_property_set_visible(obs_properties_get(props, "debug_dump_status"), on);
+    return true;
+}
+
+// "Dump frames now" button — runs on the UI thread; the video thread picks
+// up dump_remaining and writes frames on its next detector submissions.
+static bool debug_dump_button(obs_properties_t *props, obs_property_t *p, void *data)
+{
+    UNUSED_PARAMETER(props);
+    UNUSED_PARAMETER(p);
+    struct fps_analyzer_filter *filter = (struct fps_analyzer_filter *)data;
+    if (filter)
+        debug_dump_request(filter, filter->dump_delay);
+    return false;
 }
 
 static bool resolution_detection_modified(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
@@ -975,6 +1216,42 @@ static obs_properties_t *fps_analyzer_properties(void *data)
     obs_property_set_visible(path_prop, csv_on);
     obs_property_set_visible(clear_prop, csv_on);
 
+    // Debug options
+    obs_property_t *dbg = obs_properties_add_bool(props, "debug_options", "Debug options");
+    obs_property_set_modified_callback(dbg, debug_options_modified);
+    obs_property_t *dump_dir = obs_properties_add_path(props, "debug_dump_dir", "Frame dump folder",
+                                                       OBS_PATH_DIRECTORY, NULL, NULL);
+    obs_property_set_long_description(dump_dir,
+        "Where frame dumps are written (one subfolder per dump: <label>_<timestamp>). "
+        "Empty = the plugin's config folder.");
+    obs_property_t *dump_label = obs_properties_add_text(props, "debug_dump_label",
+                                                         "Dump label (case name)", OBS_TEXT_DEFAULT);
+    obs_property_t *dump_count = obs_properties_add_int(props, "debug_dump_count",
+                                                        "Frames per dump", 1, 200, 1);
+    obs_property_t *dump_delay = obs_properties_add_int_slider(props, "debug_dump_delay",
+                                                               "Start delay after button (s)", 0, 30, 1);
+    obs_property_set_long_description(dump_delay,
+        "Countdown between clicking \"Dump frames now\" and the first written frame - "
+        "time to Alt+Tab back into the game and leave the pause menu. The hotkey "
+        "\"FPS Analyzer: dump frames (debug)\" (Settings -> Hotkeys, top section) starts immediately.");
+    obs_property_t *dump_btn = obs_properties_add_button(props, "debug_dump_now",
+                                                         "Dump frames now", debug_dump_button);
+    obs_property_set_long_description(dump_btn,
+        "After the start delay, writes the next N full-frame luma planes fed to the "
+        "resolution detector (one every 0.5 s) as PGM files, plus frames.csv with the "
+        "detection result at each frame. Works with detection enabled or disabled.");
+    char status[800] = "Dump status: idle";
+    if (data)
+        debug_dump_status_text((struct fps_analyzer_filter *)data, status, sizeof(status));
+    obs_property_t *dump_status = obs_properties_add_text(props, "debug_dump_status", status, OBS_TEXT_INFO);
+    bool dbg_on = data ? ((struct fps_analyzer_filter*)data)->debug_options : false;
+    obs_property_set_visible(dump_dir, dbg_on);
+    obs_property_set_visible(dump_label, dbg_on);
+    obs_property_set_visible(dump_count, dbg_on);
+    obs_property_set_visible(dump_delay, dbg_on);
+    obs_property_set_visible(dump_btn, dbg_on);
+    obs_property_set_visible(dump_status, dbg_on);
+
     return props;
 }
 
@@ -1001,6 +1278,7 @@ static void fps_analyzer_update(void *data, obs_data_t *settings)
         filter->res_detector = resdet_create();
     if (filter->res_detector)
         resdet_set_fast_spectrum(filter->res_detector, filter->spectrum_fps > 0);
+    read_debug_settings(filter, settings);
 }
 
 // --- File helpers ---
@@ -1062,6 +1340,11 @@ static void fps_analyzer_get_defaults(obs_data_t *settings)
     obs_data_set_default_double(settings, "sensitivity", 0.1);
     obs_data_set_default_bool(settings, "enable_resolution_detection", false);
     obs_data_set_default_int(settings, "spectrum_fps", 0);
+    obs_data_set_default_bool(settings, "debug_options", false);
+    obs_data_set_default_string(settings, "debug_dump_dir", "");
+    obs_data_set_default_string(settings, "debug_dump_label", "");
+    obs_data_set_default_int(settings, "debug_dump_count", 16);
+    obs_data_set_default_int(settings, "debug_dump_delay", 5);
 }
 
 // --- Source info ---
