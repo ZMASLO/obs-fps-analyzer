@@ -1,0 +1,7 @@
+# resdet-cli manifest example. One case per line:
+#   dir ; expected (WxH | native) ; tolerance px ; note
+# `dir` is a frame-dump folder written by the filter's "Debug options"
+# (frame_NNNN.pgm + frames.csv), relative to this file.
+# Run:  resdet-cli --manifest cases.txt [--verbose]
+game_menu_1080p_20260903_120000 ; 1920x1080 ; 16 ; 1080p borderless on a 1440p desktop
+game_native_20260903_120100 ; native ; 0 ; native, no scaling expected

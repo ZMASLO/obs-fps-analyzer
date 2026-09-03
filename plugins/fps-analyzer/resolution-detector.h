@@ -61,6 +61,51 @@ void resdet_set_fast_spectrum(struct resolution_detector *rd, bool enabled);
 bool resdet_submit_spectrum(struct resolution_detector *rd, const uint8_t *luma,
                             uint32_t width, uint32_t height);
 
+// --- Debug / test-tool API (not used by the OBS plugin itself) ---
+
+// Tunable detector parameters. The plugin runs with the defaults; the test
+// tools override them per run to sweep thresholds against a frame corpus.
+struct resdet_params {
+    float accum_alpha;    // EMA weight of each analysis (default 0.25)
+    float sign_threshold; // sign-vote fraction needed for a candidate (default 0.60)
+    float knee_threshold; // knee step in log10 decades (default 0.45)
+    int warmup_frames;    // analyses before anything is reported (default 4)
+    int min_votes;        // agreeing analyses in the consensus history (default 3)
+    float sign_cand_min;  // vote needed to be a sign candidate at all (default 0.55)
+    float sign_joint_min; // W+H vote sum for an aspect-consistent pair (default 1.13)
+    float sign_flank_min; // min mean vote at offsets 2..3 around a peak (default 0.47);
+                          // lower = comb-like peak from a filter null, rejected
+};
+void resdet_debug_get_params(struct resolution_detector *rd, struct resdet_params *out);
+// Set before submitting frames (not thread-safe against a running analysis).
+void resdet_debug_set_params(struct resolution_detector *rd, const struct resdet_params *p);
+
+struct resdet_debug_frame {
+    int frame_w, frame_h;
+    int sign_w, sign_h;           // sign-method pick this analysis (0 = none)
+    double sign_conf_w, sign_conf_h;
+    int sign_mode;                // 0 = none, 1 = independent per-axis picks, 2 = joint (same scale on both axes)
+    int knee_w, knee_h;           // magnitude-knee pick this analysis (0 = none)
+    double knee_conf_w, knee_conf_h;
+    int frames_accumulated;       // analyses since the last dimension change
+};
+
+// Number of full-frame analyses completed so far (lets tools wait for the worker).
+int resdet_debug_analysis_count(struct resolution_detector *rd);
+
+// Raw per-analysis picks behind the last published result.
+bool resdet_debug_last_frame(struct resolution_detector *rd, struct resdet_debug_frame *out);
+
+// Copies the accumulated sign votes (votes[i] belongs to position i+range)
+// and the accumulated log10 magnitude profile of an axis (0 = width,
+// 1 = height). Returns the axis length, or 0 before the first analysis.
+// Only call while the worker is idle (test tools).
+size_t resdet_debug_axis(struct resolution_detector *rd, int axis, float *votes, size_t votes_cap,
+                         float *profile, size_t profile_cap, int *range);
+
+// Knee score for every position of a profile (0 outside the searchable range).
+void resdet_debug_knee_scores(const float *profile, size_t length, double *scores);
+
 // Colormap for the spectrum thumbnail: dark -> purple -> white (BGRA).
 static inline void resdet_spectrum_color(uint8_t v, uint8_t *b, uint8_t *g, uint8_t *r)
 {

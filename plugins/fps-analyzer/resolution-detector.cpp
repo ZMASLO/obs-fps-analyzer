@@ -18,6 +18,14 @@
 // results over multiple frames (EMA) and use a higher threshold.
 #define RESDET_RANGE 12
 #define RESDET_THRESHOLD 0.60f
+// Sign candidates: minimum vote to be considered at all, the W+H vote sum
+// an aspect-consistent pair needs to win jointly (natives on the corpus
+// never form a pair with both >= 0.55; true pairs on a temporal upscaler
+// in motion sum ~1.13-1.19, spurious pairs <= 1.11), and the flank test
+// that rejects comb-like peaks (see collect_sign_candidates).
+#define SIGN_CAND_MIN 0.55f
+#define SIGN_JOINT_SUM_MIN 1.13f
+#define SIGN_FLANK_MIN 0.47f
 // EMA weight of each new frame's result vector
 #define RESDET_ACCUM_ALPHA 0.25f
 // Analyses required before reporting anything (lets the EMA settle)
@@ -158,14 +166,16 @@ static void magnitude_profile(const float *f, size_t length, size_t n_perp,
     }
 }
 
-// Strongest energy step in the (smoothed) profile, or 0 if none passes
-// the threshold. A true upscale boundary stays low past the step, so we
-// also check a far window — this rejects narrow dips (e.g. filter nulls).
-static void pick_knee(const float *profile, size_t length, int *out_idx,
-                      double *out_conf)
+// Knee score for every position of a (smoothed) log-magnitude profile:
+// how much the energy steps down at k. A true upscale boundary stays low
+// past the step, so a far window is checked too (rejects narrow dips such
+// as filter nulls), and the local decay trend left of k is subtracted
+// (soft content decaying into the noise floor is not a boundary).
+// scores[] has `length` entries, 0 outside the searchable range.
+static void knee_scores(const float *profile, size_t length, double *scores)
 {
-    *out_idx = 0;
-    *out_conf = 0.0;
+    for (size_t i = 0; i < length; i++)
+        scores[i] = 0.0;
 
     size_t W = length / 64 < 8 ? 8 : length / 64;
     size_t lo = (size_t)(length * RESDET_MIN_FRACTION);
@@ -188,8 +198,6 @@ static void pick_knee(const float *profile, size_t length, int *out_idx,
     for (size_t i = 0; i < length; i++)
         pre[i + 1] = pre[i] + p[i];
 
-    double best = 0.0;
-    size_t best_k = 0;
     for (size_t k = lo; k < hi; k++) {
         double left = (pre[k] - pre[k - W]) / W;
         double left_far = (pre[k - W] - pre[k - 2 * W]) / W;
@@ -199,19 +207,29 @@ static void pick_knee(const float *profile, size_t length, int *out_idx,
         double step = left - right;
         double step_far = left - far_right;
         double score = step < step_far ? step : step_far;
-        // Soft content decays gradually into the noise floor; that
-        // shoulder is not an upscale boundary. A real boundary must drop
-        // much faster than the local decay trend left of the candidate.
         double trend = left_far - left;
         if (trend > 0.0)
             score -= trend;
-        if (score > best) {
-            best = score;
+        scores[k] = score > 0.0 ? score : 0.0;
+    }
+}
+
+// Strongest knee above threshold, or 0 if none.
+static void pick_knee(const float *profile, size_t length, float threshold,
+                      int *out_idx, double *out_conf)
+{
+    *out_idx = 0;
+    *out_conf = 0.0;
+    std::vector<double> scores(length);
+    knee_scores(profile, length, scores.data());
+    double best = 0.0;
+    size_t best_k = 0;
+    for (size_t k = 0; k < length; k++)
+        if (scores[k] > best) {
+            best = scores[k];
             best_k = k;
         }
-    }
-
-    if (best >= KNEE_THRESHOLD) {
+    if (best >= threshold) {
         *out_idx = (int)best_k;
         *out_conf = best / KNEE_CONF_FULL;
         if (*out_conf > 1.0)
@@ -223,7 +241,7 @@ static void pick_knee(const float *profile, size_t length, int *out_idx,
 // median of nonzero values if enough of them agree within tolerance,
 // otherwise 0. Smooths DRS jitter and rejects sporadic false knees.
 static int axis_consensus(const int *vals, const double *confs, int count,
-                          double *out_conf)
+                          int min_votes, double *out_conf)
 {
     *out_conf = 0.0;
 
@@ -236,7 +254,7 @@ static int axis_consensus(const int *vals, const double *confs, int count,
             nzc[n] = confs[i];
             n++;
         }
-    if (n < RESDET_MIN_VOTES)
+    if (n < min_votes)
         return 0;
 
     // insertion sort (n <= RESDET_HISTORY), confidences follow values
@@ -264,32 +282,59 @@ static int axis_consensus(const int *vals, const double *confs, int count,
             agree++;
             conf_sum += nzc[i];
         }
-    if (agree < RESDET_MIN_VOTES)
+    if (agree < min_votes)
         return 0;
 
     *out_conf = conf_sum / agree;
     return median;
 }
 
-// Highest-confidence candidate above threshold, or 0 if none.
-static void pick_candidate(const float *result, size_t length, size_t range,
-                           int *out_idx, double *out_conf)
+// Sign-method candidates of one axis: positions in the searchable range
+// whose accumulated vote is >= cand_min and whose flanks look random.
+// Around a real mirror boundary, pairs misaligned by a few bins are
+// uncorrelated (votes ~0.5). Around a spectral null of some filter (motion
+// blur, reconstruction kernels) the coefficient signs flip systematically,
+// so misaligned pairs are anti-correlated (votes well below 0.5) and the
+// peaks come in combs — the flank test rejects those.
+struct sign_cand {
+    int pos;
+    double vote;
+};
+
+static void collect_sign_candidates(const float *votes, size_t length, size_t range,
+                                    float cand_min, float flank_min,
+                                    std::vector<sign_cand> &out)
 {
-    *out_idx = 0;
-    *out_conf = 0.0;
+    out.clear();
     size_t count = length - 2 * range;
     size_t lo = (size_t)(length * RESDET_MIN_FRACTION);
     size_t hi = (size_t)(length * RESDET_MIN_SCALE);
     for (size_t i = 0; i < count; i++) {
-        size_t idx = i + range;
-        if (idx < lo)
+        size_t pos = i + range;
+        if (pos < lo)
             continue;
-        if (idx >= hi)
+        if (pos >= hi)
             break;
-        if (result[i] >= RESDET_THRESHOLD && result[i] > *out_conf) {
-            *out_idx = (int)idx;
-            *out_conf = result[i];
+        if (votes[i] < cand_min)
+            continue;
+        // Offsets 2..3: the combs seen on real content have a ~5-bin period,
+        // so these land in the anti-correlated troughs, while offset 4 would
+        // already touch the next tooth and dilute the test.
+        float flank = 0.0f;
+        int n = 0;
+        for (size_t d = 2; d <= 3; d++) {
+            if (i >= d) {
+                flank += votes[i - d];
+                n++;
+            }
+            if (i + d < count) {
+                flank += votes[i + d];
+                n++;
+            }
         }
+        if (n && flank / (float)n < flank_min)
+            continue;
+        out.push_back({(int)pos, (double)votes[i]});
     }
 }
 
@@ -406,6 +451,14 @@ struct resolution_detector {
     bool result_fresh = false;
     uint8_t spectrum[RESDET_SPEC_W * RESDET_SPEC_H] = {};
     bool spectrum_fresh = false;
+    // debug/test-tool snapshot of the last analysis
+    resdet_debug_frame dbg_frame = {};
+    bool dbg_valid = false;
+    std::atomic<int> analysis_seq{0};
+    // tunable parameters (defaults = the plugin's behaviour)
+    resdet_params params = {RESDET_ACCUM_ALPHA, RESDET_THRESHOLD, (float)KNEE_THRESHOLD,
+                            RESDET_WARMUP_FRAMES, RESDET_MIN_VOTES,
+                            SIGN_CAND_MIN, SIGN_JOINT_SUM_MIN, SIGN_FLANK_MIN};
 
     // analysis-worker-only state
     dct_plan plan;
@@ -510,13 +563,13 @@ void resolution_detector::analyze(const uint8_t *luma, uint32_t w, uint32_t h)
         hist_count = 0;
     } else {
         for (size_t i = 0; i < xaccum.size(); i++)
-            xaccum[i] += (xresult[i] - xaccum[i]) * RESDET_ACCUM_ALPHA;
+            xaccum[i] += (xresult[i] - xaccum[i]) * params.accum_alpha;
         for (size_t i = 0; i < yaccum.size(); i++)
-            yaccum[i] += (yresult[i] - yaccum[i]) * RESDET_ACCUM_ALPHA;
+            yaccum[i] += (yresult[i] - yaccum[i]) * params.accum_alpha;
         for (size_t i = 0; i < xprof_acc.size(); i++)
-            xprof_acc[i] += (xprof[i] - xprof_acc[i]) * RESDET_ACCUM_ALPHA;
+            xprof_acc[i] += (xprof[i] - xprof_acc[i]) * params.accum_alpha;
         for (size_t i = 0; i < yprof_acc.size(); i++)
-            yprof_acc[i] += (yprof[i] - yprof_acc[i]) * RESDET_ACCUM_ALPHA;
+            yprof_acc[i] += (yprof[i] - yprof_acc[i]) * params.accum_alpha;
         frames_accumulated++;
     }
 
@@ -524,21 +577,91 @@ void resolution_detector::analyze(const uint8_t *luma, uint32_t w, uint32_t h)
     // during warmup) so the panel shows early. Skipped while the fast
     // crop-based path owns the thumbnail.
     if (!fast_spectrum.load())
-        publish_spectrum(spec_main, coeffs.data(), w, h, RESDET_ACCUM_ALPHA);
+        publish_spectrum(spec_main, coeffs.data(), w, h, params.accum_alpha);
 
-    if (frames_accumulated < RESDET_WARMUP_FRAMES)
+    if (frames_accumulated < params.warmup_frames)
         return;
 
-    // Hybrid: exact sign method first; magnitude knee as the robust
-    // fallback when overlays/grain destroy the sign symmetry.
-    int cand_w = 0, cand_h = 0;
-    double cconf_w = 0.0, cconf_h = 0.0;
-    pick_candidate(xaccum.data(), w, RESDET_RANGE, &cand_w, &cconf_w);
-    pick_candidate(yaccum.data(), h, RESDET_RANGE, &cand_h, &cconf_h);
-    if (!cand_w)
-        pick_knee(xprof_acc.data(), w, &cand_w, &cconf_w);
-    if (!cand_h)
-        pick_knee(yprof_acc.data(), h, &cand_h, &cconf_h);
+    // Sign method: candidates per axis, then a joint pick. Upscaling is
+    // (almost always) uniform, so two candidates at the same scale on both
+    // axes are far stronger evidence than either axis alone — a pair with
+    // votes 0.59+0.58 beats a lone 0.63 that has no partner. Independent
+    // per-axis picks remain the fallback (horizontal-only scaling, or one
+    // axis drowned in soft content).
+    std::vector<sign_cand> cands_w, cands_h;
+    collect_sign_candidates(xaccum.data(), w, RESDET_RANGE, params.sign_cand_min,
+                            params.sign_flank_min, cands_w);
+    collect_sign_candidates(yaccum.data(), h, RESDET_RANGE, params.sign_cand_min,
+                            params.sign_flank_min, cands_h);
+    int sign_w = 0, sign_h = 0, sign_mode = 0;
+    double sconf_w = 0.0, sconf_h = 0.0;
+    {
+        std::vector<double> hvote(h, 0.0);
+        for (auto &c : cands_h)
+            hvote[c.pos] = c.vote;
+        double best = 0.0;
+        for (auto &c : cands_w) {
+            int ky = (int)((double)c.pos * h / w + 0.5);
+            for (int d = -1; d <= 1; d++) {
+                int k = ky + d;
+                if (k < 0 || k >= (int)h || hvote[k] <= 0.0)
+                    continue;
+                double s = c.vote + hvote[k];
+                if (s > best) {
+                    best = s;
+                    sign_w = c.pos;
+                    sign_h = k;
+                    sconf_w = c.vote;
+                    sconf_h = hvote[k];
+                }
+            }
+        }
+        if (best >= params.sign_joint_min) {
+            sign_mode = 2;
+        } else {
+            sign_w = sign_h = 0;
+            sconf_w = sconf_h = 0.0;
+            for (auto &c : cands_w)
+                if (c.vote >= params.sign_threshold && c.vote > sconf_w) {
+                    sign_w = c.pos;
+                    sconf_w = c.vote;
+                }
+            for (auto &c : cands_h)
+                if (c.vote >= params.sign_threshold && c.vote > sconf_h) {
+                    sign_h = c.pos;
+                    sconf_h = c.vote;
+                }
+            if (sign_w || sign_h)
+                sign_mode = 1;
+        }
+    }
+
+    // Magnitude knee: fallback when overlays/grain destroy the sign
+    // symmetry. Computed every analysis so the debug tools can compare.
+    int knee_w = 0, knee_h = 0;
+    double kconf_w = 0.0, kconf_h = 0.0;
+    pick_knee(xprof_acc.data(), w, params.knee_threshold, &knee_w, &kconf_w);
+    pick_knee(yprof_acc.data(), h, params.knee_threshold, &knee_h, &kconf_h);
+    int cand_w = sign_w ? sign_w : knee_w;
+    int cand_h = sign_h ? sign_h : knee_h;
+    double cconf_w = sign_w ? sconf_w : kconf_w;
+    double cconf_h = sign_h ? sconf_h : kconf_h;
+    {
+        std::lock_guard<std::mutex> lock(result_mtx);
+        dbg_frame.frame_w = (int)w;
+        dbg_frame.frame_h = (int)h;
+        dbg_frame.sign_w = sign_w;
+        dbg_frame.sign_h = sign_h;
+        dbg_frame.sign_conf_w = sconf_w;
+        dbg_frame.sign_conf_h = sconf_h;
+        dbg_frame.sign_mode = sign_mode;
+        dbg_frame.knee_w = knee_w;
+        dbg_frame.knee_h = knee_h;
+        dbg_frame.knee_conf_w = kconf_w;
+        dbg_frame.knee_conf_h = kconf_h;
+        dbg_frame.frames_accumulated = frames_accumulated;
+        dbg_valid = true;
+    }
 
     hist_w[hist_pos] = cand_w;
     hconf_w[hist_pos] = cconf_w;
@@ -552,8 +675,8 @@ void resolution_detector::analyze(const uint8_t *luma, uint32_t w, uint32_t h)
     r.valid = true;
     r.frame_w = (int)w;
     r.frame_h = (int)h;
-    r.src_w = axis_consensus(hist_w, hconf_w, hist_count, &r.conf_w);
-    r.src_h = axis_consensus(hist_h, hconf_h, hist_count, &r.conf_h);
+    r.src_w = axis_consensus(hist_w, hconf_w, hist_count, params.min_votes, &r.conf_w);
+    r.src_h = axis_consensus(hist_h, hconf_h, hist_count, params.min_votes, &r.conf_h);
 
     // Uniform-scale inference: upscaling almost always preserves aspect,
     // so when one axis has a clean signature and the other drowned in
@@ -594,6 +717,7 @@ void resolution_detector::worker_loop()
             h = job_h;
         }
         analyze(luma.data(), w, h);
+        analysis_seq++;
         {
             std::lock_guard<std::mutex> lock(mtx);
             has_job = false;
@@ -712,4 +836,60 @@ bool resdet_get_spectrum(struct resolution_detector *rd, uint8_t *out)
     memcpy(out, rd->spectrum, sizeof(rd->spectrum));
     rd->spectrum_fresh = false;
     return true;
+}
+
+// --- Debug / test-tool API ---
+
+void resdet_debug_get_params(struct resolution_detector *rd, struct resdet_params *out)
+{
+    if (rd && out)
+        *out = rd->params;
+}
+
+void resdet_debug_set_params(struct resolution_detector *rd, const struct resdet_params *p)
+{
+    if (rd && p)
+        rd->params = *p;
+}
+
+int resdet_debug_analysis_count(struct resolution_detector *rd)
+{
+    return rd ? rd->analysis_seq.load() : 0;
+}
+
+bool resdet_debug_last_frame(struct resolution_detector *rd, struct resdet_debug_frame *out)
+{
+    if (!rd || !out)
+        return false;
+    std::lock_guard<std::mutex> lock(rd->result_mtx);
+    if (!rd->dbg_valid)
+        return false;
+    *out = rd->dbg_frame;
+    return true;
+}
+
+size_t resdet_debug_axis(struct resolution_detector *rd, int axis, float *votes, size_t votes_cap,
+                         float *profile, size_t profile_cap, int *range)
+{
+    if (!rd || rd->accum_w == 0 || rd->accum_h == 0)
+        return 0;
+    const std::vector<float> &v = axis == 0 ? rd->xaccum : rd->yaccum;
+    const std::vector<float> &p = axis == 0 ? rd->xprof_acc : rd->yprof_acc;
+    size_t length = axis == 0 ? rd->accum_w : rd->accum_h;
+    if (votes) {
+        size_t n = v.size() < votes_cap ? v.size() : votes_cap;
+        memcpy(votes, v.data(), n * sizeof(float));
+    }
+    if (profile) {
+        size_t n = p.size() < profile_cap ? p.size() : profile_cap;
+        memcpy(profile, p.data(), n * sizeof(float));
+    }
+    if (range)
+        *range = RESDET_RANGE;
+    return length;
+}
+
+void resdet_debug_knee_scores(const float *profile, size_t length, double *scores)
+{
+    knee_scores(profile, length, scores);
 }
