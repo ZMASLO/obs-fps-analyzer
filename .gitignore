@@ -41,3 +41,8 @@ rundir/
 # Debug frame dumps (test corpus, hundreds of MB)
 debug_dump/
 *.pgm
+
+# Test tool outputs (resdet-selftest / resdet-cli spectrum dumps)
+*.bmp
+_resdet_out/
+_votes/
