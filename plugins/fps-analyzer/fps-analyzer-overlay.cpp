@@ -37,6 +37,7 @@ struct fps_overlay_source
     bool show_fps_text;
     bool show_frametime_text;
     bool show_tearing_text;
+    bool show_resolution_text;
     bool show_frametime_graph;
     bool show_fps_graph;
     int frametime_style; // GRAPH_STYLE_BIG or GRAPH_STYLE_COMPACT
@@ -56,7 +57,7 @@ struct fps_overlay_source
 static const char *fps_overlay_get_name(void *unused)
 {
     UNUSED_PARAMETER(unused);
-    return "FPS Analyzer 0.4";
+    return "FPS Analyzer 0.5";
 }
 
 static void update_text_source(struct fps_overlay_source *ctx, const char *text)
@@ -401,6 +402,7 @@ static void *fps_overlay_create(obs_data_t *settings, obs_source_t *source)
     ctx->show_fps_text = obs_data_get_bool(settings, "show_fps_text");
     ctx->show_frametime_text = obs_data_get_bool(settings, "show_frametime_text");
     ctx->show_tearing_text = obs_data_get_bool(settings, "show_tearing_text");
+    ctx->show_resolution_text = obs_data_get_bool(settings, "show_resolution_text");
     ctx->show_frametime_graph = obs_data_get_bool(settings, "show_frametime_graph");
     ctx->frametime_style = (int)obs_data_get_int(settings, "frametime_style");
     ctx->show_fps_graph = obs_data_get_bool(settings, "show_fps_graph");
@@ -478,6 +480,10 @@ static obs_properties_t *fps_overlay_properties(void *data)
     obs_properties_add_bool(props, "show_fps_text", "Show FPS text");
     obs_properties_add_bool(props, "show_frametime_text", "Show Frametime text");
     obs_properties_add_bool(props, "show_tearing_text", "Show Tearing warning");
+    obs_property_t *res_text = obs_properties_add_bool(props, "show_resolution_text", "Show Source resolution text");
+    obs_property_set_long_description(res_text,
+        "Shows the upscale source resolution estimate. Requires \"Detect upscale "
+        "source resolution\" to be enabled in the FPS Analyzer filter.");
     obs_properties_add_bool(props, "show_text_background", "Show text background");
 
     obs_property_t *ft_toggle = obs_properties_add_bool(props, "show_frametime_graph", "Show frametime graph");
@@ -531,6 +537,7 @@ static void fps_overlay_get_defaults(obs_data_t *settings)
     obs_data_set_default_bool(settings, "show_fps_text", true);
     obs_data_set_default_bool(settings, "show_frametime_text", true);
     obs_data_set_default_bool(settings, "show_tearing_text", true);
+    obs_data_set_default_bool(settings, "show_resolution_text", true);
     obs_data_set_default_bool(settings, "show_text_background", true);
     obs_data_set_default_bool(settings, "show_frametime_graph", true);
     obs_data_set_default_int(settings, "frametime_style", GRAPH_STYLE_COMPACT);
@@ -550,6 +557,7 @@ static void fps_overlay_update(void *data, obs_data_t *settings)
     ctx->show_fps_text = obs_data_get_bool(settings, "show_fps_text");
     ctx->show_frametime_text = obs_data_get_bool(settings, "show_frametime_text");
     ctx->show_tearing_text = obs_data_get_bool(settings, "show_tearing_text");
+    ctx->show_resolution_text = obs_data_get_bool(settings, "show_resolution_text");
     ctx->show_frametime_graph = obs_data_get_bool(settings, "show_frametime_graph");
     ctx->frametime_style = (int)obs_data_get_int(settings, "frametime_style");
     ctx->show_fps_graph = obs_data_get_bool(settings, "show_fps_graph");
@@ -574,7 +582,7 @@ static void fps_overlay_tick(void *data, float seconds)
     {
         snprintf(text, sizeof(text),
                  "No FPS Analyzer filter active.\n"
-                 "Add the \"FPS Analyzer 0.4\" filter\n"
+                 "Add the \"FPS Analyzer 0.5\" filter\n"
                  "to a video source to start.");
     }
     else if (g_fps_shared.active_filter_count > 1)
@@ -611,6 +619,37 @@ static void fps_overlay_tick(void *data, float seconds)
                 pos += snprintf(text + pos, sizeof(text) - pos, "\n");
             pos += snprintf(text + pos, sizeof(text) - pos, "Warning: Tearing detected");
         }
+        if (ctx->show_resolution_text && g_fps_shared.res_detect_enabled)
+        {
+            if (pos > 0)
+                pos += snprintf(text + pos, sizeof(text) - pos, "\n");
+            if (!g_fps_shared.res_valid)
+            {
+                pos += snprintf(text + pos, sizeof(text) - pos, "Source res: analyzing...");
+            }
+            else if (g_fps_shared.res_src_w > 0 || g_fps_shared.res_src_h > 0)
+            {
+                // Fall back to the frame dimension on an axis with no detection
+                int sw = g_fps_shared.res_src_w > 0 ? g_fps_shared.res_src_w : g_fps_shared.res_frame_w;
+                int sh = g_fps_shared.res_src_h > 0 ? g_fps_shared.res_src_h : g_fps_shared.res_frame_h;
+                double conf = 1.0;
+                if (g_fps_shared.res_src_w > 0 && g_fps_shared.res_conf_w < conf)
+                    conf = g_fps_shared.res_conf_w;
+                if (g_fps_shared.res_src_h > 0 && g_fps_shared.res_conf_h < conf)
+                    conf = g_fps_shared.res_conf_h;
+                pos += snprintf(text + pos, sizeof(text) - pos,
+                                "Source res: ~%dx%d -> %dx%d (%d%%)",
+                                sw, sh,
+                                g_fps_shared.res_frame_w, g_fps_shared.res_frame_h,
+                                (int)(conf * 100.0));
+            }
+            else
+            {
+                pos += snprintf(text + pos, sizeof(text) - pos,
+                                "Source res: native %dx%d",
+                                g_fps_shared.res_frame_w, g_fps_shared.res_frame_h);
+            }
+        }
         if (pos == 0)
             snprintf(text, sizeof(text), " "); // at least a space so text source has content
     }
@@ -632,7 +671,8 @@ static void fps_overlay_render(void *data, gs_effect_t *effect)
     bool any_graph = (ctx->show_frametime_graph || ctx->show_fps_graph) && count >= 2;
 
     // 1. Render text at top with margin
-    bool any_text = ctx->show_fps_text || ctx->show_frametime_text || ctx->show_tearing_text;
+    bool any_text = ctx->show_fps_text || ctx->show_frametime_text ||
+                    ctx->show_tearing_text || ctx->show_resolution_text;
     uint32_t y_offset = 0;
     if (any_text && ctx->text_source)
     {
@@ -717,7 +757,8 @@ static void fps_overlay_render(void *data, gs_effect_t *effect)
 static uint32_t fps_overlay_get_width(void *data)
 {
     struct fps_overlay_source *ctx = (struct fps_overlay_source *)data;
-    bool any_text = ctx->show_fps_text || ctx->show_frametime_text || ctx->show_tearing_text;
+    bool any_text = ctx->show_fps_text || ctx->show_frametime_text ||
+                    ctx->show_tearing_text || ctx->show_resolution_text;
     uint32_t text_w = 0;
     if (any_text && ctx->text_source)
         text_w = obs_source_get_width(ctx->text_source) + GRAPH_MARGIN * 2;
@@ -745,7 +786,8 @@ static uint32_t fps_overlay_get_width(void *data)
 static uint32_t fps_overlay_get_height(void *data)
 {
     struct fps_overlay_source *ctx = (struct fps_overlay_source *)data;
-    bool any_text = ctx->show_fps_text || ctx->show_frametime_text || ctx->show_tearing_text;
+    bool any_text = ctx->show_fps_text || ctx->show_frametime_text ||
+                    ctx->show_tearing_text || ctx->show_resolution_text;
     uint32_t text_h = 0;
     if (any_text && ctx->text_source)
         text_h = obs_source_get_height(ctx->text_source) + GRAPH_MARGIN * 2;
@@ -794,6 +836,6 @@ bool obs_module_load(void)
 {
     obs_register_source(&fps_analyzer_filter_info);
     obs_register_source(&fps_overlay_source_info);
-    blog(LOG_INFO, "FPS Analyzer 0.4 loaded");
+    blog(LOG_INFO, "FPS Analyzer 0.5 loaded");
     return true;
 }

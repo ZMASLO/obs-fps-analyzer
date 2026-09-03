@@ -11,6 +11,7 @@
 #endif
 
 #include "fps-shared-data.h"
+#include "resolution-detector.h"
 
 // Global shared data — read by fps-analyzer-overlay.cpp
 struct fps_shared_data g_fps_shared = {0, 0.0, false, 0, 0, -1, {}, 0};
@@ -72,6 +73,10 @@ struct fps_analyzer_filter {
     double fps_per_frame[FRAMETIME_HISTORY];
     double smoothed_frametime[FRAMETIME_HISTORY];
     double ema_frametime; // EMA state for frametime smoothing
+    // Upscale source resolution detection
+    bool enable_resolution_detection;
+    struct resolution_detector *res_detector;
+    uint64_t last_resdet_submit_ns;
 };
 
 // --- Utility functions ---
@@ -135,6 +140,84 @@ static void rgba_to_luma(const uint8_t *rgba, uint32_t linesize,
             uint8_t b = row[x * 4 + 2];
             luma[y * width + x] = (uint8_t)((r * 66 + g * 129 + b * 25 + 128) >> 8) + 16;
         }
+    }
+}
+
+// Extract the full luma plane from an async frame. Returns false on
+// unsupported format. `luma` must hold width*height bytes.
+static bool extract_full_luma_async(struct obs_source_frame *frame, uint8_t *luma) {
+    const uint32_t width = frame->width;
+    const uint32_t height = frame->height;
+
+    switch (frame->format) {
+    case VIDEO_FORMAT_NV12:
+    case VIDEO_FORMAT_I420:
+    case VIDEO_FORMAT_I444:
+    case VIDEO_FORMAT_I422:
+        for (uint32_t y = 0; y < height; ++y) {
+            memcpy(luma + y * width,
+                   frame->data[0] + y * frame->linesize[0], width);
+        }
+        return true;
+    case VIDEO_FORMAT_YUY2:
+        for (uint32_t y = 0; y < height; ++y) {
+            uint8_t *src = frame->data[0] + y * frame->linesize[0];
+            for (uint32_t x = 0; x < width; ++x) {
+                luma[y * width + x] = src[x * 2];
+            }
+        }
+        return true;
+    case VIDEO_FORMAT_UYVY:
+        for (uint32_t y = 0; y < height; ++y) {
+            uint8_t *src = frame->data[0] + y * frame->linesize[0];
+            for (uint32_t x = 0; x < width; ++x) {
+                luma[y * width + x] = src[x * 2 + 1];
+            }
+        }
+        return true;
+    case VIDEO_FORMAT_BGRA:
+        bgra_to_luma(frame->data[0], frame->linesize[0], luma, width, height);
+        return true;
+    case VIDEO_FORMAT_RGBA:
+        rgba_to_luma(frame->data[0], frame->linesize[0], luma, width, height);
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Extract a single luma line from an async frame. Returns false on
+// unsupported format. `luma` must hold width bytes.
+static bool extract_line_luma_async(struct obs_source_frame *frame, uint8_t *luma,
+                                    uint32_t line) {
+    const uint32_t width = frame->width;
+    const uint8_t *src = frame->data[0] + line * frame->linesize[0];
+
+    switch (frame->format) {
+    case VIDEO_FORMAT_NV12:
+    case VIDEO_FORMAT_I420:
+    case VIDEO_FORMAT_I444:
+    case VIDEO_FORMAT_I422:
+        memcpy(luma, src, width);
+        return true;
+    case VIDEO_FORMAT_YUY2:
+        for (uint32_t x = 0; x < width; ++x) {
+            luma[x] = src[x * 2];
+        }
+        return true;
+    case VIDEO_FORMAT_UYVY:
+        for (uint32_t x = 0; x < width; ++x) {
+            luma[x] = src[x * 2 + 1];
+        }
+        return true;
+    case VIDEO_FORMAT_BGRA:
+        bgra_to_luma(src, frame->linesize[0], luma, width, 1);
+        return true;
+    case VIDEO_FORMAT_RGBA:
+        rgba_to_luma(src, frame->linesize[0], luma, width, 1);
+        return true;
+    default:
+        return false;
     }
 }
 
@@ -385,75 +468,12 @@ static struct obs_source_frame *fps_analyzer_filter_video(void *data,
     // Allocate enough for full frame (needed for tearing detection even in LAST_LINE mode)
     ensure_luma_buffer(filter, (size_t)width * height);
     uint8_t *luma = filter->luma_buffer;
-    bool format_ok = true;
+    bool format_ok;
 
-    switch (frame->format) {
-    case VIDEO_FORMAT_NV12:
-    case VIDEO_FORMAT_I420:
-    case VIDEO_FORMAT_I444:
-    case VIDEO_FORMAT_I422:
-        // Y plane in data[0] with linesize[0] stride
-        if (filter->analyze_method == ANALYZE_DIFF) {
-            for (uint32_t y = 0; y < height; ++y) {
-                memcpy(luma + y * width,
-                       frame->data[0] + y * frame->linesize[0], width);
-            }
-        } else {
-            memcpy(luma, frame->data[0] + roi_line * frame->linesize[0], width);
-        }
-        break;
-    case VIDEO_FORMAT_YUY2:
-        // Y at even byte positions: src[x*2]
-        if (filter->analyze_method == ANALYZE_DIFF) {
-            for (uint32_t y = 0; y < height; ++y) {
-                uint8_t *src = frame->data[0] + y * frame->linesize[0];
-                for (uint32_t x = 0; x < width; ++x) {
-                    luma[y * width + x] = src[x * 2];
-                }
-            }
-        } else {
-            uint8_t *src = frame->data[0] + roi_line * frame->linesize[0];
-            for (uint32_t x = 0; x < width; ++x) {
-                luma[x] = src[x * 2];
-            }
-        }
-        break;
-    case VIDEO_FORMAT_UYVY:
-        // Y at odd byte positions: src[x*2+1]
-        if (filter->analyze_method == ANALYZE_DIFF) {
-            for (uint32_t y = 0; y < height; ++y) {
-                uint8_t *src = frame->data[0] + y * frame->linesize[0];
-                for (uint32_t x = 0; x < width; ++x) {
-                    luma[y * width + x] = src[x * 2 + 1];
-                }
-            }
-        } else {
-            uint8_t *src = frame->data[0] + roi_line * frame->linesize[0];
-            for (uint32_t x = 0; x < width; ++x) {
-                luma[x] = src[x * 2 + 1];
-            }
-        }
-        break;
-    case VIDEO_FORMAT_BGRA:
-        if (filter->analyze_method == ANALYZE_DIFF) {
-            bgra_to_luma(frame->data[0], frame->linesize[0], luma, width, height);
-        } else {
-            bgra_to_luma(frame->data[0] + roi_line * frame->linesize[0],
-                         frame->linesize[0], luma, width, 1);
-        }
-        break;
-    case VIDEO_FORMAT_RGBA:
-        if (filter->analyze_method == ANALYZE_DIFF) {
-            rgba_to_luma(frame->data[0], frame->linesize[0], luma, width, height);
-        } else {
-            rgba_to_luma(frame->data[0] + roi_line * frame->linesize[0],
-                         frame->linesize[0], luma, width, 1);
-        }
-        break;
-    default:
-        format_ok = false;
-        break;
-    }
+    if (filter->analyze_method == ANALYZE_DIFF)
+        format_ok = extract_full_luma_async(frame, luma);
+    else
+        format_ok = extract_line_luma_async(frame, luma, roi_line);
 
     if (!format_ok) {
         g_fps_shared.unsupported_format = (int)frame->format;
@@ -466,6 +486,19 @@ static struct obs_source_frame *fps_analyzer_filter_video(void *data,
 
     // Analiza klatki
     analyze_luma_frame(filter, luma, luma_size);
+
+    // Detekcja rozdzielczości źródłowej (upscale) — pełna klatka co ~0.5s
+    if (filter->enable_resolution_detection && filter->res_detector) {
+        uint64_t now = os_gettime_ns();
+        if (now - filter->last_resdet_submit_ns >= 500000000ULL) {
+            bool have_full = (filter->analyze_method == ANALYZE_DIFF);
+            if (!have_full)
+                have_full = extract_full_luma_async(frame, luma);
+            if (have_full &&
+                resdet_submit(filter->res_detector, luma, width, height))
+                filter->last_resdet_submit_ns = now;
+        }
+    }
 
     return frame;
 }
@@ -558,6 +591,21 @@ static void fps_analyzer_video_render(void *data, gs_effect_t *effect)
         analyze_luma_frame(filter, filter->luma_buffer, luma_size);
         g_fps_shared.unsupported_format = -1;
 
+        // Detekcja rozdzielczości źródłowej (upscale) — pełna klatka co ~0.5s
+        if (filter->enable_resolution_detection && filter->res_detector) {
+            uint64_t now = os_gettime_ns();
+            if (now - filter->last_resdet_submit_ns >= 500000000ULL) {
+                if (filter->analyze_method != ANALYZE_DIFF) {
+                    ensure_luma_buffer(filter, (size_t)width * height);
+                    bgra_to_luma(video_data, video_linesize,
+                                 filter->luma_buffer, width, height);
+                }
+                if (resdet_submit(filter->res_detector, filter->luma_buffer,
+                                  width, height))
+                    filter->last_resdet_submit_ns = now;
+            }
+        }
+
         gs_stagesurface_unmap(filter->stagesurface);
     }
 
@@ -630,6 +678,23 @@ static void fps_analyzer_video_tick(void *data, float seconds)
     }
     g_fps_shared.graph_count = count;
 
+    // Upscale resolution detection — publish latest result
+    g_fps_shared.res_detect_enabled = filter->enable_resolution_detection;
+    if (filter->enable_resolution_detection && filter->res_detector) {
+        struct resdet_result r;
+        if (resdet_get_result(filter->res_detector, &r) && r.valid) {
+            g_fps_shared.res_valid = true;
+            g_fps_shared.res_frame_w = r.frame_w;
+            g_fps_shared.res_frame_h = r.frame_h;
+            g_fps_shared.res_src_w = r.src_w;
+            g_fps_shared.res_src_h = r.src_h;
+            g_fps_shared.res_conf_w = r.conf_w;
+            g_fps_shared.res_conf_h = r.conf_h;
+        }
+    } else {
+        g_fps_shared.res_valid = false;
+    }
+
     // Optional CSV logging
     if (filter->enable_csv) {
         char csv_path[512];
@@ -656,6 +721,7 @@ static void fps_analyzer_destroy(void *data)
             if (filter->prev_lines[i]) bfree(filter->prev_lines[i]);
         }
         if (filter->luma_buffer) bfree(filter->luma_buffer);
+        if (filter->res_detector) resdet_destroy(filter->res_detector);
         obs_enter_graphics();
         if (filter->texrender) gs_texrender_destroy(filter->texrender);
         if (filter->stagesurface) gs_stagesurface_destroy(filter->stagesurface);
@@ -710,6 +776,12 @@ static void *fps_analyzer_create(obs_data_t *settings, obs_source_t *context)
     filter->ema_frametime = 0.0;
     // CSV logging
     filter->enable_csv = obs_data_get_bool(settings, "enable_csv");
+    // Upscale resolution detection (worker thread created lazily on enable)
+    filter->enable_resolution_detection = obs_data_get_bool(settings, "enable_resolution_detection");
+    filter->res_detector = NULL;
+    filter->last_resdet_submit_ns = 0;
+    if (filter->enable_resolution_detection)
+        filter->res_detector = resdet_create();
     g_fps_shared.active_filter_count++;
     return filter;
 }
@@ -717,7 +789,7 @@ static void *fps_analyzer_create(obs_data_t *settings, obs_source_t *context)
 static const char *fps_analyzer_get_name(void *unused)
 {
     UNUSED_PARAMETER(unused);
-    return "FPS Analyzer 0.4";
+    return "FPS Analyzer 0.5";
 }
 
 // --- Properties ---
@@ -770,6 +842,15 @@ static obs_properties_t *fps_analyzer_properties(void *data)
     obs_properties_add_bool(props, "enable_tearing_detection", "Tearing detection");
     obs_properties_add_float_slider(props, "tearing_sensitivity", "Tearing sensitivity threshold (%)", 0.1, 10.0, 0.1);
 
+    // Upscale source resolution detection
+    obs_property_t *res_prop = obs_properties_add_bool(
+        props, "enable_resolution_detection", "Detect upscale source resolution (DCT)");
+    obs_property_set_long_description(res_prop,
+        "Estimates the internal render resolution the image was upscaled from "
+        "using DCT spectral analysis (~1 analysis per second on a background thread). "
+        "Works with traditional scaling (bilinear/bicubic/lanczos); does not detect "
+        "AI upscalers like DLSS/FSR2+/PSSR.");
+
     // CSV logging
     obs_property_t *csv_toggle = obs_properties_add_bool(props, "enable_csv", "Enable CSV logging");
     obs_property_set_modified_callback(csv_toggle, enable_csv_modified);
@@ -803,6 +884,9 @@ static void fps_analyzer_update(void *data, obs_data_t *settings)
     filter->analyze_method = (analyze_method_t)obs_data_get_int(settings, "analyze_method");
     filter->sensitivity = obs_data_get_double(settings, "sensitivity");
     filter->enable_csv = obs_data_get_bool(settings, "enable_csv");
+    filter->enable_resolution_detection = obs_data_get_bool(settings, "enable_resolution_detection");
+    if (filter->enable_resolution_detection && !filter->res_detector)
+        filter->res_detector = resdet_create();
 }
 
 // --- File helpers ---
@@ -862,6 +946,7 @@ static void fps_analyzer_get_defaults(obs_data_t *settings)
     obs_data_set_default_double(settings, "tearing_sensitivity", 1.0);
     obs_data_set_default_int(settings, "analyze_method", ANALYZE_LAST_LINE);
     obs_data_set_default_double(settings, "sensitivity", 0.1);
+    obs_data_set_default_bool(settings, "enable_resolution_detection", false);
 }
 
 // --- Source info ---

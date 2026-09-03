@@ -54,6 +54,19 @@ The plugin offers two different image analysis methods:
 - **Settings**: "Sensitivity threshold" slider (0.0-5.0%)
 
 
+### Upscale Source Resolution Detection:
+- **Independent feature**: Works with any analysis method
+- **Description**: Estimates the internal render resolution the image was upscaled from (e.g. a console game rendering at 1280x720 output as 1920x1080)
+- **Settings**:
+  - Filter: "Detect upscale source resolution (DCT)" checkbox (default: disabled)
+  - Overlay: "Show Source resolution text" checkbox (default: enabled)
+- **Algorithm**: hybrid DCT spectral analysis, ~2 analyses per second on a background thread:
+  - *Sign method* (ported from [resdet](https://github.com/0x09/resdet)): traditional resamplers mirror the spectrum with inverted signs around the source resolution index — pixel-exact on clean upscales (videos, menus).
+  - *Magnitude knee* (fallback): native-res overlays like HUD or film grain corrupt the sign symmetry, but the energy envelope still drops sharply at the source resolution; the detector finds the strongest step in the log-magnitude profile of each axis.
+  - Results are accumulated over consecutive frames (EMA) and reported only when recent analyses agree (median consensus) — smooths dynamic resolution scaling and rejects sporadic false positives.
+- **Output**: `Source res: ~1280x720 -> 1920x1080 (95%)` or `Source res: native 1920x1080`
+- **Limitations**: Detects traditional scaling (nearest/bilinear/bicubic/lanczos) even under HUD/film grain. Temporal/AI upscalers (DLSS, FSR 2+, TSR, PSSR) partially rebuild the spectrum — the knee may still show through (weaker, fluctuating), but results are approximate. Letterbox/pillarbox black bars distort the spectrum and can produce wrong values.
+
 ### Tearing Detection:
 - **Independent feature**: Works with any analysis method
 - **Description**: Detects screen tearing by analyzing 3 lines (top, middle, bottom)
