@@ -70,7 +70,7 @@ The plugin offers two different image analysis methods:
 - **Limitations** (from a real-frame corpus — see the testing section):
   - Works: linear scaling of the whole frame (borderless windows scaled by Windows/GPU, video content, console bilinear/bicubic output) — pixel-exact. Mild adaptive/temporal upscaling (e.g. Starfield CAS at 70%, FSR2-style in motion) — usually right thanks to the joint two-axis pick.
   - Unreliable: adaptive sharpen-upscalers (AMD CAS, FSR 1) at factors ≥ ~1.67×. Their per-pixel kernels smear the mirror signature, so other linearly-upsampled layers in the frame win — reduced-resolution post-effect buffers (depth of field, volumetrics — Starfield's ~60% buffer read as 1546x871) or spectral nulls of the output filter, which are aspect-consistent just like a real upscale.
-  - Temporal/AI upscalers (DLSS, FSR 2+, TSR, PSSR) rebuild the spectrum; results are approximate at best. Letterbox/pillarbox black bars distort the spectrum. Periodic dither patterns (id Tech) can produce spurious candidates in motion.
+  - Temporal/AI upscalers (DLSS, FSR 2+/3, TSR, PSSR) rebuild the spectrum and leave no mirror signature — on the corpus Starfield with FSR3 or DLSS Quality reads as native, standing still and in motion alike. Letterbox/pillarbox black bars distort the spectrum. Periodic dither patterns (id Tech) can produce spurious candidates in motion.
   - The value shown is "the strongest linear-upscale signature in the frame", which is not always the main render's resolution.
 
 ### Debug options (frame dump):
