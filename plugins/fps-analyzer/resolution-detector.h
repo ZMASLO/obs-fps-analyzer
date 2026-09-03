@@ -75,6 +75,8 @@ struct resdet_params {
     float sign_joint_min; // W+H vote sum for an aspect-consistent pair (default 1.13)
     float sign_flank_min; // min mean vote at offsets 2..3 around a peak (default 0.47);
                           // lower = comb-like peak from a filter null, rejected
+    int sign_weighted;    // 0 = count sign inversions (resdet); 1 = weight each pair by
+                          // min(|a|,|b|) so the layer carrying the image's energy dominates
 };
 void resdet_debug_get_params(struct resolution_detector *rd, struct resdet_params *out);
 // Set before submitting frames (not thread-safe against a running analysis).

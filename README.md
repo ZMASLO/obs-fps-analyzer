@@ -67,7 +67,11 @@ The plugin offers two different image analysis methods:
   - *Magnitude knee* (fallback): native-res overlays like HUD or film grain corrupt the sign symmetry, but the energy envelope still drops sharply at the source resolution; the detector finds the strongest step in the log-magnitude profile of each axis.
   - Results are accumulated over consecutive frames (EMA) and reported only when recent analyses agree (median consensus) — smooths dynamic resolution scaling and rejects sporadic false positives.
 - **Output**: `Source res: ~1280x720 -> 1920x1080 (95%)` or `Source res: native 1920x1080`
-- **Limitations**: Detects traditional scaling (nearest/bilinear/bicubic/lanczos) even under HUD/film grain. Temporal/AI upscalers (DLSS, FSR 2+, TSR, PSSR) partially rebuild the spectrum — the knee may still show through (weaker, fluctuating), but results are approximate. Letterbox/pillarbox black bars distort the spectrum and can produce wrong values.
+- **Limitations** (from a real-frame corpus — see the testing section):
+  - Works: linear scaling of the whole frame (borderless windows scaled by Windows/GPU, video content, console bilinear/bicubic output) — pixel-exact. Mild adaptive/temporal upscaling (e.g. Starfield CAS at 70%, FSR2-style in motion) — usually right thanks to the joint two-axis pick.
+  - Unreliable: adaptive sharpen-upscalers (AMD CAS, FSR 1) at factors ≥ ~1.67×. Their per-pixel kernels smear the mirror signature, so other linearly-upsampled layers in the frame win — reduced-resolution post-effect buffers (depth of field, volumetrics — Starfield's ~60% buffer read as 1546x871) or spectral nulls of the output filter, which are aspect-consistent just like a real upscale.
+  - Temporal/AI upscalers (DLSS, FSR 2+, TSR, PSSR) rebuild the spectrum; results are approximate at best. Letterbox/pillarbox black bars distort the spectrum. Periodic dither patterns (id Tech) can produce spurious candidates in motion.
+  - The value shown is "the strongest linear-upscale signature in the frame", which is not always the main render's resolution.
 
 ### Debug options (frame dump):
 - **Settings** (filter, under the "Debug options" checkbox): "Frame dump folder", "Dump label (case name)", "Frames per dump" (default 16), "Start delay after button" (default 5 s — time to Alt+Tab back into the game) and a "Dump frames now" button

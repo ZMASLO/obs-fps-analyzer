@@ -108,6 +108,7 @@ struct case_spec {
     fs::path dir;
     int exp_w = 0, exp_h = 0; // 0x0 = native expected
     int tol = 16;
+    bool xfail = false;       // known limitation: a failure is expected and not counted as a regression
     std::string note;
 };
 
@@ -115,7 +116,7 @@ struct case_spec {
 struct param_overrides {
     float alpha = -1.0f, sign_thr = -1.0f, knee_thr = -1.0f;
     float cand_min = -1.0f, joint_min = -1.0f, flank_min = -1.0f;
-    int warmup = -1, min_votes = -1;
+    int warmup = -1, min_votes = -1, weighted = -1;
     bool dump_votes = false;
 };
 
@@ -131,6 +132,7 @@ static void apply_params(resolution_detector *rd, const param_overrides &o)
     if (o.flank_min >= 0.0f) p.sign_flank_min = o.flank_min;
     if (o.warmup >= 0) p.warmup_frames = o.warmup;
     if (o.min_votes >= 0) p.min_votes = o.min_votes;
+    if (o.weighted >= 0) p.sign_weighted = o.weighted;
     resdet_debug_set_params(rd, &p);
 }
 
@@ -284,12 +286,13 @@ static bool run_case(const case_spec &cs, bool verbose, const fs::path &outdir, 
         if (last.plugin_w || last.plugin_h) snprintf(plug, sizeof(plug), "%dx%d", last.plugin_w, last.plugin_h);
         else snprintf(plug, sizeof(plug), "native");
     }
+    const char *tag = pass ? (cs.xfail ? "XPASS" : "PASS") : (cs.xfail ? "XFAIL" : "FAIL");
     printf("[%s] %-52s expected %-10s got %-24s plugin(live) %s\n",
-           pass ? "PASS" : "FAIL", name.c_str(), expect, got, plug);
+           tag, name.c_str(), expect, got, plug);
     if (!cs.note.empty())
         printf("       %s\n", cs.note.c_str());
 
-    if (!pass || verbose) {
+    if ((!pass && !cs.xfail) || verbose) {
         printf("       frame  sign W/H (J=joint,S=solo)  knee W/H            consensus     plugin\n");
         for (auto &t : trace) {
             char mode = t.d.sign_mode == 2 ? 'J' : (t.d.sign_mode == 1 ? 'S' : ' ');
@@ -324,8 +327,14 @@ static std::string trim(const std::string &s)
     return a == std::string::npos ? "" : s.substr(a, b - a + 1);
 }
 
-static bool parse_expect(const std::string &s, int &w, int &h)
+// "WxH", "native", optionally prefixed with "xfail:" for known limitations
+static bool parse_expect(std::string s, int &w, int &h, bool &xfail)
 {
+    xfail = false;
+    if (s.rfind("xfail:", 0) == 0) {
+        xfail = true;
+        s = trim(s.substr(6));
+    }
     if (s == "native" || s == "0" || s == "0x0") {
         w = h = 0;
         return true;
@@ -362,6 +371,7 @@ int main(int argc, char **argv)
         else if (a == "--joint-min") po.joint_min = (float)atof(next("--joint-min"));
         else if (a == "--flank-min") po.flank_min = (float)atof(next("--flank-min"));
         else if (a == "--warmup") po.warmup = atoi(next("--warmup"));
+        else if (a == "--sign-weighted") po.weighted = atoi(next("--sign-weighted"));
         else if (a == "--min-votes") po.min_votes = atoi(next("--min-votes"));
         else if (a == "--dump-votes") po.dump_votes = true;
         else if (a[0] == '-') { fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
@@ -390,7 +400,7 @@ int main(int argc, char **argv)
             if (cols.size() < 2) { fprintf(stderr, "bad manifest line: %s\n", line.c_str()); continue; }
             case_spec cs;
             cs.dir = base / cols[0];
-            if (!parse_expect(cols[1], cs.exp_w, cs.exp_h)) { fprintf(stderr, "bad expectation: %s\n", cols[1].c_str()); continue; }
+            if (!parse_expect(cols[1], cs.exp_w, cs.exp_h, cs.xfail)) { fprintf(stderr, "bad expectation: %s\n", cols[1].c_str()); continue; }
             if (cols.size() >= 3 && !cols[2].empty()) cs.tol = atoi(cols[2].c_str());
             if (cols.size() >= 4) cs.note = cols[3];
             cases.push_back(cs);
@@ -398,7 +408,7 @@ int main(int argc, char **argv)
     } else if (!single.empty()) {
         case_spec cs;
         cs.dir = single;
-        if (!parse_expect(expect_str, cs.exp_w, cs.exp_h)) { fprintf(stderr, "bad --expect %s\n", expect_str.c_str()); return 2; }
+        if (!parse_expect(expect_str, cs.exp_w, cs.exp_h, cs.xfail)) { fprintf(stderr, "bad --expect %s\n", expect_str.c_str()); return 2; }
         cs.tol = tol;
         cases.push_back(cs);
         if (outdir.empty()) outdir = single.parent_path() / "_resdet_out";
@@ -406,14 +416,21 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: resdet-cli <dumpdir> [--expect WxH|native] [--tol PX] [--verbose] [--out DIR]\n"
                         "       resdet-cli --manifest cases.txt [--verbose] [--out DIR]\n"
                         "tuning: --alpha A --sign-thr T --knee-thr T --cand-min T --joint-min S --flank-min T\n"
-                        "        --warmup N --min-votes N --dump-votes\n");
+                        "        --warmup N --min-votes N --sign-weighted 0|1 --dump-votes\n");
         return 2;
     }
 
-    int passed = 0;
-    for (auto &cs : cases)
-        if (run_case(cs, verbose, outdir, po))
-            passed++;
-    printf("\nRESULT: %d/%zu passed\n", passed, cases.size());
-    return passed == (int)cases.size() ? 0 : 1;
+    int passed = 0, xfailed = 0, xpassed = 0, failed = 0;
+    for (auto &cs : cases) {
+        bool ok = run_case(cs, verbose, outdir, po);
+        if (cs.xfail) (ok ? xpassed : xfailed)++;
+        else (ok ? passed : failed)++;
+    }
+    size_t regular = cases.size() - xfailed - xpassed;
+    printf("\nRESULT: %d/%zu passed", passed, regular);
+    if (xfailed || xpassed)
+        printf(", %d known limitations (xfail)%s", xfailed,
+               xpassed ? " — and some now PASS (xpass): consider un-marking them" : "");
+    printf("\n");
+    return failed == 0 ? 0 : 1;
 }

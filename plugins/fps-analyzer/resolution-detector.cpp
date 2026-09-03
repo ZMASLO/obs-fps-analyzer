@@ -26,6 +26,8 @@
 #define SIGN_CAND_MIN 0.55f
 #define SIGN_JOINT_SUM_MIN 1.13f
 #define SIGN_FLANK_MIN 0.47f
+// 0 = plain inversion count (resdet), 1 = energy-weighted (experimental)
+#define SIGN_WEIGHTED 0
 // EMA weight of each new frame's result vector
 #define RESDET_ACCUM_ALPHA 0.25f
 // Analyses required before reporting anything (lets the EMA settle)
@@ -152,6 +154,32 @@ static void detect_sign(const float *f, size_t length, size_t n, size_t stride,
     }
 }
 
+// Energy-weighted variant of detect_sign: each mirrored pair votes with
+// weight min(|a|,|b|), so pairs that carry real image energy (the main
+// render) dominate, while low-energy layers (upsampled effect buffers) and
+// noise-floor coefficients in dead zones barely count. Result = weighted
+// fraction of inverted-sign pairs (0.5 = no structure).
+static void detect_sign_weighted(const float *f, size_t length, size_t n, size_t stride,
+                                 size_t dist, size_t range, float *result)
+{
+    for (size_t x = range; x < length - range; x++) {
+        double num = 0.0, den = 0.0;
+        for (size_t y = 0; y < n; y++) {
+            const float *line = f + y * stride + x * dist;
+            for (size_t i = 1; i <= range; i++) {
+                float a = line[-(ptrdiff_t)(i * dist)];
+                float b = line[i * dist];
+                float fa = fabsf(a), fb = fabsf(b);
+                float w = fa < fb ? fa : fb;
+                den += w;
+                if (std::signbit(a) != std::signbit(b))
+                    num += w;
+            }
+        }
+        result[x - range] = den > 0.0 ? (float)(num / den) : 0.5f;
+    }
+}
+
 // Mean log10 magnitude of the DCT along one axis, averaged over the
 // n_perp lowest-frequency lines of the perpendicular axis (where scene
 // energy is concentrated). Indexing convention matches detect_sign.
@@ -211,29 +239,6 @@ static void knee_scores(const float *profile, size_t length, double *scores)
         if (trend > 0.0)
             score -= trend;
         scores[k] = score > 0.0 ? score : 0.0;
-    }
-}
-
-// Strongest knee above threshold, or 0 if none.
-static void pick_knee(const float *profile, size_t length, float threshold,
-                      int *out_idx, double *out_conf)
-{
-    *out_idx = 0;
-    *out_conf = 0.0;
-    std::vector<double> scores(length);
-    knee_scores(profile, length, scores.data());
-    double best = 0.0;
-    size_t best_k = 0;
-    for (size_t k = 0; k < length; k++)
-        if (scores[k] > best) {
-            best = scores[k];
-            best_k = k;
-        }
-    if (best >= threshold) {
-        *out_idx = (int)best_k;
-        *out_conf = best / KNEE_CONF_FULL;
-        if (*out_conf > 1.0)
-            *out_conf = 1.0;
     }
 }
 
@@ -458,7 +463,8 @@ struct resolution_detector {
     // tunable parameters (defaults = the plugin's behaviour)
     resdet_params params = {RESDET_ACCUM_ALPHA, RESDET_THRESHOLD, (float)KNEE_THRESHOLD,
                             RESDET_WARMUP_FRAMES, RESDET_MIN_VOTES,
-                            SIGN_CAND_MIN, SIGN_JOINT_SUM_MIN, SIGN_FLANK_MIN};
+                            SIGN_CAND_MIN, SIGN_JOINT_SUM_MIN, SIGN_FLANK_MIN,
+                            SIGN_WEIGHTED};
 
     // analysis-worker-only state
     dct_plan plan;
@@ -540,8 +546,13 @@ void resolution_detector::analyze(const uint8_t *luma, uint32_t w, uint32_t h)
 
     xresult.assign(w - 2 * RESDET_RANGE, 0.0f);
     yresult.assign(h - 2 * RESDET_RANGE, 0.0f);
-    detect_sign(coeffs.data(), w, n_perp_x, w, 1, RESDET_RANGE, xresult.data());
-    detect_sign(coeffs.data(), h, n_perp_y, 1, w, RESDET_RANGE, yresult.data());
+    if (params.sign_weighted) {
+        detect_sign_weighted(coeffs.data(), w, n_perp_x, w, 1, RESDET_RANGE, xresult.data());
+        detect_sign_weighted(coeffs.data(), h, n_perp_y, 1, w, RESDET_RANGE, yresult.data());
+    } else {
+        detect_sign(coeffs.data(), w, n_perp_x, w, 1, RESDET_RANGE, xresult.data());
+        detect_sign(coeffs.data(), h, n_perp_y, 1, w, RESDET_RANGE, yresult.data());
+    }
 
     xprof.assign(w, 0.0f);
     yprof.assign(h, 0.0f);
@@ -637,11 +648,39 @@ void resolution_detector::analyze(const uint8_t *luma, uint32_t w, uint32_t h)
     }
 
     // Magnitude knee: fallback when overlays/grain destroy the sign
-    // symmetry. Computed every analysis so the debug tools can compare.
+    // symmetry. Accepted only as an aspect-consistent pair: on real content
+    // linear upscalers leave mirrored energy past the cutoff (no step, so
+    // the knee never fires at the render resolution), while periodic dither
+    // lattices (Doom TDA in motion) produce strong but aspect-inconsistent
+    // steps — requiring the same scale on both axes rejects those.
     int knee_w = 0, knee_h = 0;
     double kconf_w = 0.0, kconf_h = 0.0;
-    pick_knee(xprof_acc.data(), w, params.knee_threshold, &knee_w, &kconf_w);
-    pick_knee(yprof_acc.data(), h, params.knee_threshold, &knee_h, &kconf_h);
+    {
+        std::vector<double> sx(w), sy(h);
+        knee_scores(xprof_acc.data(), w, sx.data());
+        knee_scores(yprof_acc.data(), h, sy.data());
+        double best = 0.0;
+        for (size_t kx = 0; kx < w; kx++) {
+            if (sx[kx] < params.knee_threshold)
+                continue;
+            int ky0 = (int)((double)kx * h / w + 0.5);
+            for (int d = -2; d <= 2; d++) {
+                int ky = ky0 + d;
+                if (ky < 0 || ky >= (int)h || sy[ky] < params.knee_threshold)
+                    continue;
+                double s = sx[kx] + sy[ky];
+                if (s > best) {
+                    best = s;
+                    knee_w = (int)kx;
+                    knee_h = ky;
+                    kconf_w = sx[kx] / KNEE_CONF_FULL;
+                    kconf_h = sy[ky] / KNEE_CONF_FULL;
+                    if (kconf_w > 1.0) kconf_w = 1.0;
+                    if (kconf_h > 1.0) kconf_h = 1.0;
+                }
+            }
+        }
+    }
     int cand_w = sign_w ? sign_w : knee_w;
     int cand_h = sign_h ? sign_h : knee_h;
     double cconf_w = sign_w ? sconf_w : kconf_w;
