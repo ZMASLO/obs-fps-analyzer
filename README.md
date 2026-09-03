@@ -60,6 +60,7 @@ The plugin offers two different image analysis methods:
 - **Settings**:
   - Filter: "Detect upscale source resolution (DCT)" checkbox (default: disabled)
   - Overlay: "Show Source resolution text" checkbox (default: enabled)
+  - Filter: "Spectrum refresh rate" dropdown — "Analysis rate" (~2/s, default), "30 FPS" or "60 FPS". The fast modes compute the spectrum from a 640x360 center crop on a second background thread (~20% / ~40% of one core); detection itself always uses the full frame at the analysis rate. A crop keeps the spectral cutoff at the same normalized frequency, so the markers still line up.
   - Overlay: "Show Source resolution spectrum" checkbox (default: enabled) — a small panel with the 2D DCT log-magnitude spectrum of the frame (low frequencies top-left, bright = energy) and green tick markers with the detected source width (bottom edge) and height (right edge). On an upscaled image the energy forms a visible rectangle ending at the markers; a native image fills the whole panel.
 - **Algorithm**: hybrid DCT spectral analysis, ~2 analyses per second on a background thread:
   - *Sign method* (ported from [resdet](https://github.com/0x09/resdet)): traditional resamplers mirror the spectrum with inverted signs around the source resolution index — pixel-exact on clean upscales (videos, menus).

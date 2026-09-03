@@ -77,6 +77,9 @@ struct fps_analyzer_filter {
     bool enable_resolution_detection;
     struct resolution_detector *res_detector;
     uint64_t last_resdet_submit_ns;
+    int spectrum_fps;             // 0 = follow analysis rate (~2/s), else 30/60
+    uint64_t last_spec_submit_ns;
+    uint8_t *crop_buffer;         // RESDET_FAST_CROP_W*H luma for the fast spectrum path
 };
 
 // --- Utility functions ---
@@ -219,6 +222,63 @@ static bool extract_line_luma_async(struct obs_source_frame *frame, uint8_t *lum
     default:
         return false;
     }
+}
+
+// Extract a luma crop (x0, y0, cw x ch) from an async frame into `luma`
+// (cw*ch bytes). Returns false on unsupported format.
+static bool extract_crop_luma_async(struct obs_source_frame *frame, uint8_t *luma,
+                                    uint32_t x0, uint32_t y0, uint32_t cw, uint32_t ch) {
+    const uint32_t ls = frame->linesize[0];
+    switch (frame->format) {
+    case VIDEO_FORMAT_NV12:
+    case VIDEO_FORMAT_I420:
+    case VIDEO_FORMAT_I444:
+    case VIDEO_FORMAT_I422:
+        for (uint32_t y = 0; y < ch; ++y)
+            memcpy(luma + y * cw, frame->data[0] + (y0 + y) * ls + x0, cw);
+        return true;
+    case VIDEO_FORMAT_YUY2:
+        for (uint32_t y = 0; y < ch; ++y) {
+            const uint8_t *src = frame->data[0] + (y0 + y) * ls + x0 * 2;
+            for (uint32_t x = 0; x < cw; ++x)
+                luma[y * cw + x] = src[x * 2];
+        }
+        return true;
+    case VIDEO_FORMAT_UYVY:
+        for (uint32_t y = 0; y < ch; ++y) {
+            const uint8_t *src = frame->data[0] + (y0 + y) * ls + x0 * 2;
+            for (uint32_t x = 0; x < cw; ++x)
+                luma[y * cw + x] = src[x * 2 + 1];
+        }
+        return true;
+    case VIDEO_FORMAT_BGRA:
+        bgra_to_luma(frame->data[0] + y0 * ls + x0 * 4, ls, luma, cw, ch);
+        return true;
+    case VIDEO_FORMAT_RGBA:
+        rgba_to_luma(frame->data[0] + y0 * ls + x0 * 4, ls, luma, cw, ch);
+        return true;
+    default:
+        return false;
+    }
+}
+
+// --- Fast spectrum path helpers (30/60 FPS center crop) ---
+
+static bool fast_spectrum_due(struct fps_analyzer_filter *filter, uint64_t now) {
+    if (!filter->enable_resolution_detection || !filter->res_detector ||
+        filter->spectrum_fps <= 0 || !filter->crop_buffer)
+        return false;
+    uint64_t interval = 1000000000ULL / (uint64_t)filter->spectrum_fps;
+    // Accept slightly early so frame-timing jitter doesn't halve the rate
+    return now - filter->last_spec_submit_ns >= interval - interval / 4;
+}
+
+static void fast_spectrum_crop(uint32_t w, uint32_t h,
+                               uint32_t *x0, uint32_t *y0, uint32_t *cw, uint32_t *ch) {
+    *cw = w < RESDET_FAST_CROP_W ? w : RESDET_FAST_CROP_W;
+    *ch = h < RESDET_FAST_CROP_H ? h : RESDET_FAST_CROP_H;
+    *x0 = (w - *cw) / 2;
+    *y0 = (h - *ch) / 2;
 }
 
 // --- Shared analysis logic ---
@@ -498,6 +558,14 @@ static struct obs_source_frame *fps_analyzer_filter_video(void *data,
                 resdet_submit(filter->res_detector, luma, width, height))
                 filter->last_resdet_submit_ns = now;
         }
+        // Szybka ścieżka widma (30/60 FPS) — centralny wycinek na osobnym wątku
+        if (fast_spectrum_due(filter, now)) {
+            uint32_t x0, y0, cw, ch;
+            fast_spectrum_crop(width, height, &x0, &y0, &cw, &ch);
+            if (extract_crop_luma_async(frame, filter->crop_buffer, x0, y0, cw, ch) &&
+                resdet_submit_spectrum(filter->res_detector, filter->crop_buffer, cw, ch))
+                filter->last_spec_submit_ns = now;
+        }
     }
 
     return frame;
@@ -604,6 +672,15 @@ static void fps_analyzer_video_render(void *data, gs_effect_t *effect)
                                   width, height))
                     filter->last_resdet_submit_ns = now;
             }
+            // Szybka ścieżka widma (30/60 FPS) — centralny wycinek z BGRA
+            if (fast_spectrum_due(filter, now)) {
+                uint32_t x0, y0, cw, ch;
+                fast_spectrum_crop(width, height, &x0, &y0, &cw, &ch);
+                bgra_to_luma(video_data + y0 * video_linesize + x0 * 4, video_linesize,
+                             filter->crop_buffer, cw, ch);
+                if (resdet_submit_spectrum(filter->res_detector, filter->crop_buffer, cw, ch))
+                    filter->last_spec_submit_ns = now;
+            }
         }
 
         gs_stagesurface_unmap(filter->stagesurface);
@@ -625,6 +702,13 @@ static void fps_analyzer_video_tick(void *data, float seconds)
     UNUSED_PARAMETER(seconds);
     struct fps_analyzer_filter *filter = (struct fps_analyzer_filter *)data;
     uint64_t now = os_gettime_ns();
+
+    // Spectrum thumbnail — polled every tick (not gated by update_interval)
+    // so the 30/60 FPS fast path reaches the overlay at full rate
+    if (filter->enable_resolution_detection && filter->res_detector &&
+        resdet_get_spectrum(filter->res_detector, g_fps_shared.res_spectrum))
+        g_fps_shared.res_spectrum_version++;
+
     double elapsed = (now - filter->last_write_time) / 1000000000.0;
     if (elapsed < filter->update_interval)
         return;
@@ -691,8 +775,6 @@ static void fps_analyzer_video_tick(void *data, float seconds)
             g_fps_shared.res_conf_w = r.conf_w;
             g_fps_shared.res_conf_h = r.conf_h;
         }
-        if (resdet_get_spectrum(filter->res_detector, g_fps_shared.res_spectrum))
-            g_fps_shared.res_spectrum_version++;
     } else {
         g_fps_shared.res_valid = false;
     }
@@ -723,6 +805,7 @@ static void fps_analyzer_destroy(void *data)
             if (filter->prev_lines[i]) bfree(filter->prev_lines[i]);
         }
         if (filter->luma_buffer) bfree(filter->luma_buffer);
+        if (filter->crop_buffer) bfree(filter->crop_buffer);
         if (filter->res_detector) resdet_destroy(filter->res_detector);
         obs_enter_graphics();
         if (filter->texrender) gs_texrender_destroy(filter->texrender);
@@ -778,12 +861,17 @@ static void *fps_analyzer_create(obs_data_t *settings, obs_source_t *context)
     filter->ema_frametime = 0.0;
     // CSV logging
     filter->enable_csv = obs_data_get_bool(settings, "enable_csv");
-    // Upscale resolution detection (worker thread created lazily on enable)
+    // Upscale resolution detection (worker threads created lazily on enable)
     filter->enable_resolution_detection = obs_data_get_bool(settings, "enable_resolution_detection");
     filter->res_detector = NULL;
     filter->last_resdet_submit_ns = 0;
-    if (filter->enable_resolution_detection)
+    filter->spectrum_fps = (int)obs_data_get_int(settings, "spectrum_fps");
+    filter->last_spec_submit_ns = 0;
+    filter->crop_buffer = (uint8_t *)bzalloc((size_t)RESDET_FAST_CROP_W * RESDET_FAST_CROP_H);
+    if (filter->enable_resolution_detection) {
         filter->res_detector = resdet_create();
+        resdet_set_fast_spectrum(filter->res_detector, filter->spectrum_fps > 0);
+    }
     g_fps_shared.active_filter_count++;
     return filter;
 }
@@ -811,6 +899,14 @@ static bool enable_csv_modified(obs_properties_t *props, obs_property_t *p, obs_
     bool csv_on = obs_data_get_bool(settings, "enable_csv");
     obs_property_set_visible(obs_properties_get(props, "output_path"), csv_on);
     obs_property_set_visible(obs_properties_get(props, "clear_csv_on_start"), csv_on);
+    return true;
+}
+
+static bool resolution_detection_modified(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
+{
+    UNUSED_PARAMETER(p);
+    bool on = obs_data_get_bool(settings, "enable_resolution_detection");
+    obs_property_set_visible(obs_properties_get(props, "spectrum_fps"), on);
     return true;
 }
 
@@ -852,6 +948,19 @@ static obs_properties_t *fps_analyzer_properties(void *data)
         "using DCT spectral analysis (~1 analysis per second on a background thread). "
         "Works with traditional scaling (bilinear/bicubic/lanczos); does not detect "
         "AI upscalers like DLSS/FSR2+/PSSR.");
+    obs_property_set_modified_callback(res_prop, resolution_detection_modified);
+
+    obs_property_t *spec_fps = obs_properties_add_list(props, "spectrum_fps",
+        "Spectrum refresh rate", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    obs_property_list_add_int(spec_fps, "Analysis rate (~2/s, lowest CPU)", 0);
+    obs_property_list_add_int(spec_fps, "30 FPS (center crop, ~20% of one core)", 30);
+    obs_property_list_add_int(spec_fps, "60 FPS (center crop, ~40% of one core)", 60);
+    obs_property_set_long_description(spec_fps,
+        "How often the overlay's spectrum panel refreshes. 30/60 FPS compute the "
+        "spectrum from a 640x360 center crop on a second background thread; "
+        "detection itself always runs on the full frame at the analysis rate.");
+    obs_property_set_visible(spec_fps,
+        data ? ((struct fps_analyzer_filter*)data)->enable_resolution_detection : false);
 
     // CSV logging
     obs_property_t *csv_toggle = obs_properties_add_bool(props, "enable_csv", "Enable CSV logging");
@@ -887,8 +996,11 @@ static void fps_analyzer_update(void *data, obs_data_t *settings)
     filter->sensitivity = obs_data_get_double(settings, "sensitivity");
     filter->enable_csv = obs_data_get_bool(settings, "enable_csv");
     filter->enable_resolution_detection = obs_data_get_bool(settings, "enable_resolution_detection");
+    filter->spectrum_fps = (int)obs_data_get_int(settings, "spectrum_fps");
     if (filter->enable_resolution_detection && !filter->res_detector)
         filter->res_detector = resdet_create();
+    if (filter->res_detector)
+        resdet_set_fast_spectrum(filter->res_detector, filter->spectrum_fps > 0);
 }
 
 // --- File helpers ---
@@ -949,6 +1061,7 @@ static void fps_analyzer_get_defaults(obs_data_t *settings)
     obs_data_set_default_int(settings, "analyze_method", ANALYZE_LAST_LINE);
     obs_data_set_default_double(settings, "sensitivity", 0.1);
     obs_data_set_default_bool(settings, "enable_resolution_detection", false);
+    obs_data_set_default_int(settings, "spectrum_fps", 0);
 }
 
 // --- Source info ---

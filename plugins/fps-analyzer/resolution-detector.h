@@ -44,6 +44,23 @@ bool resdet_get_result(struct resolution_detector *rd, struct resdet_result *out
 // 0 = no energy, 255 = peak). Returns true if it changed since last call.
 bool resdet_get_spectrum(struct resolution_detector *rd, uint8_t *out);
 
+// Fast spectrum path: the filter feeds a center crop of this size at
+// 30/60 FPS to a second worker thread that only computes the thumbnail
+// (detection stays on the full frame at the analysis rate). A crop — not a
+// downscale — keeps the spectral cutoff at the same normalized frequency,
+// so the markers still line up. ~3-5 ms per crop.
+#define RESDET_FAST_CROP_W 640
+#define RESDET_FAST_CROP_H 360
+
+// While enabled, the full-frame analysis no longer overwrites the
+// thumbnail; the fast path owns it.
+void resdet_set_fast_spectrum(struct resolution_detector *rd, bool enabled);
+
+// Queues a luma crop for the fast thumbnail. Returns false (frame skipped)
+// if the spectrum worker is still busy.
+bool resdet_submit_spectrum(struct resolution_detector *rd, const uint8_t *luma,
+                            uint32_t width, uint32_t height);
+
 // Colormap for the spectrum thumbnail: dark -> purple -> white (BGRA).
 static inline void resdet_spectrum_color(uint8_t v, uint8_t *b, uint8_t *g, uint8_t *r)
 {

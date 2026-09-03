@@ -56,6 +56,10 @@
 #define SPEC_P_LOW 0.10
 #define SPEC_P_HIGH 0.90
 #define SPEC_MIN_RANGE 1.0f // decades; avoids amplifying noise on flat spectra
+// Fast (30/60 FPS, center-crop) spectrum path: per-frame EMA weight, and
+// smoothing of the percentile bounds so the contrast doesn't flicker.
+#define SPEC_FAST_ALPHA 0.30f
+#define SPEC_BOUNDS_ALPHA 0.20f
 
 struct dct_plan {
     size_t width = 0, height = 0;
@@ -289,14 +293,113 @@ static void pick_candidate(const float *result, size_t length, size_t range,
     }
 }
 
+// Spectrum thumbnail state: block sums of |coeff| from a 2D DCT, EMA of
+// the log10 block means, percentile stretch (smoothed bounds) -> 8-bit.
+// One instance per producer (full-frame analysis, fast crop path).
+struct spectrum_state {
+    std::vector<float> sum, acc;
+    std::vector<uint32_t> cnt;
+    std::vector<uint16_t> bx, by; // coefficient index -> block
+    std::vector<uint8_t> out8;
+    size_t w = 0, h = 0;
+    int frames = 0;
+    float lo_ema = 0.0f, hi_ema = 0.0f;
+
+    void update(const float *coeffs, size_t cw, size_t ch, float alpha)
+    {
+        const size_t nblk = (size_t)RESDET_SPEC_W * RESDET_SPEC_H;
+        if (w != cw || h != ch) {
+            w = cw;
+            h = ch;
+            bx.resize(w);
+            for (size_t x = 0; x < w; x++)
+                bx[x] = (uint16_t)(x * RESDET_SPEC_W / w);
+            by.resize(h);
+            for (size_t y = 0; y < h; y++)
+                by[y] = (uint16_t)(y * RESDET_SPEC_H / h);
+            acc.assign(nblk, 0.0f);
+            frames = 0;
+        }
+        out8.resize(nblk);
+        sum.assign(nblk, 0.0f);
+        cnt.assign(nblk, 0);
+        for (size_t y = 0; y < h; y++) {
+            const float *row = coeffs + y * w;
+            size_t base = (size_t)by[y] * RESDET_SPEC_W;
+            for (size_t x = 0; x < w; x++) {
+                size_t i = base + bx[x];
+                sum[i] += fabsf(row[x]);
+                cnt[i]++;
+            }
+        }
+        float vmin = 1e30f, vmax = -1e30f;
+        for (size_t i = 0; i < nblk; i++) {
+            float mean = cnt[i] ? sum[i] / (float)cnt[i] : 0.0f;
+            float v = log10f(mean + KNEE_LOG_EPS);
+            if (frames == 0)
+                acc[i] = v;
+            else
+                acc[i] += (v - acc[i]) * alpha;
+            if (acc[i] < vmin)
+                vmin = acc[i];
+            if (acc[i] > vmax)
+                vmax = acc[i];
+        }
+        // Percentile stretch: noise floor -> black, content band -> white
+        uint32_t histo[SPEC_HIST_BINS] = {};
+        float span = (vmax - vmin) > 1e-6f ? (vmax - vmin) : 1e-6f;
+        for (size_t i = 0; i < nblk; i++) {
+            int b = (int)((acc[i] - vmin) / span * (SPEC_HIST_BINS - 1));
+            histo[b < 0 ? 0 : (b >= SPEC_HIST_BINS ? SPEC_HIST_BINS - 1 : b)]++;
+        }
+        auto percentile = [&](double p) {
+            uint32_t target = (uint32_t)(p * (double)nblk), a = 0;
+            for (int b = 0; b < SPEC_HIST_BINS; b++) {
+                a += histo[b];
+                if (a >= target)
+                    return vmin + span * (float)b / (float)(SPEC_HIST_BINS - 1);
+            }
+            return vmax;
+        };
+        float lo = percentile(SPEC_P_LOW);
+        float hi = percentile(SPEC_P_HIGH);
+        if (frames == 0) {
+            lo_ema = lo;
+            hi_ema = hi;
+        } else {
+            lo_ema += (lo - lo_ema) * SPEC_BOUNDS_ALPHA;
+            hi_ema += (hi - hi_ema) * SPEC_BOUNDS_ALPHA;
+        }
+        frames++;
+        float lo2 = lo_ema, hi2 = hi_ema;
+        if (hi2 - lo2 < SPEC_MIN_RANGE)
+            hi2 = lo2 + SPEC_MIN_RANGE;
+        float scale = 255.0f / (hi2 - lo2);
+        for (size_t i = 0; i < nblk; i++) {
+            float q = (acc[i] - lo2) * scale;
+            out8[i] = (uint8_t)(q < 0.0f ? 0.0f : (q > 255.0f ? 255.0f : q));
+        }
+    }
+};
+
 struct resolution_detector {
+    // full-frame analysis worker
     std::thread worker;
     std::mutex mtx;
     std::condition_variable cv;
-    bool stop = false;
+    std::atomic<bool> stop{false};
     bool has_job = false;
     std::vector<uint8_t> job_luma;
     uint32_t job_w = 0, job_h = 0;
+
+    // fast spectrum worker (center crop at 30/60 FPS)
+    std::thread spec_worker;
+    std::mutex spec_mtx;
+    std::condition_variable spec_cv;
+    bool spec_has_job = false;
+    std::vector<uint8_t> spec_job;
+    uint32_t spec_job_w = 0, spec_job_h = 0;
+    std::atomic<bool> fast_spectrum{false};
 
     std::mutex result_mtx;
     resdet_result result = {};
@@ -304,16 +407,16 @@ struct resolution_detector {
     uint8_t spectrum[RESDET_SPEC_W * RESDET_SPEC_H] = {};
     bool spectrum_fresh = false;
 
-    // worker-only state
+    // analysis-worker-only state
     dct_plan plan;
     std::vector<float> coeffs;
     std::vector<float> xresult, yresult;
     std::vector<float> xprof, yprof;
-    // spectrum thumbnail: per-block sum of |coeff| and EMA of log10 mean
-    std::vector<float> spec_sum;
-    std::vector<uint32_t> spec_cnt;
-    std::vector<float> spec_acc;
-    std::vector<uint16_t> spec_bx, spec_by; // coefficient index -> block
+    spectrum_state spec_main;
+    // spectrum-worker-only state
+    dct_plan spec_plan;
+    std::vector<float> spec_coeffs;
+    spectrum_state spec_fast;
     // temporal accumulation (EMA over consecutive analyses)
     std::vector<float> xaccum, yaccum;     // sign-method votes
     std::vector<float> xprof_acc, yprof_acc; // magnitude profiles
@@ -326,7 +429,36 @@ struct resolution_detector {
 
     void analyze(const uint8_t *luma, uint32_t w, uint32_t h);
     void worker_loop();
+    void analyze_spectrum(const uint8_t *luma, uint32_t w, uint32_t h);
+    void spec_worker_loop();
+    void publish_spectrum(spectrum_state &st, const float *c, size_t w, size_t h, float alpha);
 };
+
+void resolution_detector::publish_spectrum(spectrum_state &st, const float *c,
+                                           size_t w, size_t h, float alpha)
+{
+    st.update(c, w, h, alpha);
+    std::lock_guard<std::mutex> lock(result_mtx);
+    memcpy(spectrum, st.out8.data(), sizeof(spectrum));
+    spectrum_fresh = true;
+}
+
+// Fast path: 2D DCT of a luma crop, thumbnail only (no detection).
+void resolution_detector::analyze_spectrum(const uint8_t *luma, uint32_t w, uint32_t h)
+{
+    if (w < 16 || h < 16 || w > RESDET_MAX_DIM || h > RESDET_MAX_DIM)
+        return;
+    if (!spec_plan.setup(w, h))
+        return;
+    spec_coeffs.resize((size_t)w * h);
+    for (size_t i = 0; i < (size_t)w * h; i++)
+        spec_coeffs[i] = (float)luma[i];
+    dct_pass(spec_plan.cfg_w, spec_coeffs.data(), spec_plan.F.data(), spec_plan.mirror.data(),
+             spec_plan.shift_w.data(), h, w, 1, w);
+    dct_pass(spec_plan.cfg_h, spec_coeffs.data(), spec_plan.F.data(), spec_plan.mirror.data(),
+             spec_plan.shift_h.data(), w, h, w, 1);
+    publish_spectrum(spec_fast, spec_coeffs.data(), w, h, SPEC_FAST_ALPHA);
+}
 
 void resolution_detector::analyze(const uint8_t *luma, uint32_t w, uint32_t h)
 {
@@ -388,73 +520,11 @@ void resolution_detector::analyze(const uint8_t *luma, uint32_t w, uint32_t h)
         frames_accumulated++;
     }
 
-    // Spectrum thumbnail: block mean of |coeff| -> log10 -> EMA -> 8-bit.
-    // Updated every analysis (also during warmup) so the panel shows early.
-    {
-        const size_t nblk = (size_t)RESDET_SPEC_W * RESDET_SPEC_H;
-        if (spec_bx.size() != w) {
-            spec_bx.resize(w);
-            for (size_t x = 0; x < w; x++)
-                spec_bx[x] = (uint16_t)(x * RESDET_SPEC_W / w);
-        }
-        if (spec_by.size() != h) {
-            spec_by.resize(h);
-            for (size_t y = 0; y < h; y++)
-                spec_by[y] = (uint16_t)(y * RESDET_SPEC_H / h);
-        }
-        spec_sum.assign(nblk, 0.0f);
-        spec_cnt.assign(nblk, 0);
-        for (size_t y = 0; y < h; y++) {
-            const float *row = coeffs.data() + y * w;
-            size_t base = (size_t)spec_by[y] * RESDET_SPEC_W;
-            for (size_t x = 0; x < w; x++) {
-                size_t i = base + spec_bx[x];
-                spec_sum[i] += fabsf(row[x]);
-                spec_cnt[i]++;
-            }
-        }
-        if (spec_acc.size() != nblk || frames_accumulated == 1)
-            spec_acc.assign(nblk, 0.0f);
-        float vmin = 1e30f, vmax = -1e30f;
-        for (size_t i = 0; i < nblk; i++) {
-            float mean = spec_cnt[i] ? spec_sum[i] / (float)spec_cnt[i] : 0.0f;
-            float v = log10f(mean + KNEE_LOG_EPS);
-            if (frames_accumulated == 1)
-                spec_acc[i] = v;
-            else
-                spec_acc[i] += (v - spec_acc[i]) * RESDET_ACCUM_ALPHA;
-            if (spec_acc[i] < vmin)
-                vmin = spec_acc[i];
-            if (spec_acc[i] > vmax)
-                vmax = spec_acc[i];
-        }
-        uint32_t histo[SPEC_HIST_BINS] = {};
-        float span = (vmax - vmin) > 1e-6f ? (vmax - vmin) : 1e-6f;
-        for (size_t i = 0; i < nblk; i++) {
-            int b = (int)((spec_acc[i] - vmin) / span * (SPEC_HIST_BINS - 1));
-            histo[b < 0 ? 0 : (b >= SPEC_HIST_BINS ? SPEC_HIST_BINS - 1 : b)]++;
-        }
-        auto percentile = [&](double p) {
-            uint32_t target = (uint32_t)(p * (double)nblk), acc = 0;
-            for (int b = 0; b < SPEC_HIST_BINS; b++) {
-                acc += histo[b];
-                if (acc >= target)
-                    return vmin + span * (float)b / (float)(SPEC_HIST_BINS - 1);
-            }
-            return vmax;
-        };
-        float lo = percentile(SPEC_P_LOW);
-        float hi = percentile(SPEC_P_HIGH);
-        if (hi - lo < SPEC_MIN_RANGE)
-            hi = lo + SPEC_MIN_RANGE;
-        float scale = 255.0f / (hi - lo);
-        std::lock_guard<std::mutex> lock(result_mtx);
-        for (size_t i = 0; i < nblk; i++) {
-            float q = (spec_acc[i] - lo) * scale;
-            spectrum[i] = (uint8_t)(q < 0.0f ? 0.0f : (q > 255.0f ? 255.0f : q));
-        }
-        spectrum_fresh = true;
-    }
+    // Spectrum thumbnail from the full-frame DCT — every analysis (also
+    // during warmup) so the panel shows early. Skipped while the fast
+    // crop-based path owns the thumbnail.
+    if (!fast_spectrum.load())
+        publish_spectrum(spec_main, coeffs.data(), w, h, RESDET_ACCUM_ALPHA);
 
     if (frames_accumulated < RESDET_WARMUP_FRAMES)
         return;
@@ -516,8 +586,8 @@ void resolution_detector::worker_loop()
     for (;;) {
         {
             std::unique_lock<std::mutex> lock(mtx);
-            cv.wait(lock, [this] { return stop || has_job; });
-            if (stop)
+            cv.wait(lock, [this] { return stop.load() || has_job; });
+            if (stop.load())
                 return;
             luma.swap(job_luma);
             w = job_w;
@@ -531,10 +601,33 @@ void resolution_detector::worker_loop()
     }
 }
 
+void resolution_detector::spec_worker_loop()
+{
+    std::vector<uint8_t> luma;
+    uint32_t w, h;
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lock(spec_mtx);
+            spec_cv.wait(lock, [this] { return stop.load() || spec_has_job; });
+            if (stop.load())
+                return;
+            luma.swap(spec_job);
+            w = spec_job_w;
+            h = spec_job_h;
+        }
+        analyze_spectrum(luma.data(), w, h);
+        {
+            std::lock_guard<std::mutex> lock(spec_mtx);
+            spec_has_job = false;
+        }
+    }
+}
+
 struct resolution_detector *resdet_create(void)
 {
     resolution_detector *rd = new resolution_detector();
     rd->worker = std::thread(&resolution_detector::worker_loop, rd);
+    rd->spec_worker = std::thread(&resolution_detector::spec_worker_loop, rd);
     return rd;
 }
 
@@ -544,12 +637,40 @@ void resdet_destroy(struct resolution_detector *rd)
         return;
     {
         std::lock_guard<std::mutex> lock(rd->mtx);
+        std::lock_guard<std::mutex> lock2(rd->spec_mtx);
         rd->stop = true;
     }
     rd->cv.notify_all();
+    rd->spec_cv.notify_all();
     if (rd->worker.joinable())
         rd->worker.join();
+    if (rd->spec_worker.joinable())
+        rd->spec_worker.join();
     delete rd;
+}
+
+void resdet_set_fast_spectrum(struct resolution_detector *rd, bool enabled)
+{
+    if (rd)
+        rd->fast_spectrum = enabled;
+}
+
+bool resdet_submit_spectrum(struct resolution_detector *rd, const uint8_t *luma,
+                            uint32_t width, uint32_t height)
+{
+    if (!rd || !luma || !width || !height)
+        return false;
+    {
+        std::lock_guard<std::mutex> lock(rd->spec_mtx);
+        if (rd->spec_has_job)
+            return false;
+        rd->spec_job.assign(luma, luma + (size_t)width * height);
+        rd->spec_job_w = width;
+        rd->spec_job_h = height;
+        rd->spec_has_job = true;
+    }
+    rd->spec_cv.notify_one();
+    return true;
 }
 
 bool resdet_submit(struct resolution_detector *rd, const uint8_t *luma,
