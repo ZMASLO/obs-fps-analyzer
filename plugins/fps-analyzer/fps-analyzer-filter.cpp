@@ -2,7 +2,6 @@
 #include <graphics/graphics.h>
 #include <graphics/vec4.h>
 #include <util/platform.h>
-#include <util/threading.h>
 #include <atomic>
 #include <stdio.h>
 #include <stdint.h>
@@ -88,7 +87,8 @@ struct fps_analyzer_filter {
     char dump_label[128];
     int dump_count;
     int dump_delay;               // seconds between the button click and the first frame
-    volatile long dump_remaining; // >0 while a dump session is active (set from the UI thread)
+    long dump_remaining;          // >0 while a dump session is active (set from the UI thread);
+                                  // accessed through std::atomic_ref (see dump_remaining_* helpers)
     uint64_t dump_not_before_ns;  // frames are written only once os_gettime_ns() passes this
     int dump_done_frames;         // frames written by the last finished session (0 = none)
     bool dump_status_dirty;       // status label needs a properties refresh
@@ -100,6 +100,20 @@ struct fps_analyzer_filter {
 };
 
 // --- Utility functions ---
+
+// Cross-thread counter for the debug frame dump. std::atomic_ref keeps the
+// struct plain C-style (bzalloc'd, no constructors) and avoids libobs'
+// util/threading.h, which on Windows pulls in pthread.h that the minimal
+// CI SDK does not ship.
+static inline long dump_remaining_load(struct fps_analyzer_filter *f) {
+    return std::atomic_ref<long>(f->dump_remaining).load();
+}
+static inline void dump_remaining_store(struct fps_analyzer_filter *f, long v) {
+    std::atomic_ref<long>(f->dump_remaining).store(v);
+}
+static inline long dump_remaining_dec(struct fps_analyzer_filter *f) {
+    return std::atomic_ref<long>(f->dump_remaining).fetch_sub(1) - 1;
+}
 
 static void ensure_luma_buffer(struct fps_analyzer_filter *filter, size_t needed) {
     if (filter->luma_buffer_size >= needed)
@@ -322,7 +336,7 @@ static void read_debug_settings(struct fps_analyzer_filter *filter, obs_data_t *
 // Starts a dump session after `delay_sec`. Called from the UI thread
 // (button) or the hotkey thread; the video thread does the writing.
 static void debug_dump_request(struct fps_analyzer_filter *filter, int delay_sec) {
-    if (os_atomic_load_long(&filter->dump_remaining) > 0) {
+    if (dump_remaining_load(filter) > 0) {
         blog(LOG_INFO, "[FPS Analyzer] Frame dump already in progress");
         return;
     }
@@ -331,7 +345,7 @@ static void debug_dump_request(struct fps_analyzer_filter *filter, int delay_sec
     filter->dump_index = 0;
     filter->dump_done_frames = 0;
     filter->dump_not_before_ns = os_gettime_ns() + (uint64_t)delay_sec * 1000000000ULL;
-    os_atomic_set_long(&filter->dump_remaining, n);
+    dump_remaining_store(filter,n);
     filter->dump_status_dirty = true;
     blog(LOG_INFO, "[FPS Analyzer] Frame dump requested: %ld frames, starting in %d s", n, delay_sec);
 }
@@ -373,13 +387,13 @@ static void debug_dump_finish(struct fps_analyzer_filter *filter) {
          filter->dump_index, filter->dump_session_dir);
     filter->dump_done_frames = filter->dump_index;
     filter->dump_index = 0;
-    os_atomic_set_long(&filter->dump_remaining, 0);
+    dump_remaining_store(filter,0);
     filter->dump_status_dirty = true;
 }
 
 // Text for the status label in the properties dialog
 static void debug_dump_status_text(struct fps_analyzer_filter *filter, char *buf, size_t size) {
-    long remaining = os_atomic_load_long(&filter->dump_remaining);
+    long remaining = dump_remaining_load(filter);
     uint64_t now = os_gettime_ns();
     if (remaining > 0) {
         if (now < filter->dump_not_before_ns) {
@@ -443,7 +457,7 @@ static void debug_dump_frame(struct fps_analyzer_filter *filter, const uint8_t *
                 g_fps_shared.res_conf_w, g_fps_shared.res_conf_h,
                 g_fps_shared.res_status);
     filter->dump_index++;
-    if (os_atomic_dec_long(&filter->dump_remaining) <= 0)
+    if (dump_remaining_dec(filter) <= 0)
         debug_dump_finish(filter);
 }
 
@@ -718,7 +732,7 @@ static struct obs_source_frame *fps_analyzer_filter_video(void *data,
     {
         uint64_t now = os_gettime_ns();
         bool detect = filter->enable_resolution_detection && filter->res_detector;
-        bool dump = os_atomic_load_long(&filter->dump_remaining) > 0 &&
+        bool dump = dump_remaining_load(filter) > 0 &&
                     now >= filter->dump_not_before_ns;
         if ((detect || dump) && now - filter->last_resdet_submit_ns >= 500000000ULL) {
             bool have_full = (filter->analyze_method == ANALYZE_DIFF);
@@ -842,7 +856,7 @@ static void fps_analyzer_video_render(void *data, gs_effect_t *effect)
         {
             uint64_t now = os_gettime_ns();
             bool detect = filter->enable_resolution_detection && filter->res_detector;
-            bool dump = os_atomic_load_long(&filter->dump_remaining) > 0 &&
+            bool dump = dump_remaining_load(filter) > 0 &&
                     now >= filter->dump_not_before_ns;
             if ((detect || dump) && now - filter->last_resdet_submit_ns >= 500000000ULL) {
                 if (filter->analyze_method != ANALYZE_DIFF) {
@@ -897,7 +911,7 @@ static void fps_analyzer_video_tick(void *data, float seconds)
     // second while a session is pending/active, and once when it finishes.
     // (OBS rebuilds the dialog on the update_properties signal.)
     if (filter->debug_options) {
-        bool active = os_atomic_load_long(&filter->dump_remaining) > 0;
+        bool active = dump_remaining_load(filter) > 0;
         if (filter->dump_status_dirty ||
             (active && now - filter->dump_status_refresh_ns >= 1000000000ULL)) {
             filter->dump_status_dirty = false;
