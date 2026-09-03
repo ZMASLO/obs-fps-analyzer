@@ -60,6 +60,7 @@ The plugin offers two different image analysis methods:
 - **Settings**:
   - Filter: "Detect upscale source resolution (DCT)" checkbox (default: disabled)
   - Overlay: "Show Source resolution text" checkbox (default: enabled)
+  - Overlay: "Show Source resolution spectrum" checkbox (default: enabled) — a small panel with the 2D DCT log-magnitude spectrum of the frame (low frequencies top-left, bright = energy) and green tick markers with the detected source width (bottom edge) and height (right edge). On an upscaled image the energy forms a visible rectangle ending at the markers; a native image fills the whole panel.
 - **Algorithm**: hybrid DCT spectral analysis, ~2 analyses per second on a background thread:
   - *Sign method* (ported from [resdet](https://github.com/0x09/resdet)): traditional resamplers mirror the spectrum with inverted signs around the source resolution index — pixel-exact on clean upscales (videos, menus).
   - *Magnitude knee* (fallback): native-res overlays like HUD or film grain corrupt the sign symmetry, but the energy envelope still drops sharply at the source resolution; the detector finds the strongest step in the log-magnitude profile of each axis.

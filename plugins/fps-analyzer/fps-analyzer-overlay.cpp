@@ -27,6 +27,12 @@ extern struct obs_source_info fps_analyzer_filter_info;
 #define COMPACT_PLOT_W 300
 #define COMPACT_PLOT_H 80
 
+// Spectrum panel (DCT log-magnitude thumbnail + source-resolution markers)
+#define SPEC_PAD 8
+#define SPEC_LABEL_W 60
+#define SPEC_LABEL_H 20
+#define SPEC_TICK 10
+
 struct fps_overlay_source
 {
     obs_source_t *text_source;
@@ -38,6 +44,7 @@ struct fps_overlay_source
     bool show_frametime_text;
     bool show_tearing_text;
     bool show_resolution_text;
+    bool show_resolution_spectrum;
     bool show_frametime_graph;
     bool show_fps_graph;
     int frametime_style; // GRAPH_STYLE_BIG or GRAPH_STYLE_COMPACT
@@ -52,6 +59,13 @@ struct fps_overlay_source
     int fps_grid_count;
     double fps_grid_values[MAX_GRID_LABELS];
     char last_text[512];
+    // Spectrum panel
+    gs_texture_t *spec_tex;
+    uint8_t *spec_bgra;
+    uint32_t spec_uploaded_version;
+    obs_source_t *spec_label_w;
+    obs_source_t *spec_label_h;
+    int spec_label_w_val, spec_label_h_val;
 };
 
 static const char *fps_overlay_get_name(void *unused)
@@ -92,7 +106,8 @@ static void update_text_source(struct fps_overlay_source *ctx, const char *text)
     obs_data_release(settings);
 }
 
-static obs_source_t *create_label_source(const char *text, const char *name, int size, bool bold)
+static obs_source_t *create_label_source_color(const char *text, const char *name, int size,
+                                               bool bold, uint32_t color)
 {
     obs_data_t *font_obj = obs_data_create();
     obs_data_set_string(font_obj, "face", "Arial");
@@ -103,8 +118,8 @@ static obs_source_t *create_label_source(const char *text, const char *name, int
     obs_data_t *settings = obs_data_create();
     obs_data_set_string(settings, "text", text);
     obs_data_set_obj(settings, "font", font_obj);
-    obs_data_set_int(settings, "color1", 0xFFFFFF);
-    obs_data_set_int(settings, "color2", 0xFFFFFF);
+    obs_data_set_int(settings, "color1", color);
+    obs_data_set_int(settings, "color2", color);
     obs_data_set_int(settings, "opacity", 80);
     obs_data_set_bool(settings, "outline", true);
     obs_data_set_int(settings, "outline_size", 1);
@@ -116,6 +131,163 @@ static obs_source_t *create_label_source(const char *text, const char *name, int
     obs_data_release(font_obj);
     obs_data_release(settings);
     return src;
+}
+
+static obs_source_t *create_label_source(const char *text, const char *name, int size, bool bold)
+{
+    return create_label_source_color(text, name, size, bold, 0xFFFFFF);
+}
+
+static void set_label_text(obs_source_t *label, const char *text)
+{
+    if (!label)
+        return;
+    obs_data_t *settings = obs_data_create();
+    obs_data_set_string(settings, "text", text);
+    obs_source_update(label, settings);
+    obs_data_release(settings);
+}
+
+// --- Spectrum panel ---
+
+static void get_spectrum_panel_dims(int *total_w, int *total_h)
+{
+    *total_w = SPEC_PAD + RESDET_SPEC_W + SPEC_PAD + SPEC_LABEL_W;
+    *total_h = SPEC_PAD + RESDET_SPEC_H + SPEC_PAD + SPEC_LABEL_H;
+}
+
+static bool spectrum_visible(struct fps_overlay_source *ctx)
+{
+    return ctx->show_resolution_spectrum && g_fps_shared.res_detect_enabled &&
+           g_fps_shared.active_filter_count == 1 && g_fps_shared.res_spectrum_version > 0;
+}
+
+// Draws the DCT log-magnitude thumbnail (DC top-left) with green ticks and
+// labels at the detected source resolution, like the reference overlay.
+static void render_spectrum_panel(struct fps_overlay_source *ctx)
+{
+    if (!ctx->spec_tex)
+        ctx->spec_tex = gs_texture_create(RESDET_SPEC_W, RESDET_SPEC_H, GS_BGRA, 1, NULL, GS_DYNAMIC);
+    if (!ctx->spec_tex || !ctx->spec_bgra)
+        return;
+
+    if (ctx->spec_uploaded_version != g_fps_shared.res_spectrum_version)
+    {
+        for (int i = 0; i < RESDET_SPEC_W * RESDET_SPEC_H; i++)
+        {
+            uint8_t *px = ctx->spec_bgra + i * 4;
+            resdet_spectrum_color(g_fps_shared.res_spectrum[i], &px[0], &px[1], &px[2]);
+            px[3] = 255;
+        }
+        gs_texture_set_image(ctx->spec_tex, ctx->spec_bgra, RESDET_SPEC_W * 4, false);
+        ctx->spec_uploaded_version = g_fps_shared.res_spectrum_version;
+    }
+
+    int total_w, total_h;
+    get_spectrum_panel_dims(&total_w, &total_h);
+
+    gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
+    gs_effect_t *def = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+    if (!solid || !def)
+        return;
+    gs_eparam_t *color_param = gs_effect_get_param_by_name(solid, "color");
+    gs_technique_t *tech = gs_effect_get_technique(solid, "Solid");
+    gs_eparam_t *image = gs_effect_get_param_by_name(def, "image");
+    if (!color_param || !tech || !image)
+        return;
+    struct vec4 col;
+
+    // Panel background
+    gs_technique_begin(tech);
+    gs_technique_begin_pass(tech, 0);
+    vec4_set(&col, 0.0f, 0.0f, 0.0f, 0.8f);
+    gs_effect_set_vec4(color_param, &col);
+    gs_draw_sprite(0, 0, (uint32_t)total_w, (uint32_t)total_h);
+    gs_technique_end_pass(tech);
+    gs_technique_end(tech);
+
+    // Spectrum image
+    gs_matrix_push();
+    gs_matrix_translate3f((float)SPEC_PAD, (float)SPEC_PAD, 0.0f);
+    gs_effect_set_texture(image, ctx->spec_tex);
+    while (gs_effect_loop(def, "Draw"))
+        gs_draw_sprite(ctx->spec_tex, 0, RESDET_SPEC_W, RESDET_SPEC_H);
+
+    // Markers at the detected source resolution (spectrum index == pixels)
+    int fw = g_fps_shared.res_frame_w, fh = g_fps_shared.res_frame_h;
+    int sw = g_fps_shared.res_valid ? g_fps_shared.res_src_w : 0;
+    int sh = g_fps_shared.res_valid ? g_fps_shared.res_src_h : 0;
+    int x_pos = (sw > 0 && fw > 0) ? (int)((int64_t)sw * RESDET_SPEC_W / fw) : -1;
+    int y_pos = (sh > 0 && fh > 0) ? (int)((int64_t)sh * RESDET_SPEC_H / fh) : -1;
+
+    if (x_pos >= 0 || y_pos >= 0)
+    {
+        gs_technique_begin(tech);
+        gs_technique_begin_pass(tech, 0);
+        if (x_pos >= 0)
+        {
+            vec4_set(&col, 0.0f, 1.0f, 0.0f, 0.25f);
+            gs_effect_set_vec4(color_param, &col);
+            gs_matrix_push();
+            gs_matrix_translate3f((float)x_pos, 0.0f, 0.0f);
+            gs_draw_sprite(0, 0, 1, RESDET_SPEC_H);
+            gs_matrix_pop();
+
+            vec4_set(&col, 0.0f, 1.0f, 0.0f, 1.0f);
+            gs_effect_set_vec4(color_param, &col);
+            gs_matrix_push();
+            gs_matrix_translate3f((float)(x_pos - 1), 0.0f, 0.0f);
+            gs_draw_sprite(0, 0, 2, SPEC_TICK);
+            gs_matrix_pop();
+            gs_matrix_push();
+            gs_matrix_translate3f((float)(x_pos - 1), (float)(RESDET_SPEC_H - SPEC_TICK), 0.0f);
+            gs_draw_sprite(0, 0, 2, SPEC_TICK);
+            gs_matrix_pop();
+        }
+        if (y_pos >= 0)
+        {
+            vec4_set(&col, 0.0f, 1.0f, 0.0f, 0.25f);
+            gs_effect_set_vec4(color_param, &col);
+            gs_matrix_push();
+            gs_matrix_translate3f(0.0f, (float)y_pos, 0.0f);
+            gs_draw_sprite(0, 0, RESDET_SPEC_W, 1);
+            gs_matrix_pop();
+
+            vec4_set(&col, 0.0f, 1.0f, 0.0f, 1.0f);
+            gs_effect_set_vec4(color_param, &col);
+            gs_matrix_push();
+            gs_matrix_translate3f(0.0f, (float)(y_pos - 1), 0.0f);
+            gs_draw_sprite(0, 0, SPEC_TICK, 2);
+            gs_matrix_pop();
+            gs_matrix_push();
+            gs_matrix_translate3f((float)(RESDET_SPEC_W - SPEC_TICK), (float)(y_pos - 1), 0.0f);
+            gs_draw_sprite(0, 0, SPEC_TICK, 2);
+            gs_matrix_pop();
+        }
+        gs_technique_end_pass(tech);
+        gs_technique_end(tech);
+    }
+    gs_matrix_pop();
+
+    // Labels outside the image: width below the bottom tick, height right of the right tick
+    if (x_pos >= 0 && ctx->spec_label_w)
+    {
+        uint32_t lw = obs_source_get_width(ctx->spec_label_w);
+        gs_matrix_push();
+        gs_matrix_translate3f((float)(SPEC_PAD + x_pos) - (float)lw / 2.0f,
+                              (float)(SPEC_PAD + RESDET_SPEC_H + 2), 0.0f);
+        obs_source_video_render(ctx->spec_label_w);
+        gs_matrix_pop();
+    }
+    if (y_pos >= 0 && ctx->spec_label_h)
+    {
+        uint32_t lh = obs_source_get_height(ctx->spec_label_h);
+        gs_matrix_push();
+        gs_matrix_translate3f((float)(SPEC_PAD + RESDET_SPEC_W + 6),
+                              (float)(SPEC_PAD + y_pos) - (float)lh / 2.0f, 0.0f);
+        obs_source_video_render(ctx->spec_label_h);
+        gs_matrix_pop();
+    }
 }
 
 // Build grid labels for a given step and max value
@@ -409,8 +581,14 @@ static void *fps_overlay_create(obs_data_t *settings, obs_source_t *source)
     ctx->fps_style = (int)obs_data_get_int(settings, "fps_style");
     ctx->frametime_scale = obs_data_get_double(settings, "frametime_scale");
     ctx->fps_scale = obs_data_get_double(settings, "fps_scale");
+    ctx->show_resolution_spectrum = obs_data_get_bool(settings, "show_resolution_spectrum");
 
     ctx->last_text[0] = '\0';
+    ctx->spec_tex = NULL;
+    ctx->spec_bgra = (uint8_t *)bzalloc((size_t)RESDET_SPEC_W * RESDET_SPEC_H * 4);
+    ctx->spec_uploaded_version = 0;
+    ctx->spec_label_w_val = -1;
+    ctx->spec_label_h_val = -1;
 
     // Create private text_gdiplus source (not visible in OBS source list)
     obs_data_t *text_settings = obs_data_create();
@@ -425,6 +603,8 @@ static void *fps_overlay_create(obs_data_t *settings, obs_source_t *source)
 
     ctx->label_frametime = create_label_source("FRAMETIME", "fps_label_ft", 18, true);
     ctx->label_fps = create_label_source("FRAMERATE", "fps_label_fps", 18, true);
+    ctx->spec_label_w = create_label_source_color("", "fps_spec_label_w", 14, true, 0x00FF00);
+    ctx->spec_label_h = create_label_source_color("", "fps_spec_label_h", 14, true, 0x00FF00);
     rebuild_grid_labels(ctx);
 
     return ctx;
@@ -441,6 +621,18 @@ static void fps_overlay_destroy(void *data)
             obs_source_release(ctx->label_frametime);
         if (ctx->label_fps)
             obs_source_release(ctx->label_fps);
+        if (ctx->spec_label_w)
+            obs_source_release(ctx->spec_label_w);
+        if (ctx->spec_label_h)
+            obs_source_release(ctx->spec_label_h);
+        if (ctx->spec_bgra)
+            bfree(ctx->spec_bgra);
+        if (ctx->spec_tex)
+        {
+            obs_enter_graphics();
+            gs_texture_destroy(ctx->spec_tex);
+            obs_leave_graphics();
+        }
         for (int i = 0; i < ctx->ft_grid_count; i++)
             if (ctx->ft_grid_labels[i])
                 obs_source_release(ctx->ft_grid_labels[i]);
@@ -483,6 +675,11 @@ static obs_properties_t *fps_overlay_properties(void *data)
     obs_property_t *res_text = obs_properties_add_bool(props, "show_resolution_text", "Show Source resolution text");
     obs_property_set_long_description(res_text,
         "Shows the upscale source resolution estimate. Requires \"Detect upscale "
+        "source resolution\" to be enabled in the FPS Analyzer filter.");
+    obs_property_t *spec_prop = obs_properties_add_bool(props, "show_resolution_spectrum", "Show Source resolution spectrum");
+    obs_property_set_long_description(spec_prop,
+        "Shows the 2D DCT spectrum of the frame (low frequencies top-left) with "
+        "markers at the detected source resolution. Requires \"Detect upscale "
         "source resolution\" to be enabled in the FPS Analyzer filter.");
     obs_properties_add_bool(props, "show_text_background", "Show text background");
 
@@ -538,6 +735,7 @@ static void fps_overlay_get_defaults(obs_data_t *settings)
     obs_data_set_default_bool(settings, "show_frametime_text", true);
     obs_data_set_default_bool(settings, "show_tearing_text", true);
     obs_data_set_default_bool(settings, "show_resolution_text", true);
+    obs_data_set_default_bool(settings, "show_resolution_spectrum", true);
     obs_data_set_default_bool(settings, "show_text_background", true);
     obs_data_set_default_bool(settings, "show_frametime_graph", true);
     obs_data_set_default_int(settings, "frametime_style", GRAPH_STYLE_COMPACT);
@@ -564,6 +762,7 @@ static void fps_overlay_update(void *data, obs_data_t *settings)
     ctx->fps_style = (int)obs_data_get_int(settings, "fps_style");
     ctx->frametime_scale = obs_data_get_double(settings, "frametime_scale");
     ctx->fps_scale = obs_data_get_double(settings, "fps_scale");
+    ctx->show_resolution_spectrum = obs_data_get_bool(settings, "show_resolution_spectrum");
 
     rebuild_grid_labels(ctx);
 
@@ -654,6 +853,27 @@ static void fps_overlay_tick(void *data, float seconds)
             snprintf(text, sizeof(text), " "); // at least a space so text source has content
     }
 
+    // Spectrum marker labels follow the detected source resolution
+    if (ctx->show_resolution_spectrum)
+    {
+        bool have = g_fps_shared.res_detect_enabled && g_fps_shared.res_valid;
+        int sw = have ? g_fps_shared.res_src_w : 0;
+        int sh = have ? g_fps_shared.res_src_h : 0;
+        char buf[16];
+        if (sw != ctx->spec_label_w_val)
+        {
+            snprintf(buf, sizeof(buf), "%d", sw);
+            set_label_text(ctx->spec_label_w, buf);
+            ctx->spec_label_w_val = sw;
+        }
+        if (sh != ctx->spec_label_h_val)
+        {
+            snprintf(buf, sizeof(buf), "%d", sh);
+            set_label_text(ctx->spec_label_h, buf);
+            ctx->spec_label_h_val = sh;
+        }
+    }
+
     // Only update the text source if the text actually changed
     if (strcmp(text, ctx->last_text) != 0)
     {
@@ -669,6 +889,7 @@ static void fps_overlay_render(void *data, gs_effect_t *effect)
     struct fps_overlay_source *ctx = (struct fps_overlay_source *)data;
     int count = g_fps_shared.graph_count;
     bool any_graph = (ctx->show_frametime_graph || ctx->show_fps_graph) && count >= 2;
+    bool show_spec = spectrum_visible(ctx);
 
     // 1. Render text at top with margin
     bool any_text = ctx->show_fps_text || ctx->show_frametime_text ||
@@ -683,7 +904,7 @@ static void fps_overlay_render(void *data, gs_effect_t *effect)
         y_offset = obs_source_get_height(ctx->text_source) + GRAPH_MARGIN * 2;
     }
 
-    if (!any_graph)
+    if (!any_graph && !show_spec)
         return;
 
     gs_blend_state_push();
@@ -691,8 +912,20 @@ static void fps_overlay_render(void *data, gs_effect_t *effect)
     gs_enable_blending(true);
     gs_blend_function(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA);
 
-    // 2. Frametime graph
-    if (ctx->show_frametime_graph)
+    // 2. Spectrum panel
+    if (show_spec)
+    {
+        gs_matrix_push();
+        gs_matrix_translate3f(0.0f, (float)y_offset, 0.0f);
+        render_spectrum_panel(ctx);
+        gs_matrix_pop();
+        int pw, ph;
+        get_spectrum_panel_dims(&pw, &ph);
+        y_offset += (uint32_t)ph + GRAPH_MARGIN;
+    }
+
+    // 3. Frametime graph
+    if (any_graph && ctx->show_frametime_graph)
     {
         gs_matrix_push();
         gs_matrix_translate3f(0.0f, (float)y_offset, 0.0f);
@@ -719,8 +952,8 @@ static void fps_overlay_render(void *data, gs_effect_t *effect)
         }
     }
 
-    // 3. FPS graph
-    if (ctx->show_fps_graph)
+    // 4. FPS graph
+    if (any_graph && ctx->show_fps_graph)
     {
         gs_matrix_push();
         gs_matrix_translate3f(0.0f, (float)y_offset, 0.0f);
@@ -759,28 +992,30 @@ static uint32_t fps_overlay_get_width(void *data)
     struct fps_overlay_source *ctx = (struct fps_overlay_source *)data;
     bool any_text = ctx->show_fps_text || ctx->show_frametime_text ||
                     ctx->show_tearing_text || ctx->show_resolution_text;
-    uint32_t text_w = 0;
+    uint32_t max_w = 0;
     if (any_text && ctx->text_source)
-        text_w = obs_source_get_width(ctx->text_source) + GRAPH_MARGIN * 2;
-    if (ctx->show_frametime_graph || ctx->show_fps_graph)
+        max_w = obs_source_get_width(ctx->text_source) + GRAPH_MARGIN * 2;
+    if (spectrum_visible(ctx))
     {
-        int pw, ph, tw, th;
-        uint32_t max_gw = 0;
-        if (ctx->show_frametime_graph)
-        {
-            get_graph_dims(ctx->frametime_style, &pw, &ph, &tw, &th);
-            if ((uint32_t)tw > max_gw)
-                max_gw = (uint32_t)tw;
-        }
-        if (ctx->show_fps_graph)
-        {
-            get_graph_dims(ctx->fps_style, &pw, &ph, &tw, &th);
-            if ((uint32_t)tw > max_gw)
-                max_gw = (uint32_t)tw;
-        }
-        return text_w > max_gw ? text_w : max_gw;
+        int sw, sh;
+        get_spectrum_panel_dims(&sw, &sh);
+        if ((uint32_t)sw > max_w)
+            max_w = (uint32_t)sw;
     }
-    return text_w;
+    int pw, ph, tw, th;
+    if (ctx->show_frametime_graph)
+    {
+        get_graph_dims(ctx->frametime_style, &pw, &ph, &tw, &th);
+        if ((uint32_t)tw > max_w)
+            max_w = (uint32_t)tw;
+    }
+    if (ctx->show_fps_graph)
+    {
+        get_graph_dims(ctx->fps_style, &pw, &ph, &tw, &th);
+        if ((uint32_t)tw > max_w)
+            max_w = (uint32_t)tw;
+    }
+    return max_w;
 }
 
 static uint32_t fps_overlay_get_height(void *data)
@@ -791,11 +1026,12 @@ static uint32_t fps_overlay_get_height(void *data)
     uint32_t text_h = 0;
     if (any_text && ctx->text_source)
         text_h = obs_source_get_height(ctx->text_source) + GRAPH_MARGIN * 2;
-    int graphs = 0;
-    if (ctx->show_frametime_graph)
-        graphs++;
-    if (ctx->show_fps_graph)
-        graphs++;
+    if (spectrum_visible(ctx))
+    {
+        int sw, sh;
+        get_spectrum_panel_dims(&sw, &sh);
+        text_h += (uint32_t)sh + GRAPH_MARGIN;
+    }
     uint32_t graph_h = 0;
     int pw, ph, tw, th;
     if (ctx->show_frametime_graph)

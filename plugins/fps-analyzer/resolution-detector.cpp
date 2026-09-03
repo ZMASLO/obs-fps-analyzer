@@ -48,6 +48,15 @@
 #define RESDET_HISTORY 8
 #define RESDET_MIN_VOTES 3
 
+// Spectrum thumbnail contrast: percentile stretch of the log10 block
+// values — the noise floor (P_LOW) maps to black, the content band
+// (P_HIGH) to white, so an upscale's energy rectangle stands out
+// regardless of how much energy sits near DC.
+#define SPEC_HIST_BINS 512
+#define SPEC_P_LOW 0.10
+#define SPEC_P_HIGH 0.90
+#define SPEC_MIN_RANGE 1.0f // decades; avoids amplifying noise on flat spectra
+
 struct dct_plan {
     size_t width = 0, height = 0;
     kiss_fftr_cfg cfg_w = nullptr, cfg_h = nullptr;
@@ -292,12 +301,19 @@ struct resolution_detector {
     std::mutex result_mtx;
     resdet_result result = {};
     bool result_fresh = false;
+    uint8_t spectrum[RESDET_SPEC_W * RESDET_SPEC_H] = {};
+    bool spectrum_fresh = false;
 
     // worker-only state
     dct_plan plan;
     std::vector<float> coeffs;
     std::vector<float> xresult, yresult;
     std::vector<float> xprof, yprof;
+    // spectrum thumbnail: per-block sum of |coeff| and EMA of log10 mean
+    std::vector<float> spec_sum;
+    std::vector<uint32_t> spec_cnt;
+    std::vector<float> spec_acc;
+    std::vector<uint16_t> spec_bx, spec_by; // coefficient index -> block
     // temporal accumulation (EMA over consecutive analyses)
     std::vector<float> xaccum, yaccum;     // sign-method votes
     std::vector<float> xprof_acc, yprof_acc; // magnitude profiles
@@ -370,6 +386,74 @@ void resolution_detector::analyze(const uint8_t *luma, uint32_t w, uint32_t h)
         for (size_t i = 0; i < yprof_acc.size(); i++)
             yprof_acc[i] += (yprof[i] - yprof_acc[i]) * RESDET_ACCUM_ALPHA;
         frames_accumulated++;
+    }
+
+    // Spectrum thumbnail: block mean of |coeff| -> log10 -> EMA -> 8-bit.
+    // Updated every analysis (also during warmup) so the panel shows early.
+    {
+        const size_t nblk = (size_t)RESDET_SPEC_W * RESDET_SPEC_H;
+        if (spec_bx.size() != w) {
+            spec_bx.resize(w);
+            for (size_t x = 0; x < w; x++)
+                spec_bx[x] = (uint16_t)(x * RESDET_SPEC_W / w);
+        }
+        if (spec_by.size() != h) {
+            spec_by.resize(h);
+            for (size_t y = 0; y < h; y++)
+                spec_by[y] = (uint16_t)(y * RESDET_SPEC_H / h);
+        }
+        spec_sum.assign(nblk, 0.0f);
+        spec_cnt.assign(nblk, 0);
+        for (size_t y = 0; y < h; y++) {
+            const float *row = coeffs.data() + y * w;
+            size_t base = (size_t)spec_by[y] * RESDET_SPEC_W;
+            for (size_t x = 0; x < w; x++) {
+                size_t i = base + spec_bx[x];
+                spec_sum[i] += fabsf(row[x]);
+                spec_cnt[i]++;
+            }
+        }
+        if (spec_acc.size() != nblk || frames_accumulated == 1)
+            spec_acc.assign(nblk, 0.0f);
+        float vmin = 1e30f, vmax = -1e30f;
+        for (size_t i = 0; i < nblk; i++) {
+            float mean = spec_cnt[i] ? spec_sum[i] / (float)spec_cnt[i] : 0.0f;
+            float v = log10f(mean + KNEE_LOG_EPS);
+            if (frames_accumulated == 1)
+                spec_acc[i] = v;
+            else
+                spec_acc[i] += (v - spec_acc[i]) * RESDET_ACCUM_ALPHA;
+            if (spec_acc[i] < vmin)
+                vmin = spec_acc[i];
+            if (spec_acc[i] > vmax)
+                vmax = spec_acc[i];
+        }
+        uint32_t histo[SPEC_HIST_BINS] = {};
+        float span = (vmax - vmin) > 1e-6f ? (vmax - vmin) : 1e-6f;
+        for (size_t i = 0; i < nblk; i++) {
+            int b = (int)((spec_acc[i] - vmin) / span * (SPEC_HIST_BINS - 1));
+            histo[b < 0 ? 0 : (b >= SPEC_HIST_BINS ? SPEC_HIST_BINS - 1 : b)]++;
+        }
+        auto percentile = [&](double p) {
+            uint32_t target = (uint32_t)(p * (double)nblk), acc = 0;
+            for (int b = 0; b < SPEC_HIST_BINS; b++) {
+                acc += histo[b];
+                if (acc >= target)
+                    return vmin + span * (float)b / (float)(SPEC_HIST_BINS - 1);
+            }
+            return vmax;
+        };
+        float lo = percentile(SPEC_P_LOW);
+        float hi = percentile(SPEC_P_HIGH);
+        if (hi - lo < SPEC_MIN_RANGE)
+            hi = lo + SPEC_MIN_RANGE;
+        float scale = 255.0f / (hi - lo);
+        std::lock_guard<std::mutex> lock(result_mtx);
+        for (size_t i = 0; i < nblk; i++) {
+            float q = (spec_acc[i] - lo) * scale;
+            spectrum[i] = (uint8_t)(q < 0.0f ? 0.0f : (q > 255.0f ? 255.0f : q));
+        }
+        spectrum_fresh = true;
     }
 
     if (frames_accumulated < RESDET_WARMUP_FRAMES)
@@ -495,4 +579,16 @@ bool resdet_get_result(struct resolution_detector *rd, struct resdet_result *out
     bool fresh = rd->result_fresh;
     rd->result_fresh = false;
     return fresh;
+}
+
+bool resdet_get_spectrum(struct resolution_detector *rd, uint8_t *out)
+{
+    if (!rd || !out)
+        return false;
+    std::lock_guard<std::mutex> lock(rd->result_mtx);
+    if (!rd->spectrum_fresh)
+        return false;
+    memcpy(out, rd->spectrum, sizeof(rd->spectrum));
+    rd->spectrum_fresh = false;
+    return true;
 }

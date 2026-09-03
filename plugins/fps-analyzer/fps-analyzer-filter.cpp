@@ -691,6 +691,8 @@ static void fps_analyzer_video_tick(void *data, float seconds)
             g_fps_shared.res_conf_w = r.conf_w;
             g_fps_shared.res_conf_h = r.conf_h;
         }
+        if (resdet_get_spectrum(filter->res_detector, g_fps_shared.res_spectrum))
+            g_fps_shared.res_spectrum_version++;
     } else {
         g_fps_shared.res_valid = false;
     }
