@@ -28,6 +28,14 @@
 #define SIGN_FLANK_MIN 0.47f
 // 0 = plain inversion count (resdet), 1 = energy-weighted (experimental)
 #define SIGN_WEIGHTED 0
+// Artefact filters (see resdet_params). Periodic dither lattices (id Tech
+// in motion) offer several mutually inconsistent aspect-consistent pairs at
+// once — harmonics of one base frequency — while an upscale offers one, so
+// more than SIGN_MAX_PAIRS pairs in an analysis means "periodic, no result".
+// Corpus: fixes Doom TDA 100% in motion, no regressions. The spike test is
+// off by default (thin margin on some true peaks).
+#define SIGN_PEAK_MIN 0.0f
+#define SIGN_MAX_PAIRS 2
 // EMA weight of each new frame's result vector
 #define RESDET_ACCUM_ALPHA 0.25f
 // Analyses required before reporting anything (lets the EMA settle)
@@ -307,7 +315,7 @@ struct sign_cand {
 };
 
 static void collect_sign_candidates(const float *votes, size_t length, size_t range,
-                                    float cand_min, float flank_min,
+                                    float cand_min, float flank_min, float peak_min,
                                     std::vector<sign_cand> &out)
 {
     out.clear();
@@ -322,6 +330,13 @@ static void collect_sign_candidates(const float *votes, size_t length, size_t ra
             break;
         if (votes[i] < cand_min)
             continue;
+        // Spike test (optional): a mirror boundary is pixel-exact, so the
+        // vote peaks at exactly one position; plateaus are artefacts.
+        if (peak_min > 0.0f && i > 0 && i + 1 < count) {
+            float nb = votes[i - 1] > votes[i + 1] ? votes[i - 1] : votes[i + 1];
+            if (votes[i] - nb < peak_min)
+                continue;
+        }
         // Offsets 2..3: the combs seen on real content have a ~5-bin period,
         // so these land in the anti-correlated troughs, while offset 4 would
         // already touch the next tooth and dilute the test.
@@ -464,7 +479,7 @@ struct resolution_detector {
     resdet_params params = {RESDET_ACCUM_ALPHA, RESDET_THRESHOLD, (float)KNEE_THRESHOLD,
                             RESDET_WARMUP_FRAMES, RESDET_MIN_VOTES,
                             SIGN_CAND_MIN, SIGN_JOINT_SUM_MIN, SIGN_FLANK_MIN,
-                            SIGN_WEIGHTED};
+                            SIGN_WEIGHTED, SIGN_PEAK_MIN, SIGN_MAX_PAIRS};
 
     // analysis-worker-only state
     dct_plan plan;
@@ -484,6 +499,7 @@ struct resolution_detector {
     // per-axis detection history for consensus
     int hist_w[RESDET_HISTORY] = {}, hist_h[RESDET_HISTORY] = {};
     double hconf_w[RESDET_HISTORY] = {}, hconf_h[RESDET_HISTORY] = {};
+    bool hist_periodic[RESDET_HISTORY] = {};
     int hist_pos = 0, hist_count = 0;
 
     void analyze(const uint8_t *luma, uint32_t w, uint32_t h);
@@ -601,16 +617,20 @@ void resolution_detector::analyze(const uint8_t *luma, uint32_t w, uint32_t h)
     // axis drowned in soft content).
     std::vector<sign_cand> cands_w, cands_h;
     collect_sign_candidates(xaccum.data(), w, RESDET_RANGE, params.sign_cand_min,
-                            params.sign_flank_min, cands_w);
+                            params.sign_flank_min, params.sign_peak_min, cands_w);
     collect_sign_candidates(yaccum.data(), h, RESDET_RANGE, params.sign_cand_min,
-                            params.sign_flank_min, cands_h);
+                            params.sign_flank_min, params.sign_peak_min, cands_h);
     int sign_w = 0, sign_h = 0, sign_mode = 0;
     double sconf_w = 0.0, sconf_h = 0.0;
+    bool periodic = false;
     {
         std::vector<double> hvote(h, 0.0);
         for (auto &c : cands_h)
             hvote[c.pos] = c.vote;
         double best = 0.0;
+        // Positions of every pair passing the joint bar, to count how many
+        // mutually inconsistent scales the frame offers (periodicity test).
+        std::vector<int> pair_pos;
         for (auto &c : cands_w) {
             int ky = (int)((double)c.pos * h / w + 0.5);
             for (int d = -1; d <= 1; d++) {
@@ -618,6 +638,14 @@ void resolution_detector::analyze(const uint8_t *luma, uint32_t w, uint32_t h)
                 if (k < 0 || k >= (int)h || hvote[k] <= 0.0)
                     continue;
                 double s = c.vote + hvote[k];
+                if (s >= params.sign_joint_min) {
+                    bool dup = false;
+                    for (int p : pair_pos)
+                        if (abs(p - c.pos) <= (int)(w * 0.02))
+                            dup = true;
+                    if (!dup)
+                        pair_pos.push_back(c.pos);
+                }
                 if (s > best) {
                     best = s;
                     sign_w = c.pos;
@@ -627,7 +655,15 @@ void resolution_detector::analyze(const uint8_t *luma, uint32_t w, uint32_t h)
                 }
             }
         }
-        if (best >= params.sign_joint_min) {
+        periodic = params.sign_max_pairs > 0 && (int)pair_pos.size() > params.sign_max_pairs;
+        if (periodic) {
+            // Several unrelated scales pass at once: a periodic structure
+            // (dither lattice, filter nulls), not an upscale. Report nothing.
+            sign_w = sign_h = 0;
+            sconf_w = sconf_h = 0.0;
+            cands_w.clear();
+            cands_h.clear();
+        } else if (best >= params.sign_joint_min) {
             sign_mode = 2;
         } else {
             sign_w = sign_h = 0;
@@ -694,6 +730,7 @@ void resolution_detector::analyze(const uint8_t *luma, uint32_t w, uint32_t h)
         dbg_frame.sign_conf_w = sconf_w;
         dbg_frame.sign_conf_h = sconf_h;
         dbg_frame.sign_mode = sign_mode;
+        dbg_frame.periodic = periodic ? 1 : 0;
         dbg_frame.knee_w = knee_w;
         dbg_frame.knee_h = knee_h;
         dbg_frame.knee_conf_w = kconf_w;
@@ -706,6 +743,7 @@ void resolution_detector::analyze(const uint8_t *luma, uint32_t w, uint32_t h)
     hconf_w[hist_pos] = cconf_w;
     hist_h[hist_pos] = cand_h;
     hconf_h[hist_pos] = cconf_h;
+    hist_periodic[hist_pos] = periodic;
     hist_pos = (hist_pos + 1) % RESDET_HISTORY;
     if (hist_count < RESDET_HISTORY)
         hist_count++;
@@ -735,6 +773,19 @@ void resolution_detector::analyze(const uint8_t *luma, uint32_t w, uint32_t h)
             r.conf_w = r.conf_h;
         }
     }
+
+    // Status: detected / no signature / periodic. "Periodic" needs the same
+    // agreement as a detection so a single odd frame doesn't flip the label.
+    int periodic_count = 0;
+    for (int i = 0; i < hist_count; i++)
+        if (hist_periodic[i])
+            periodic_count++;
+    if (r.src_w > 0 || r.src_h > 0)
+        r.status = RESDET_STATUS_DETECTED;
+    else if (periodic_count >= params.min_votes)
+        r.status = RESDET_STATUS_PERIODIC;
+    else
+        r.status = RESDET_STATUS_NONE;
 
     std::lock_guard<std::mutex> lock(result_mtx);
     result = r;

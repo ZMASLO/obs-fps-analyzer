@@ -845,10 +845,21 @@ static void fps_overlay_tick(void *data, float seconds)
                                 g_fps_shared.res_frame_w, g_fps_shared.res_frame_h,
                                 (int)(conf * 100.0));
             }
+            else if (g_fps_shared.res_status == RESDET_STATUS_PERIODIC)
+            {
+                // Dither lattice / adaptive-upscaler nulls offer several
+                // scales at once — any number would be a guess.
+                pos += snprintf(text + pos, sizeof(text) - pos,
+                                "Source res: unreliable\n"
+                                "(periodic pattern - dither or adaptive upscaler)");
+            }
             else
             {
+                // No mirror signature: a native image and a temporal/AI
+                // upscaler look identical to the detector.
                 pos += snprintf(text + pos, sizeof(text) - pos,
-                                "Source res: native %dx%d",
+                                "Source res: no upscale signature\n"
+                                "(native %dx%d, or TAA/FSR/DLSS - not measurable)",
                                 g_fps_shared.res_frame_w, g_fps_shared.res_frame_h);
             }
         }

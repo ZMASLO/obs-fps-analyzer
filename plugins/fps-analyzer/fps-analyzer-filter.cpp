@@ -422,7 +422,7 @@ static void debug_dump_frame(struct fps_analyzer_filter *filter, const uint8_t *
         filter->dump_csv = fopen(csv_path, "w");
         if (filter->dump_csv)
             fprintf(filter->dump_csv,
-                    "index,t_ms,width,height,video_format,res_valid,src_w,src_h,conf_w,conf_h\n");
+                    "index,t_ms,width,height,video_format,res_valid,src_w,src_h,conf_w,conf_h,status\n");
         filter->dump_start_ns = now;
         blog(LOG_INFO, "[FPS Analyzer] Frame dump started: %s", filter->dump_session_dir);
     }
@@ -436,11 +436,12 @@ static void debug_dump_frame(struct fps_analyzer_filter *filter, const uint8_t *
         fclose(f);
     }
     if (filter->dump_csv)
-        fprintf(filter->dump_csv, "%d,%.1f,%u,%u,%d,%d,%d,%d,%.3f,%.3f\n",
+        fprintf(filter->dump_csv, "%d,%.1f,%u,%u,%d,%d,%d,%d,%.3f,%.3f,%d\n",
                 filter->dump_index, (now - filter->dump_start_ns) / 1000000.0,
                 width, height, format, g_fps_shared.res_valid ? 1 : 0,
                 g_fps_shared.res_src_w, g_fps_shared.res_src_h,
-                g_fps_shared.res_conf_w, g_fps_shared.res_conf_h);
+                g_fps_shared.res_conf_w, g_fps_shared.res_conf_h,
+                g_fps_shared.res_status);
     filter->dump_index++;
     if (os_atomic_dec_long(&filter->dump_remaining) <= 0)
         debug_dump_finish(filter);
@@ -976,6 +977,7 @@ static void fps_analyzer_video_tick(void *data, float seconds)
             g_fps_shared.res_src_h = r.src_h;
             g_fps_shared.res_conf_w = r.conf_w;
             g_fps_shared.res_conf_h = r.conf_h;
+            g_fps_shared.res_status = r.status;
         }
     } else {
         g_fps_shared.res_valid = false;

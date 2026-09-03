@@ -14,11 +14,21 @@
 // Temporal/AI upscalers (DLSS/FSR2+/TSR) partially rebuild the spectrum;
 // results there are approximate at best.
 
+// resdet_result.status — what the detector can honestly say about the frame.
+// It cannot tell a native image from a temporal/AI upscaler (DLSS, FSR2+,
+// TAA upscaling): neither leaves a mirror signature. It can, however, tell
+// when the frame is dominated by a periodic structure (dither lattice,
+// nulls of an adaptive upscaler) that makes any reading unreliable.
+#define RESDET_STATUS_DETECTED 0
+#define RESDET_STATUS_NONE 1      // no upscale signature: native, or temporal/AI upscaler
+#define RESDET_STATUS_PERIODIC 2  // several unrelated scales at once — suppressed, unreliable
+
 struct resdet_result {
     bool valid;        // at least one analysis completed
     int frame_w, frame_h;
-    int src_w, src_h;  // detected source dimension, 0 = native (no upscale found)
+    int src_w, src_h;  // detected source dimension, 0 = no upscale found
     double conf_w, conf_h; // confidence 0..1 for the detected candidate
+    int status;        // RESDET_STATUS_*
 };
 
 // Spectrum thumbnail: log-magnitude of the 2D DCT (DC at top-left,
@@ -77,6 +87,10 @@ struct resdet_params {
                           // lower = comb-like peak from a filter null, rejected
     int sign_weighted;    // 0 = count sign inversions (resdet); 1 = weight each pair by
                           // min(|a|,|b|) so the layer carrying the image's energy dominates
+    float sign_peak_min;  // candidate must exceed both +-1 neighbours by this much (0 = off);
+                          // real boundaries are 1-px spikes, lattice/null artefacts are plateaus
+    int sign_max_pairs;   // if more than this many mutually inconsistent joint pairs pass in one
+                          // analysis, treat the frame as periodic and report nothing (default 2, 0 = off)
 };
 void resdet_debug_get_params(struct resolution_detector *rd, struct resdet_params *out);
 // Set before submitting frames (not thread-safe against a running analysis).
@@ -87,6 +101,7 @@ struct resdet_debug_frame {
     int sign_w, sign_h;           // sign-method pick this analysis (0 = none)
     double sign_conf_w, sign_conf_h;
     int sign_mode;                // 0 = none, 1 = independent per-axis picks, 2 = joint (same scale on both axes)
+    int periodic;                 // 1 = this analysis was suppressed as periodic (too many unrelated pairs)
     int knee_w, knee_h;           // magnitude-knee pick this analysis (0 = none)
     double knee_conf_w, knee_conf_h;
     int frames_accumulated;       // analyses since the last dimension change

@@ -115,8 +115,8 @@ struct case_spec {
 // Parameter overrides from the command line (NaN/-1 = keep default)
 struct param_overrides {
     float alpha = -1.0f, sign_thr = -1.0f, knee_thr = -1.0f;
-    float cand_min = -1.0f, joint_min = -1.0f, flank_min = -1.0f;
-    int warmup = -1, min_votes = -1, weighted = -1;
+    float cand_min = -1.0f, joint_min = -1.0f, flank_min = -1.0f, peak_min = -1.0f;
+    int warmup = -1, min_votes = -1, weighted = -1, max_pairs = -1;
     bool dump_votes = false;
 };
 
@@ -133,6 +133,8 @@ static void apply_params(resolution_detector *rd, const param_overrides &o)
     if (o.warmup >= 0) p.warmup_frames = o.warmup;
     if (o.min_votes >= 0) p.min_votes = o.min_votes;
     if (o.weighted >= 0) p.sign_weighted = o.weighted;
+    if (o.peak_min >= 0.0f) p.sign_peak_min = o.peak_min;
+    if (o.max_pairs >= 0) p.sign_max_pairs = o.max_pairs;
     resdet_debug_set_params(rd, &p);
 }
 
@@ -280,7 +282,7 @@ static bool run_case(const case_spec &cs, bool verbose, const fs::path &outdir, 
     if (native_expected) snprintf(expect, sizeof(expect), "native");
     else snprintf(expect, sizeof(expect), "%dx%d", cs.exp_w, cs.exp_h);
     if (r.src_w || r.src_h) snprintf(got, sizeof(got), "%dx%d (%.2f/%.2f)", r.src_w, r.src_h, r.conf_w, r.conf_h);
-    else snprintf(got, sizeof(got), "native");
+    else snprintf(got, sizeof(got), r.status == RESDET_STATUS_PERIODIC ? "none [periodic]" : "none");
     if (!trace.empty()) {
         auto &last = trace.back();
         if (last.plugin_w || last.plugin_h) snprintf(plug, sizeof(plug), "%dx%d", last.plugin_w, last.plugin_h);
@@ -293,9 +295,9 @@ static bool run_case(const case_spec &cs, bool verbose, const fs::path &outdir, 
         printf("       %s\n", cs.note.c_str());
 
     if ((!pass && !cs.xfail) || verbose) {
-        printf("       frame  sign W/H (J=joint,S=solo)  knee W/H            consensus     plugin\n");
+        printf("       frame  sign W/H (J=joint,S=solo,P=periodic)  knee W/H   consensus     plugin\n");
         for (auto &t : trace) {
-            char mode = t.d.sign_mode == 2 ? 'J' : (t.d.sign_mode == 1 ? 'S' : ' ');
+            char mode = t.d.periodic ? 'P' : (t.d.sign_mode == 2 ? 'J' : (t.d.sign_mode == 1 ? 'S' : ' '));
             printf("       %3d    %4d(%.2f) %4d(%.2f) %c     %4d(%.2f) %4d(%.2f)  %4dx%-4d     %dx%d\n",
                    t.idx, t.d.sign_w, t.d.sign_conf_w, t.d.sign_h, t.d.sign_conf_h, mode,
                    t.d.knee_w, t.d.knee_conf_w, t.d.knee_h, t.d.knee_conf_h,
@@ -372,6 +374,8 @@ int main(int argc, char **argv)
         else if (a == "--flank-min") po.flank_min = (float)atof(next("--flank-min"));
         else if (a == "--warmup") po.warmup = atoi(next("--warmup"));
         else if (a == "--sign-weighted") po.weighted = atoi(next("--sign-weighted"));
+        else if (a == "--peak-min") po.peak_min = (float)atof(next("--peak-min"));
+        else if (a == "--max-pairs") po.max_pairs = atoi(next("--max-pairs"));
         else if (a == "--min-votes") po.min_votes = atoi(next("--min-votes"));
         else if (a == "--dump-votes") po.dump_votes = true;
         else if (a[0] == '-') { fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
@@ -416,7 +420,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: resdet-cli <dumpdir> [--expect WxH|native] [--tol PX] [--verbose] [--out DIR]\n"
                         "       resdet-cli --manifest cases.txt [--verbose] [--out DIR]\n"
                         "tuning: --alpha A --sign-thr T --knee-thr T --cand-min T --joint-min S --flank-min T\n"
-                        "        --warmup N --min-votes N --sign-weighted 0|1 --dump-votes\n");
+                        "        --warmup N --min-votes N --sign-weighted 0|1 --peak-min T --max-pairs N\n"
+                        "        --dump-votes\n");
         return 2;
     }
 
