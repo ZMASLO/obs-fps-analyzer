@@ -430,6 +430,29 @@ struct Expect {
     double value = 0.0, tol = 0.0;
 };
 
+// The overlay graph arrays are too big to print per tick; hashing the entries
+// in use puts them into the golden, so a change in what the graph would draw
+// shows up as a failing case.
+static uint32_t graph_hash(const fps_core_output &o)
+{
+    uint32_t h = 2166136261u;
+    auto mix = [&h](const void *p, size_t n) {
+        const uint8_t *b = (const uint8_t *)p;
+        for (size_t i = 0; i < n; i++) {
+            h ^= b[i];
+            h *= 16777619u;
+        }
+    };
+    int n = o.graph_count;
+    if (n < 0) n = 0;
+    if (n > FPS_CORE_HISTORY) n = FPS_CORE_HISTORY;
+    mix(o.graph_frametimes, sizeof(double) * (size_t)n);
+    mix(o.graph_frametimes_raw, sizeof(double) * (size_t)n);
+    mix(o.graph_fps, sizeof(double) * (size_t)n);
+    mix(o.graph_tearing, sizeof(bool) * (size_t)n);
+    return h;
+}
+
 struct Publish {
     double t_s;
     int fps;
@@ -593,8 +616,9 @@ static ClipResult replay_clip(const fs::path &path, const fps_core_params &param
         if (fps_core_tick(core, now, &out)) {
             r.pubs.push_back({(double)rel / 1e9, out.fps, out.frametime_ms, out.tearing_detected, out.window,
                               out.graph_count});
-            snprintf(row, sizeof(row), "T,%llu,%d,%.17g,%d,%.17g,%d,%d\n", (unsigned long long)now, out.window,
-                     out.frametime_ms, out.fps, out.frametime_ms, out.tearing_detected ? 1 : 0, out.graph_count);
+            snprintf(row, sizeof(row), "T,%llu,%d,%.17g,%d,%.17g,%d,%d,%08x\n", (unsigned long long)now, out.window,
+                     out.frametime_ms, out.fps, out.frametime_ms, out.tearing_detected ? 1 : 0, out.graph_count,
+                     graph_hash(out));
             r.log += row;
         }
     }

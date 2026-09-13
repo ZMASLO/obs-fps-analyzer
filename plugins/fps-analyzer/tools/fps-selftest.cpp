@@ -143,6 +143,29 @@ struct Pub {
     bool tearing;
 };
 
+// The four graph arrays are what the overlay draws, and they are far too big to
+// print per tick. Hashing the entries actually in use puts them in the log, so
+// the goldens pin them and the cross-implementation comparison covers them.
+static uint32_t graph_hash(const fps_core_output &o)
+{
+    uint32_t h = 2166136261u;
+    auto mix = [&h](const void *p, size_t n) {
+        const uint8_t *b = (const uint8_t *)p;
+        for (size_t i = 0; i < n; i++) {
+            h ^= b[i];
+            h *= 16777619u;
+        }
+    };
+    int n = o.graph_count;
+    if (n < 0) n = 0;
+    if (n > FPS_CORE_HISTORY) n = FPS_CORE_HISTORY;
+    mix(o.graph_frametimes, sizeof(double) * (size_t)n);
+    mix(o.graph_frametimes_raw, sizeof(double) * (size_t)n);
+    mix(o.graph_fps, sizeof(double) * (size_t)n);
+    mix(o.graph_tearing, sizeof(bool) * (size_t)n);
+    return h;
+}
+
 struct Runner {
     std::vector<std::unique_ptr<Impl>> impls;
     std::vector<std::string> logs;
@@ -209,8 +232,8 @@ struct Runner {
     static void fmt_tick(std::string &log, uint64_t now, const fps_core_output &o)
     {
         char line[256];
-        snprintf(line, sizeof(line), "T,%llu,%d,%.17g,%d,%.17g,%d,%d\n", (unsigned long long)now, o.window,
-                 o.frametime_ms, o.fps, o.frametime_ms, o.tearing_detected ? 1 : 0, o.graph_count);
+        snprintf(line, sizeof(line), "T,%llu,%d,%.17g,%d,%.17g,%d,%d,%08x\n", (unsigned long long)now, o.window,
+                 o.frametime_ms, o.fps, o.frametime_ms, o.tearing_detected ? 1 : 0, o.graph_count, graph_hash(o));
         log += line;
     }
 
@@ -1002,6 +1025,174 @@ static void s19_zero_ft(Runner &r)
     r.end();
 }
 
+// Everything a replay has to reproduce from a recorded row.
+struct Rec {
+    bool unique, tear, sample;
+    double ft, ema, pf;
+    int pos, count;
+    bool published;
+    int fps, window, graph;
+    double ft_ms;
+    bool tear_pub;
+    uint32_t ghash;
+};
+
+static bool rec_equal(const Rec &a, const Rec &b)
+{
+    return a.unique == b.unique && a.tear == b.tear && a.sample == b.sample && a.ft == b.ft && a.ema == b.ema &&
+           a.pf == b.pf && a.pos == b.pos && a.count == b.count && a.published == b.published && a.fps == b.fps &&
+           a.window == b.window && a.graph == b.graph && a.ft_ms == b.ft_ms && a.tear_pub == b.tear_pub &&
+           a.ghash == b.ghash;
+}
+
+// The trace replay model, checked against the pixel path.
+//
+// fps-cli replays a recorded session by feeding back only the decisions the
+// live plugin made (new frame or duplicate, tearing or not, and when), never
+// the pixels. That only proves anything if replaying a decision leaves the
+// core in exactly the state the pixels would have. This scenario runs a stream
+// through the full pixel path, records what it decided, replays those
+// decisions into a fresh core and requires the two to agree on every frame and
+// every publish.
+static void s20_decision_replay(Runner &r)
+{
+    r.begin("s20_decision_replay", fps_core_params_defaults());
+    if (!r.active()) return;
+
+    struct Event {
+        uint64_t now;
+        bool is_frame;
+        bool unique, tear;
+    };
+
+    for (size_t k = 0; k < r.impls.size(); k++) {
+        Impl &impl = *r.impls[k];
+        fps_core_params p = fps_core_params_defaults();
+        p.analyze_method = FPS_ANALYZE_DIFF; // exercise tearing and full-frame diffs together
+        impl.reset(p);
+
+        Frame f = make_frame(FPS_PIXFMT_NV12, 64, 36);
+        std::vector<Event> events;
+        std::vector<Rec> live;
+        uint64_t now = T0;
+
+        for (int i = 0; i < 400; i++) {
+            // A mixed stream: steady motion, duplicates, a partial-frame update
+            // that trips tearing, a 100 ms stutter and a 3 s stale gap.
+            if (i == 200)
+                now += 100000000ULL; // stutter
+            else if (i == 300)
+                now += 3000000000ULL; // stale
+            else
+                now += 16666666ULL;
+
+            if (i % 7 == 3)
+                ; // duplicate: leave the frame untouched
+            else if (i % 6 == 0 || i % 6 == 1)
+                // Top line only, on two consecutive frames: one partial frame
+                // is not enough, the verdict needs two hits within five.
+                fill_rows(f, 0, 1, 2000 + i);
+            else
+                fill_all(f, 2000 + i);
+
+            impl.feed(f.view(), now);
+            fps_core_frame_debug d{};
+            impl.last_frame(d);
+            events.push_back({now, true, d.unique, d.tearing_flag});
+
+            Rec rec{};
+            rec.unique = d.unique;
+            rec.tear = d.tearing_flag;
+            rec.sample = d.sample_written;
+            rec.ft = d.ft_ms;
+            rec.ema = d.ema;
+            rec.pf = d.fps_pf;
+            rec.pos = d.pos;
+            rec.count = d.count;
+            live.push_back(rec);
+
+            fps_core_output o{};
+            if (impl.tick(now, o)) {
+                events.push_back({now, false, false, false});
+                Rec t{};
+                t.published = true;
+                t.fps = o.fps;
+                t.window = o.window;
+                t.graph = o.graph_count;
+                t.ft_ms = o.frametime_ms;
+                t.tear_pub = o.tearing_detected;
+                t.ghash = graph_hash(o);
+                live.push_back(t);
+            }
+        }
+
+        // Replay: same events, same times, decisions only.
+        impl.reset(p);
+        std::vector<Rec> replayed;
+        for (const Event &e : events) {
+            if (e.is_frame) {
+                impl.feed_decision(e.unique, e.tear, e.now);
+                fps_core_frame_debug d{};
+                impl.last_frame(d);
+                Rec rec{};
+                rec.unique = d.unique;
+                rec.tear = d.tearing_flag;
+                rec.sample = d.sample_written;
+                rec.ft = d.ft_ms;
+                rec.ema = d.ema;
+                rec.pf = d.fps_pf;
+                rec.pos = d.pos;
+                rec.count = d.count;
+                replayed.push_back(rec);
+            } else {
+                fps_core_output o{};
+                bool pub = impl.tick(e.now, o);
+                Rec t{};
+                t.published = pub;
+                t.fps = o.fps;
+                t.window = o.window;
+                t.graph = o.graph_count;
+                t.ft_ms = o.frametime_ms;
+                t.tear_pub = o.tearing_detected;
+                t.ghash = pub ? graph_hash(o) : 0;
+                replayed.push_back(t);
+            }
+        }
+
+        r.check(live.size() == replayed.size(), "%s: replay produced %zu records for %zu recorded",
+                impl.name(), replayed.size(), live.size());
+        size_t n = live.size() < replayed.size() ? live.size() : replayed.size();
+        size_t first_bad = n;
+        for (size_t i = 0; i < n; i++)
+            if (!rec_equal(live[i], replayed[i])) {
+                first_bad = i;
+                break;
+            }
+        r.check(first_bad == n, "%s: replaying the decisions reproduces the pixel run (first difference at record %zu)",
+                impl.name(), first_bad);
+
+        // The stream has to be interesting enough for the check to mean
+        // something: duplicates, tearing, a stutter and a stale reset.
+        int uniques = 0, tears = 0, pubs = 0, zero_pubs = 0;
+        for (const Rec &rec : live) {
+            if (rec.published) {
+                pubs++;
+                if (rec.fps == 0)
+                    zero_pubs++;
+            } else {
+                if (rec.unique) uniques++;
+                if (rec.tear) tears++;
+            }
+        }
+        r.check(uniques > 300 && uniques < 400, "%s: the stream mixes unique and duplicate frames (%d unique)",
+                impl.name(), uniques);
+        r.check(tears > 20, "%s: tearing fires during the run (%d frames)", impl.name(), tears);
+        r.check(zero_pubs > 0, "%s: the stale reset is exercised (%d zero publishes)", impl.name(), zero_pubs);
+        r.check(pubs > 50, "%s: enough publishes to compare (%d)", impl.name(), pubs);
+    }
+    r.end(false);
+}
+
 // --------------------------------------------------------------- main ----
 
 int main(int argc, char **argv)
@@ -1064,6 +1255,7 @@ int main(int argc, char **argv)
     s17_params_mid_run(r);
     s18_fuzz(r);
     s19_zero_ft(r);
+    s20_decision_replay(r);
 
     printf(r.fails ? "RESULT: %d FAILURES\n" : "RESULT: ALL OK\n", r.fails);
     return r.fails;
