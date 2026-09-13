@@ -14,7 +14,14 @@ param(
     # Renderuje powiekszone MP4 do fixtures/preview (gitignore), zeby dalo sie
     # obejrzec klipy w odtwarzaczu. Same y4m maja 32x18 w skali szarosci, wiec
     # w VLC to znaczek pocztowy. Podglad nie jest uzywany przez zadne testy.
-    [switch]$Preview
+    [switch]$Preview,
+
+    # Renderuje wersje 1080p do fixtures/local (gitignore) do testu E2E w OBS.
+    # Media Source w OBS jest zrodlem ASYNCHRONICZNYM, czyli ta sama sciezka
+    # kodu co karta przechwytujaca (filter_video, NV12). Pozwala wiec nagrac
+    # slad ze sciezki async bez karty, i to o ZNANEJ kadencji, wiec oprocz
+    # samoodtwarzalnosci mozna sprawdzic, czy odczyt jest poprawny.
+    [switch]$Local
 )
 
 $ErrorActionPreference = "Stop"
@@ -35,6 +42,29 @@ if ($Preview) {
         if ($LASTEXITCODE -ne 0) { throw "ffmpeg nie powiodl sie dla podgladu $($_.Name)" }
     }
     Write-Host "`nPodglad w $pv" -ForegroundColor Green
+    return
+}
+
+if ($Local) {
+    $lc = Join-Path $dir "local"
+    New-Item -ItemType Directory -Force $lc | Out-Null
+    Get-ChildItem $dir -Filter *.y4m | Sort-Object Name | ForEach-Object {
+        $out = Join-Path $lc ($_.BaseName + "_1080p.mkv")
+        Write-Host "=== 1080p $($_.BaseName)" -ForegroundColor Cyan
+        # neighbor: kazdy piksel zrodla staje sie jednolitym blokiem, wiec
+        # kadencja zostaje dokladnie ta sama. crf 0 = bezstratnie, zeby
+        # duplikaty byly bajtowo identyczne - inaczej analiza uznalaby je za
+        # nowe klatki. fps_mode passthrough zeby enkoder ich nie wyrzucil.
+        & ffmpeg -y -hide_banner -loglevel error -i $_.FullName `
+            -vf "scale=1920:1080:flags=neighbor" -fps_mode passthrough `
+            -c:v libx264 -crf 0 -preset ultrafast -pix_fmt yuv420p $out
+        if ($LASTEXITCODE -ne 0) { throw "ffmpeg nie powiodl sie dla $($_.Name)" }
+        $n = (& ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 $out)
+        Write-Host "    $n klatek, $([int]((Get-Item $out).Length/1MB)) MB"
+    }
+    Write-Host "`nKlipy 1080p w $lc" -ForegroundColor Green
+    Write-Host "W OBS: dodaj Media Source wskazujacy na plik, odznacz petle, dodaj filtr FPS Analyzer." -ForegroundColor Gray
+    Write-Host "Media Source jest zrodlem async, wiec slad bedzie mial path=async, jak z karty." -ForegroundColor Gray
     return
 }
 
