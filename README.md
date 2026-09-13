@@ -90,6 +90,21 @@ Both tools build with the plugin (CMake option `FPS_ANALYZER_BUILD_TOOLS`, on by
 - `resdet-cli --manifest cases.txt [--verbose]` — replays frame dumps through the detector and compares with the expected source resolution. Manifest line: `dir ; WxH|native ; tolerance_px ; note` (see `plugins/fps-analyzer/tools/cases.example.txt`). On failure it prints the per-frame sign/knee picks, the top candidates per axis and writes the spectrum with detected (green) vs expected (yellow) markers. Tuning flags (`--alpha`, `--sign-thr`, `--knee-thr`, `--cand-min`, `--joint-min`, `--flank-min`, `--warmup`, `--min-votes`) sweep detector parameters over the whole corpus; `--dump-votes` writes the full per-position vote/knee profiles as CSV.
 - Workflow: dump frames in OBS (Debug options) for each known-truth case → add lines to your manifest → run the CLI → tune → re-run. The dumps are what the detector sees byte-for-byte, so offline results match the live plugin.
 
+### Regression tests for the FPS analysis (`fps-selftest`):
+The FPS numbers the overlay shows come from unique-frame detection, frametime history, EMA smoothing and a per-tick averaging window. `fps-selftest` freezes that behaviour so a later change cannot alter the readings unnoticed.
+
+- It drives synthetic frame and tick streams through the analysis with an injected clock, so runs are bit-for-bit reproducible. Scenarios cover steady 24/30/45/60/120 fps, duplicated frames, a 100 ms stutter, a rate change, the stale-data reset, the sensitivity threshold, both analysis methods, tearing sequences, luma conversion per pixel format, the CSV writer and the graph ring buffer.
+- Each scenario is checked twice: hand-written assertions derived from the algorithm, plus a byte-exact comparison against a golden file in `plugins/fps-analyzer/tests/golden/`.
+- The goldens are produced by `plugins/fps-analyzer/tools/fps-ref-v050.cpp`, a verbatim copy of the v0.5.0 analysis code kept as a test oracle. That makes "the refactor changed nothing" a mechanical result rather than an assumption.
+
+Run everything before pushing:
+
+```powershell
+.un-tests.ps1
+```
+
+If you change the algorithm on purpose, regenerate the goldens with `.un-tests.ps1 -UpdateGoldens` and commit the golden diff together with the change, so the effect on the readings is visible in review.
+
 ### Tearing Detection:
 - **Independent feature**: Works with any analysis method
 - **Description**: Detects screen tearing by analyzing 3 lines (top, middle, bottom)
@@ -123,7 +138,7 @@ The output `fps-analyzer.dll` will be in `build/plugins/fps-analyzer/Release/`.
 
 ### CI/CD
 
-GitHub Actions automatically builds the plugin on every push to `main` and on pull requests. To create a release:
+GitHub Actions builds the plugin and runs `ctest` (the FPS and detector self-tests) on every push to `main` and on pull requests, so a pull request that changes the FPS readings without updating the goldens turns red. To create a release:
 
 1. Update the version in the root `CMakeLists.txt`
 2. Commit and tag: `git tag v0.3.0`

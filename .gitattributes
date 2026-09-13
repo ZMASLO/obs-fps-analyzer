@@ -1,0 +1,5 @@
+# The FPS goldens and traces are compared byte for byte by fps-selftest and
+# fps-cli, so they must never be line-ending converted on checkout.
+plugins/fps-analyzer/tests/golden/*.csv -text
+plugins/fps-analyzer/tests/traces/*.csv -text
+plugins/fps-analyzer/tests/fixtures/** -text

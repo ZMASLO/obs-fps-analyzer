@@ -46,3 +46,11 @@ debug_dump/
 *.bmp
 _resdet_out/
 _votes/
+
+# FPS core test tool outputs (goldens under tests/golden are committed)
+plugins/fps-analyzer/tests/_out/
+plugins/fps-analyzer/tests/fixtures/local/
+plugins/fps-analyzer/tests/raw/
+_fps_out/
+fpstrace_*.csv
+lines_*.bin
