@@ -101,6 +101,8 @@ The FPS numbers the overlay shows come from unique-frame detection, frametime hi
 
 - `tests/gen-fixtures.ps1 -Preview` renders enlarged MP4s of the clips so you can look at them; `-Local` renders lossless 1080p versions into `fixtures/local` for an end-to-end check inside OBS. A Media Source is an async source, the same code path a capture card takes, so playing one of those clips through the filter exercises the real plugin on material whose cadence is known in advance. Point the filter's CSV output at a file, play the clip, then run `tests/check-fps-csv.ps1 -Csv fps.csv -ExpectFps 60 -Skip 2 -IgnoreZeros`, which reports min, max, median and mode and fails if any row is out of range. Both folders are ignored by git.
 
+- `tests/mutation-sweep.ps1` measures how much the suite actually catches: it breaks the core one thing at a time (thresholds, clamps, comparison operators, the order of two statements) and reports whether the tests notice, separately for the goldens and assertions alone, for the comparison against the v0.5.0 oracle, and for the reference clips. A mutation that survives is a coverage gap. This is how it was found that the replay path had no test at all and that the overlay graph arrays were compared nowhere. Currently every catchable mutation is caught, each of them without the oracle, which is what makes removing the oracle safe later. One mutation is marked equivalent: the tick window's floor of 10 can never fire, because the window starts at the sample count and the feedback only ever replaces it with a value above 10.
+
 Run everything before pushing:
 
 ```powershell

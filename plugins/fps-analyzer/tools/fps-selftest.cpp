@@ -699,7 +699,17 @@ static void s12_tearing(Runner &r)
     fill_rows(g, 0, 1, 1501);
     r.feed(g, at(k++, 60));
     r.check(r.dbg.tearing_flag, "history survives the re-init (2 recent hits) -> true");
-    // too wide for the line buffers -> false, history untouched
+    // Exactly at the limit the probe lines still fit, so detection runs: two
+    // partial frames in a row must still be reported.
+    Frame edge = make_frame(FPS_PIXFMT_NV12, 4096, 3);
+    fill_all(edge, 1550);
+    r.feed(edge, at(k++, 60)); // width change -> re-init of the probe lines
+    fill_rows(edge, 0, 1, 1551);
+    r.feed(edge, at(k++, 60));
+    fill_rows(edge, 0, 1, 1552);
+    r.feed(edge, at(k++, 60));
+    r.check(r.dbg.tearing_flag, "width exactly 4096 is still analysed");
+    // One pixel wider than the probe buffers -> skipped, history untouched
     Frame wide = make_frame(FPS_PIXFMT_NV12, 4097, 3);
     fill_all(wide, 1600);
     r.feed(wide, at(k++, 60));
@@ -1025,6 +1035,89 @@ static void s19_zero_ft(Runner &r)
     r.end();
 }
 
+// The per-frame averaging window is sized from an instantaneous estimate that
+// is clamped to [10, 120]. With every frametime equal the window size cannot
+// change the average, so both scenarios below put one very different sample
+// exactly at the clamp boundary: whether it falls inside the window or just
+// outside it is then visible in the per-frame FPS.
+
+// Content slower than 10 fps: the estimate would be 8, the clamp raises it to
+// 10, so the tenth sample back is included in the average.
+static void s21_below_clamp(Runner &r)
+{
+    r.begin("s21_below_clamp", fps_core_params_defaults());
+    if (!r.active()) return;
+    Frame f = make_frame(FPS_PIXFMT_NV12, 64, 36);
+
+    std::vector<uint64_t> gaps;
+    for (int i = 0; i < 15; i++) gaps.push_back(20000000ULL);  // build up history
+    gaps.push_back(500000000ULL);                              // the outlier, 500 ms
+    for (int i = 0; i < 8; i++) gaps.push_back(20000000ULL);
+    gaps.push_back(125000000ULL);                              // 8 fps -> clamped to 10
+
+    uint64_t now = T0;
+    fill_all(f, 2100);
+    r.feed(f, now);
+    r.tick(now);
+    for (size_t i = 0; i < gaps.size(); i++) {
+        now += gaps[i];
+        fill_all(f, 2101 + (uint64_t)i);
+        r.feed(f, now);
+        r.tick(now);
+    }
+    // window 10: (125 + 8*20 + 500) / 10 = 78.5 ms -> 13
+    // window  9: (125 + 8*20) / 9       = 31.7 ms -> 32
+    r.check(r.dbg.ft_ms == 125.0, "the last frame took 125 ms (got %g)", r.dbg.ft_ms);
+    r.check(r.dbg.fps_pf == 13.0, "the clamp pulls the 500 ms sample into the window (got %g)", r.dbg.fps_pf);
+    // The tick window has a floor of 10 that can never fire: it is only tested
+    // when there are at least 10 samples, and then the window is at least 10
+    // already. Recorded here so the dead branch is not mistaken for coverage.
+    r.check(r.out.window == r.dbg.count, "the tick averages every sample it has (%d of %d)", r.out.window,
+            r.dbg.count);
+    r.end();
+}
+
+// Content faster than 120 fps: the estimate would be 200, the cap lowers it to
+// 120, so the sample just beyond that stays out of the average.
+static void s22_above_clamp(Runner &r)
+{
+    r.begin("s22_above_clamp", fps_core_params_defaults());
+    if (!r.active()) return;
+    Frame f = make_frame(FPS_PIXFMT_NV12, 64, 36);
+
+    std::vector<uint64_t> gaps;
+    for (int i = 0; i < 130; i++) gaps.push_back(5000000ULL);
+    gaps.push_back(500000000ULL);                              // the outlier
+    for (int i = 0; i < 120; i++) gaps.push_back(5000000ULL);  // exactly fills the window
+    const size_t boundary = gaps.size() - 1;
+    for (int i = 0; i < 200; i++) gaps.push_back(5000000ULL);  // let the outlier scroll out
+
+    uint64_t now = T0;
+    fill_all(f, 2200);
+    r.feed(f, now);
+    r.tick(now);
+    double pf_at_boundary = -1.0;
+    for (size_t i = 0; i < gaps.size(); i++) {
+        now += gaps[i];
+        fill_all(f, 2201 + (uint64_t)i);
+        r.feed(f, now);
+        if (i == boundary)
+            pf_at_boundary = r.dbg.fps_pf;
+        r.tick(now);
+    }
+    // At the boundary frame the outlier sits exactly one sample beyond the cap:
+    //   window 120: 120 * 5 ms / 120 = 5 ms          -> 200
+    //   window 121: (120 * 5 + 500) / 121 = 9.09 ms  -> 110
+    r.check(pf_at_boundary == 200.0, "the cap keeps the 500 ms sample out of the window (got %g)", pf_at_boundary);
+    r.check(r.dbg.ft_ms == 5.0, "the last frame took 5 ms (got %g)", r.dbg.ft_ms);
+    r.check(r.dbg.count == 451, "all 451 samples are kept (got %d)", r.dbg.count);
+    // Once the reading is steady at 200 the window feedback cannot shrink it
+    // (it only applies below the window size), so the cap itself is visible.
+    r.check(r.out.fps == 200, "the published reading settles at 200 (got %d)", r.out.fps);
+    r.check(r.out.window == 120, "the tick window caps at 120 despite 451 samples (got %d)", r.out.window);
+    r.end();
+}
+
 // Everything a replay has to reproduce from a recorded row.
 struct Rec {
     bool unique, tear, sample;
@@ -1256,6 +1349,8 @@ int main(int argc, char **argv)
     s18_fuzz(r);
     s19_zero_ft(r);
     s20_decision_replay(r);
+    s21_below_clamp(r);
+    s22_above_clamp(r);
 
     printf(r.fails ? "RESULT: %d FAILURES\n" : "RESULT: ALL OK\n", r.fails);
     return r.fails;
