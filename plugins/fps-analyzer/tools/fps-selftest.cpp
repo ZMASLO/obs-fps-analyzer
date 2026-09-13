@@ -721,15 +721,19 @@ static void s14_luma(Runner &r)
     r.begin("s14_luma", fps_core_params_defaults());
     if (!r.active()) return;
     Impl &impl = *r.impls[0];
-    std::string &log = r.logs[0];
+    // The helpers are pure, so run them on impls[0] and log the values into
+    // every implementation log: the golden pins the numbers, and the
+    // cross-implementation comparison still covers the feed rows below.
     auto logv = [&](const char *tag, const uint8_t *v, size_t n) {
-        log += tag;
+        std::string row = tag;
         for (size_t i = 0; i < n; i++) {
             char b[8];
             snprintf(b, sizeof(b), " %u", v[i]);
-            log += b;
+            row += b;
         }
-        log += "\n";
+        row += "\n";
+        for (auto &l : r.logs)
+            l += row;
     };
     // BGRA / RGBA: white, black, pure R, G, B
     {
