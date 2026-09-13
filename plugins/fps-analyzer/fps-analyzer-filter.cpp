@@ -109,6 +109,11 @@ struct fps_analyzer_filter {
     int trace_kind;               // 1 = async (capture card), 2 = sync (GPU)
     uint32_t trace_w, trace_h;
     int trace_fmt;
+    uint64_t trace_not_before_ns; // nothing is recorded until os_gettime_ns() passes this
+    int trace_rows;               // frame rows written in the current session
+    int trace_done_rows;          // and in the last finished one, for the status label
+    char trace_done_path[640];
+    long trace_toggle_req;        // hotkey -> video thread, via std::atomic_ref
 };
 
 // --- Utility functions ---
@@ -125,6 +130,14 @@ static inline void dump_remaining_store(struct fps_analyzer_filter *f, long v) {
 }
 static inline long dump_remaining_dec(struct fps_analyzer_filter *f) {
     return std::atomic_ref<long>(f->dump_remaining).fetch_sub(1) - 1;
+}
+
+// The trace hotkey fires on the UI thread; the video thread picks the request up.
+static inline void trace_toggle_post(struct fps_analyzer_filter *f) {
+    std::atomic_ref<long>(f->trace_toggle_req).store(1);
+}
+static inline bool trace_toggle_take(struct fps_analyzer_filter *f) {
+    return std::atomic_ref<long>(f->trace_toggle_req).exchange(0) != 0;
 }
 
 static void ensure_luma_buffer(struct fps_analyzer_filter *filter, size_t needed) {
@@ -378,16 +391,34 @@ static void debug_dump_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey
         debug_dump_request(filter, 0);
 }
 
+static obs_hotkey_id g_trace_hotkey = OBS_INVALID_HOTKEY_ID;
+
+static void debug_trace_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed) {
+    UNUSED_PARAMETER(data);
+    UNUSED_PARAMETER(id);
+    UNUSED_PARAMETER(hotkey);
+    struct fps_analyzer_filter *filter = g_dump_hotkey_target.load();
+    if (pressed && filter)
+        trace_toggle_post(filter);
+}
+
 void fps_analyzer_register_hotkeys(void) {
     g_dump_hotkey = obs_hotkey_register_frontend("fps_analyzer.debug_dump",
                                                  "FPS Analyzer: dump frames (debug)",
                                                  debug_dump_hotkey, NULL);
+    g_trace_hotkey = obs_hotkey_register_frontend("fps_analyzer.debug_fps_trace",
+                                                  "FPS Analyzer: start/stop FPS trace (debug)",
+                                                  debug_trace_hotkey, NULL);
 }
 
 void fps_analyzer_unregister_hotkeys(void) {
     if (g_dump_hotkey != OBS_INVALID_HOTKEY_ID) {
         obs_hotkey_unregister(g_dump_hotkey);
         g_dump_hotkey = OBS_INVALID_HOTKEY_ID;
+    }
+    if (g_trace_hotkey != OBS_INVALID_HOTKEY_ID) {
+        obs_hotkey_unregister(g_trace_hotkey);
+        g_trace_hotkey = OBS_INVALID_HOTKEY_ID;
     }
 }
 
@@ -422,6 +453,28 @@ static void debug_dump_status_text(struct fps_analyzer_filter *filter, char *buf
                  filter->dump_done_frames, filter->dump_session_dir);
     } else {
         snprintf(buf, size, "Dump status: idle");
+    }
+}
+
+// Text for the FPS trace status label
+static void debug_trace_status_text(struct fps_analyzer_filter *filter, char *buf, size_t size) {
+    uint64_t now = os_gettime_ns();
+    if (filter->trace_enabled) {
+        if (now < filter->trace_not_before_ns) {
+            uint64_t left = filter->trace_not_before_ns - now;
+            snprintf(buf, size, "Trace status: starting in %d s...",
+                     (int)((left + 999999999ULL) / 1000000000ULL));
+        } else if (filter->trace_file) {
+            snprintf(buf, size, "Trace status: recording - %d frames in %s",
+                     filter->trace_rows, filter->trace_path);
+        } else {
+            snprintf(buf, size, "Trace status: armed, waiting for a frame...");
+        }
+    } else if (filter->trace_done_rows > 0) {
+        snprintf(buf, size, "Trace status: complete - %d frames in %s",
+                 filter->trace_done_rows, filter->trace_done_path);
+    } else {
+        snprintf(buf, size, "Trace status: idle");
     }
 }
 
@@ -506,7 +559,23 @@ static void trace_close(struct fps_analyzer_filter *filter) {
         return;
     fclose(filter->trace_file);
     filter->trace_file = NULL;
-    blog(LOG_INFO, "[FPS Analyzer] FPS trace finished: %s", filter->trace_path);
+    filter->trace_done_rows = filter->trace_rows;
+    snprintf(filter->trace_done_path, sizeof(filter->trace_done_path), "%s", filter->trace_path);
+    filter->trace_rows = 0;
+    filter->dump_status_dirty = true;
+    blog(LOG_INFO, "[FPS Analyzer] FPS trace finished: %d frames in %s",
+         filter->trace_done_rows, filter->trace_path);
+}
+
+// Arms the recorder: the file opens on the first frame after `delay_sec`, so
+// there is time to alt-tab into the game before anything is measured.
+static void trace_arm(struct fps_analyzer_filter *filter, int delay_sec) {
+    if (delay_sec < 0) delay_sec = 0;
+    filter->trace_not_before_ns = os_gettime_ns() + (uint64_t)delay_sec * 1000000000ULL;
+    filter->trace_rows = 0;
+    filter->trace_done_rows = 0;
+    filter->trace_done_path[0] = '\0';
+    filter->dump_status_dirty = true;
 }
 
 static void trace_open(struct fps_analyzer_filter *filter) {
@@ -542,10 +611,13 @@ static void trace_note_frame(struct fps_analyzer_filter *filter, int path_kind,
                              uint32_t width, uint32_t height, int format) {
     if (!filter->trace_enabled)
         return;
+    if (os_gettime_ns() < filter->trace_not_before_ns)
+        return; // still counting down
     if (!filter->trace_file) {
         trace_open(filter);
         if (!filter->trace_file)
             return;
+        filter->dump_status_dirty = true;
     }
     if (filter->trace_header_pending || filter->trace_kind != path_kind ||
         filter->trace_w != width || filter->trace_h != height || filter->trace_fmt != format) {
@@ -581,6 +653,7 @@ static void trace_write_frame(struct fps_analyzer_filter *filter, uint64_t now, 
     else
         fputs(",,,", t);
     fprintf(t, "%d,%d\n", filter->frametime_pos, filter->frametime_count);
+    filter->trace_rows++;
 }
 
 static void trace_write_tick(struct fps_analyzer_filter *filter, uint64_t now, int window,
@@ -1054,11 +1127,32 @@ static void fps_analyzer_video_tick(void *data, float seconds)
     struct fps_analyzer_filter *filter = (struct fps_analyzer_filter *)data;
     uint64_t now = os_gettime_ns();
 
-    // Debug dump: keep the properties dialog's status label fresh — once per
-    // second while a session is pending/active, and once when it finishes.
-    // (OBS rebuilds the dialog on the update_properties signal.)
+    // FPS trace hotkey: starts without the countdown (the key is pressed from
+    // inside the game already) and stops immediately. The checkbox follows, so
+    // the properties dialog shows the real state.
+    if (trace_toggle_take(filter)) {
+        if (filter->trace_enabled) {
+            filter->trace_enabled = false;
+            trace_close(filter);
+        } else {
+            filter->trace_enabled = true;
+            trace_arm(filter, 0);
+        }
+        obs_data_t *settings = obs_source_get_settings(filter->context);
+        if (settings) {
+            obs_data_set_bool(settings, "debug_fps_trace", filter->trace_enabled);
+            obs_data_release(settings);
+        }
+        filter->dump_status_dirty = true;
+        blog(LOG_INFO, "[FPS Analyzer] FPS trace hotkey: %s",
+             filter->trace_enabled ? "started" : "stopped");
+    }
+
+    // Debug dump and FPS trace: keep the properties dialog's status labels
+    // fresh — once per second while a session is counting down or running, and
+    // once when it finishes. (OBS rebuilds the dialog on update_properties.)
     if (filter->debug_options) {
-        bool active = dump_remaining_load(filter) > 0;
+        bool active = dump_remaining_load(filter) > 0 || filter->trace_enabled;
         if (filter->dump_status_dirty ||
             (active && now - filter->dump_status_refresh_ns >= 1000000000ULL)) {
             filter->dump_status_dirty = false;
@@ -1247,6 +1341,10 @@ static void *fps_analyzer_create(obs_data_t *settings, obs_source_t *context)
     // Debug frame dump (session state starts idle); the global hotkey targets
     // the most recently created filter
     read_debug_settings(filter, settings);
+    // A trace checkbox left ticked in the scene collection arms the recorder
+    // with its countdown rather than recording from the first frame.
+    if (filter->trace_enabled)
+        trace_arm(filter, filter->dump_delay);
     filter->dump_remaining = 0;
     filter->dump_not_before_ns = 0;
     filter->dump_done_frames = 0;
@@ -1296,6 +1394,7 @@ static bool debug_options_modified(obs_properties_t *props, obs_property_t *p, o
     obs_property_set_visible(obs_properties_get(props, "debug_dump_now"), on);
     obs_property_set_visible(obs_properties_get(props, "debug_dump_status"), on);
     obs_property_set_visible(obs_properties_get(props, "debug_fps_trace"), on);
+    obs_property_set_visible(obs_properties_get(props, "debug_fps_trace_status"), on);
     return true;
 }
 
@@ -1397,11 +1496,12 @@ static obs_properties_t *fps_analyzer_properties(void *data)
     obs_property_t *dump_count = obs_properties_add_int(props, "debug_dump_count",
                                                         "Frames per dump", 1, 200, 1);
     obs_property_t *dump_delay = obs_properties_add_int_slider(props, "debug_dump_delay",
-                                                               "Start delay after button (s)", 0, 30, 1);
+                                                               "Start delay (s)", 0, 30, 1);
     obs_property_set_long_description(dump_delay,
-        "Countdown between clicking \"Dump frames now\" and the first written frame - "
-        "time to Alt+Tab back into the game and leave the pause menu. The hotkey "
-        "\"FPS Analyzer: dump frames (debug)\" (Settings -> Hotkeys, top section) starts immediately.");
+        "Countdown before recording actually starts - time to Alt+Tab back into the game "
+        "and leave the pause menu. Applies both to \"Dump frames now\" and to ticking "
+        "\"Record FPS trace\". The hotkeys (Settings -> Hotkeys, top section) skip the "
+        "countdown and start immediately.");
     obs_property_t *dump_btn = obs_properties_add_button(props, "debug_dump_now",
                                                          "Dump frames now", debug_dump_button);
     obs_property_set_long_description(dump_btn,
@@ -1418,7 +1518,14 @@ static obs_properties_t *fps_analyzer_properties(void *data)
         "While enabled, writes fpstrace_<label>_<timestamp>.csv into the frame dump folder: "
         "one row per analysed frame (timestamp, diff, unique/tearing decision, frametime, EMA) "
         "and one per published tick (window, FPS, frametime). Replayed by the offline test "
-        "tools to pin the FPS algorithm's behaviour. ~60 rows/s, a few KB per second.");
+        "tools to pin the FPS algorithm's behaviour. ~60 rows/s, a few KB per second. "
+        "Recording begins after \"Start delay\", or immediately on the hotkey "
+        "\"FPS Analyzer: start/stop FPS trace (debug)\", which also stops it.");
+    char trace_status[800] = "Trace status: idle";
+    if (data)
+        debug_trace_status_text((struct fps_analyzer_filter *)data, trace_status, sizeof(trace_status));
+    obs_property_t *trace_status_prop = obs_properties_add_text(props, "debug_fps_trace_status",
+                                                               trace_status, OBS_TEXT_INFO);
     bool dbg_on = data ? ((struct fps_analyzer_filter*)data)->debug_options : false;
     obs_property_set_visible(dump_dir, dbg_on);
     obs_property_set_visible(dump_label, dbg_on);
@@ -1427,6 +1534,7 @@ static obs_properties_t *fps_analyzer_properties(void *data)
     obs_property_set_visible(dump_btn, dbg_on);
     obs_property_set_visible(dump_status, dbg_on);
     obs_property_set_visible(trace_prop, dbg_on);
+    obs_property_set_visible(trace_status_prop, dbg_on);
 
     return props;
 }
@@ -1454,10 +1562,15 @@ static void fps_analyzer_update(void *data, obs_data_t *settings)
         filter->res_detector = resdet_create();
     if (filter->res_detector)
         resdet_set_fast_spectrum(filter->res_detector, filter->spectrum_fps > 0);
+    const bool trace_was_enabled = filter->trace_enabled;
     read_debug_settings(filter, settings);
-    // FPS trace: the file opens lazily on the next frame; parameter changes
-    // get a fresh header; disabling closes the file.
-    if (filter->trace_enabled)
+    // FPS trace: ticking the checkbox arms the recorder and starts the same
+    // countdown the frame dump uses, so there is time to alt-tab into the game
+    // before the first frame is measured. Unticking closes the file. A change
+    // while it is already running only writes a fresh header.
+    if (filter->trace_enabled && !trace_was_enabled)
+        trace_arm(filter, filter->dump_delay);
+    else if (filter->trace_enabled)
         filter->trace_header_pending = true;
     else
         trace_close(filter);
