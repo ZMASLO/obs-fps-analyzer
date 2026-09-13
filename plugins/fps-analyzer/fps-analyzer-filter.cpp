@@ -578,6 +578,47 @@ static void trace_arm(struct fps_analyzer_filter *filter, int delay_sec) {
     filter->dump_status_dirty = true;
 }
 
+// A trace is replayed into a freshly created analysis core, so the recording
+// has to begin from the state a freshly created filter has. Without this the
+// first rows carry a history built before the recording started (frametime_count
+// already at 960, a warm EMA, a published FPS feeding the averaging window) that
+// the replay cannot reconstruct, and the recorded ticks would never reproduce.
+// Resetting here also means every trace exercises the warm-up path.
+static void trace_reset_analysis(struct fps_analyzer_filter *filter) {
+    filter->last_unique_frame_time = 0;
+    filter->last_write_time = 0;
+    memset(filter->frametime_history, 0, sizeof(filter->frametime_history));
+    memset(filter->smoothed_frametime, 0, sizeof(filter->smoothed_frametime));
+    memset(filter->fps_per_frame, 0, sizeof(filter->fps_per_frame));
+    memset(filter->tearing_per_frame, 0, sizeof(filter->tearing_per_frame));
+    filter->frametime_pos = 0;
+    filter->frametime_count = 0;
+    filter->ema_frametime = 0.0;
+    filter->rolling_count = 0;
+    filter->rolling_start = 0;
+    memset(filter->tearing_history, 0, sizeof(filter->tearing_history));
+    filter->tearing_history_pos = 0;
+    filter->tearing_detected = 0;
+    // Drop the reference frame and the tearing probe lines, so the first
+    // recorded frame is "new, nothing to compare with" exactly as after create.
+    if (filter->prev_frame) {
+        bfree(filter->prev_frame);
+        filter->prev_frame = NULL;
+    }
+    filter->prev_frame_size = 0;
+    for (int i = 0; i < 3; ++i) {
+        if (filter->prev_lines[i]) {
+            bfree(filter->prev_lines[i]);
+            filter->prev_lines[i] = NULL;
+        }
+    }
+    filter->prev_lines_size = 0;
+    // The averaging window feeds back from the published FPS.
+    g_fps_shared.fps = 0;
+    g_fps_shared.frametime_ms = 0.0;
+    g_fps_shared.graph_count = 0;
+}
+
 static void trace_open(struct fps_analyzer_filter *filter) {
     char stamp[32];
     time_t t = time(NULL);
@@ -601,6 +642,7 @@ static void trace_open(struct fps_analyzer_filter *filter) {
     }
     setvbuf(filter->trace_file, NULL, _IOFBF, 65536);
     filter->trace_header_pending = true;
+    trace_reset_analysis(filter);
     blog(LOG_INFO, "[FPS Analyzer] FPS trace started: %s", filter->trace_path);
 }
 
@@ -627,7 +669,7 @@ static void trace_note_frame(struct fps_analyzer_filter *filter, int path_kind,
         filter->trace_fmt = format;
         filter->trace_header_pending = false;
         fprintf(filter->trace_file,
-                "# fpstrace v1 ; plugin=" FPS_TRACE_PLUGIN_VERSION " ; path=%s ; method=%d ; sens=%.17g ; "
+                "# fpstrace v2 ; plugin=" FPS_TRACE_PLUGIN_VERSION " ; path=%s ; method=%d ; sens=%.17g ; "
                 "tear=%d ; tsens=%.17g ; interval=%.17g ; w=%u ; h=%u ; fmt=%s\n",
                 path_kind == 2 ? "sync" : "async", (int)filter->analyze_method, filter->sensitivity,
                 filter->enable_tearing_detection ? 1 : 0, filter->tearing_sensitivity,
