@@ -21,6 +21,8 @@ struct fps_shared_data g_fps_shared = {0, 0.0, false, 0, 0, -1, {}, 0};
 extern struct obs_source_info fps_overlay_source_info;
 
 #define FPS_CSV_HISTORY_LIMIT 300
+// Version stamped into FPS trace headers (see trace_note_frame)
+#define FPS_TRACE_PLUGIN_VERSION "0.5.0"
 #define ROLLING_MAX 120 // max 2 sekundy przy 60 FPS
 #define FRAMETIME_HISTORY 960
 
@@ -97,6 +99,16 @@ struct fps_analyzer_filter {
     char dump_session_dir[640];
     FILE *dump_csv;
     uint64_t dump_start_ns;
+    // Debug: FPS trace recorder — one CSV row per analysed frame (the
+    // unique/tearing decision with its timestamp) and per published tick.
+    // Replayed offline by the test tools to pin the FPS algorithm's output.
+    bool trace_enabled;
+    FILE *trace_file;
+    char trace_path[640];
+    bool trace_header_pending;    // write a '#' header before the next row
+    int trace_kind;               // 1 = async (capture card), 2 = sync (GPU)
+    uint32_t trace_w, trace_h;
+    int trace_fmt;
 };
 
 // --- Utility functions ---
@@ -331,6 +343,7 @@ static void read_debug_settings(struct fps_analyzer_filter *filter, obs_data_t *
     }
     filter->dump_count = (int)obs_data_get_int(settings, "debug_dump_count");
     filter->dump_delay = (int)obs_data_get_int(settings, "debug_dump_delay");
+    filter->trace_enabled = obs_data_get_bool(settings, "debug_fps_trace");
 }
 
 // Starts a dump session after `delay_sec`. Called from the UI thread
@@ -461,25 +474,150 @@ static void debug_dump_frame(struct fps_analyzer_filter *filter, const uint8_t *
         debug_dump_finish(filter);
 }
 
+// --- Debug: FPS trace recorder ---
+// Format (fpstrace v1):
+//   # fpstrace v1 ; plugin=... ; path=async|sync ; method=.. ; sens=.. ; tear=.. ; tsens=.. ; interval=.. ; w=.. ; h=.. ; fmt=..
+//   F,now_ns,luma_size,diff,percent,unique,tear,ft_ms,ema,fps_pf,pos,count
+//   T,now_ns,window,avg_ft,fps,frametime_ms,tearing,graph_count
+// diff/percent are empty when no comparison happened (first frame / size
+// change); ft_ms/ema/fps_pf are empty when no frametime sample was written.
+// Doubles use %.17g so they round-trip exactly. Both row kinds are written
+// from the OBS video thread (async filters run inside the video tick).
+
+static const char *trace_format_name(int fmt) {
+    static char buf[16];
+    switch (fmt) {
+    case VIDEO_FORMAT_NV12: return "NV12";
+    case VIDEO_FORMAT_I420: return "I420";
+    case VIDEO_FORMAT_I444: return "I444";
+    case VIDEO_FORMAT_I422: return "I422";
+    case VIDEO_FORMAT_YUY2: return "YUY2";
+    case VIDEO_FORMAT_UYVY: return "UYVY";
+    case VIDEO_FORMAT_BGRA: return "BGRA";
+    case VIDEO_FORMAT_RGBA: return "RGBA";
+    default:
+        snprintf(buf, sizeof(buf), "%d", fmt);
+        return buf;
+    }
+}
+
+static void trace_close(struct fps_analyzer_filter *filter) {
+    if (!filter->trace_file)
+        return;
+    fclose(filter->trace_file);
+    filter->trace_file = NULL;
+    blog(LOG_INFO, "[FPS Analyzer] FPS trace finished: %s", filter->trace_path);
+}
+
+static void trace_open(struct fps_analyzer_filter *filter) {
+    char stamp[32];
+    time_t t = time(NULL);
+    struct tm *tmv = localtime(&t);
+    strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", tmv);
+    const char *base = filter->dump_dir;
+    char *fallback = NULL;
+    if (!base[0]) {
+        fallback = obs_module_get_config_path(obs_current_module(), "dumps");
+        base = fallback;
+    }
+    os_mkdirs(base);
+    snprintf(filter->trace_path, sizeof(filter->trace_path), "%s/fpstrace_%s%s%s.csv",
+             base, filter->dump_label, filter->dump_label[0] ? "_" : "", stamp);
+    if (fallback) bfree(fallback);
+    filter->trace_file = fopen(filter->trace_path, "w");
+    if (!filter->trace_file) {
+        blog(LOG_WARNING, "[FPS Analyzer] FPS trace: cannot open %s", filter->trace_path);
+        filter->trace_enabled = false; // re-enabling in the properties retries
+        return;
+    }
+    setvbuf(filter->trace_file, NULL, _IOFBF, 65536);
+    filter->trace_header_pending = true;
+    blog(LOG_INFO, "[FPS Analyzer] FPS trace started: %s", filter->trace_path);
+}
+
+// Called by both capture paths right before the FPS analysis of a frame:
+// opens the file lazily and (re)writes the header when the stream or the
+// analysis parameters changed.
+static void trace_note_frame(struct fps_analyzer_filter *filter, int path_kind,
+                             uint32_t width, uint32_t height, int format) {
+    if (!filter->trace_enabled)
+        return;
+    if (!filter->trace_file) {
+        trace_open(filter);
+        if (!filter->trace_file)
+            return;
+    }
+    if (filter->trace_header_pending || filter->trace_kind != path_kind ||
+        filter->trace_w != width || filter->trace_h != height || filter->trace_fmt != format) {
+        filter->trace_kind = path_kind;
+        filter->trace_w = width;
+        filter->trace_h = height;
+        filter->trace_fmt = format;
+        filter->trace_header_pending = false;
+        fprintf(filter->trace_file,
+                "# fpstrace v1 ; plugin=" FPS_TRACE_PLUGIN_VERSION " ; path=%s ; method=%d ; sens=%.17g ; "
+                "tear=%d ; tsens=%.17g ; interval=%.17g ; w=%u ; h=%u ; fmt=%s\n",
+                path_kind == 2 ? "sync" : "async", (int)filter->analyze_method, filter->sensitivity,
+                filter->enable_tearing_detection ? 1 : 0, filter->tearing_sensitivity,
+                filter->update_interval, width, height, trace_format_name(format));
+        fputs("# F,now_ns,luma_size,diff,percent,unique,tear,ft_ms,ema,fps_pf,pos,count\n"
+              "# T,now_ns,window,avg_ft,fps,frametime_ms,tearing,graph_count\n",
+              filter->trace_file);
+    }
+}
+
+static void trace_write_frame(struct fps_analyzer_filter *filter, uint64_t now, size_t luma_size,
+                              bool compared, size_t diff, double percent, bool unique,
+                              bool sample_written, double ft, double fps_pf) {
+    FILE *t = filter->trace_file;
+    fprintf(t, "F,%llu,%zu,", (unsigned long long)now, luma_size);
+    if (compared)
+        fprintf(t, "%zu,%.17g,", diff, percent);
+    else
+        fputs(",,", t);
+    fprintf(t, "%d,%d,", unique ? 1 : 0, filter->tearing_detected ? 1 : 0);
+    if (sample_written)
+        fprintf(t, "%.17g,%.17g,%.17g,", ft, filter->ema_frametime, fps_pf);
+    else
+        fputs(",,,", t);
+    fprintf(t, "%d,%d\n", filter->frametime_pos, filter->frametime_count);
+}
+
+static void trace_write_tick(struct fps_analyzer_filter *filter, uint64_t now, int window,
+                             double avg_ft, int fps, double frametime_ms, int graph_count) {
+    fprintf(filter->trace_file, "T,%llu,%d,%.17g,%d,%.17g,%d,%d\n",
+            (unsigned long long)now, window, avg_ft, fps, frametime_ms,
+            filter->tearing_detected ? 1 : 0, graph_count);
+}
+
 // --- Shared analysis logic ---
 
 // Wspólna logika analizy klatek — porównanie z poprzednią klatką, rolling window, frametime
 static void analyze_luma_frame(struct fps_analyzer_filter *filter,
                                const uint8_t *luma_ptr, size_t luma_size) {
     int is_unique = 0;
+    bool compared = false;
+    size_t diff = 0;
+    double percent = 0.0;
     if (!filter->prev_frame || filter->prev_frame_size != luma_size) {
         init_prev_frame_buffer(filter, luma_size, luma_ptr);
         is_unique = 1;
     } else {
-        size_t diff = count_diff_bytes(luma_ptr, filter->prev_frame, luma_size);
-        double percent = (luma_size > 0) ? (100.0 * diff / luma_size) : 0.0;
+        compared = true;
+        diff = count_diff_bytes(luma_ptr, filter->prev_frame, luma_size);
+        percent = (luma_size > 0) ? (100.0 * diff / luma_size) : 0.0;
         if (percent >= filter->sensitivity) {
             is_unique = 1;
         }
         memcpy(filter->prev_frame, luma_ptr, luma_size);
     }
+    // Analysis-time clock — the only timestamp that drives FPS. Taken here
+    // for every frame so the trace can record non-unique frames as well;
+    // for unique frames this is the same instant as before.
+    uint64_t now = os_gettime_ns();
+    bool sample_written = false;
+    double ft = 0.0, fps_pf = 0.0;
     if (is_unique) {
-        uint64_t now = os_gettime_ns();
         int idx = (filter->rolling_start + filter->rolling_count) % ROLLING_MAX;
         filter->rolling_times[idx] = now;
         if (filter->rolling_count < ROLLING_MAX) {
@@ -493,7 +631,7 @@ static void analyze_luma_frame(struct fps_analyzer_filter *filter,
             filter->rolling_count--;
         }
         if (filter->last_unique_frame_time != 0) {
-            double ft = (now - filter->last_unique_frame_time) / 1000000.0;
+            ft = (now - filter->last_unique_frame_time) / 1000000.0;
             filter->frametime_history[filter->frametime_pos] = ft;
             filter->tearing_per_frame[filter->frametime_pos] = filter->tearing_detected;
 
@@ -523,6 +661,8 @@ static void analyze_luma_frame(struct fps_analyzer_filter *filter,
             }
             double avg_ft = sum / window;
             filter->fps_per_frame[filter->frametime_pos] = (avg_ft > 0.0) ? round(1000.0 / avg_ft) : 0.0;
+            fps_pf = filter->fps_per_frame[filter->frametime_pos];
+            sample_written = true;
 
             filter->frametime_pos = (filter->frametime_pos + 1) % FRAMETIME_HISTORY;
             if (filter->frametime_count < FRAMETIME_HISTORY)
@@ -530,6 +670,9 @@ static void analyze_luma_frame(struct fps_analyzer_filter *filter,
         }
         filter->last_unique_frame_time = now;
     }
+    if (filter->trace_file)
+        trace_write_frame(filter, now, luma_size, compared, diff, percent, is_unique != 0,
+                          sample_written, ft, fps_pf);
 }
 
 // --- Tearing detection ---
@@ -721,6 +864,8 @@ static struct obs_source_frame *fps_analyzer_filter_video(void *data,
     }
     g_fps_shared.unsupported_format = -1;
 
+    trace_note_frame(filter, 1, width, height, (int)frame->format);
+
     // Wykrywanie tearingu (niezależne od metody analizy)
     filter->tearing_detected = detect_tearing_async(filter, frame);
 
@@ -830,6 +975,8 @@ static void fps_analyzer_video_render(void *data, gs_effect_t *effect)
     uint8_t *video_data;
     uint32_t video_linesize;
     if (gs_stagesurface_map(filter->stagesurface, &video_data, &video_linesize)) {
+        trace_note_frame(filter, 2, width, height, (int)VIDEO_FORMAT_BGRA);
+
         // Tearing detection from BGRA staging data
         filter->tearing_detected = detect_tearing_bgra(
             filter, video_data, video_linesize, width, height);
@@ -979,6 +1126,9 @@ static void fps_analyzer_video_tick(void *data, float seconds)
     }
     g_fps_shared.graph_count = count;
 
+    if (filter->trace_file)
+        trace_write_tick(filter, now, window, avg_frametime, fps_smooth, frametime_ms, count);
+
     // Upscale resolution detection — publish latest result
     g_fps_shared.res_detect_enabled = filter->enable_resolution_detection;
     if (filter->enable_resolution_detection && filter->res_detector) {
@@ -1025,6 +1175,7 @@ static void fps_analyzer_destroy(void *data)
         if (filter->luma_buffer) bfree(filter->luma_buffer);
         if (filter->crop_buffer) bfree(filter->crop_buffer);
         if (filter->dump_csv) fclose(filter->dump_csv);
+        trace_close(filter);
         struct fps_analyzer_filter *expected = filter;
         g_dump_hotkey_target.compare_exchange_strong(expected, nullptr);
         if (filter->res_detector) resdet_destroy(filter->res_detector);
@@ -1144,6 +1295,7 @@ static bool debug_options_modified(obs_properties_t *props, obs_property_t *p, o
     obs_property_set_visible(obs_properties_get(props, "debug_dump_delay"), on);
     obs_property_set_visible(obs_properties_get(props, "debug_dump_now"), on);
     obs_property_set_visible(obs_properties_get(props, "debug_dump_status"), on);
+    obs_property_set_visible(obs_properties_get(props, "debug_fps_trace"), on);
     return true;
 }
 
@@ -1260,6 +1412,13 @@ static obs_properties_t *fps_analyzer_properties(void *data)
     if (data)
         debug_dump_status_text((struct fps_analyzer_filter *)data, status, sizeof(status));
     obs_property_t *dump_status = obs_properties_add_text(props, "debug_dump_status", status, OBS_TEXT_INFO);
+    obs_property_t *trace_prop = obs_properties_add_bool(props, "debug_fps_trace",
+                                                         "Record FPS trace (per-frame CSV)");
+    obs_property_set_long_description(trace_prop,
+        "While enabled, writes fpstrace_<label>_<timestamp>.csv into the frame dump folder: "
+        "one row per analysed frame (timestamp, diff, unique/tearing decision, frametime, EMA) "
+        "and one per published tick (window, FPS, frametime). Replayed by the offline test "
+        "tools to pin the FPS algorithm's behaviour. ~60 rows/s, a few KB per second.");
     bool dbg_on = data ? ((struct fps_analyzer_filter*)data)->debug_options : false;
     obs_property_set_visible(dump_dir, dbg_on);
     obs_property_set_visible(dump_label, dbg_on);
@@ -1267,6 +1426,7 @@ static obs_properties_t *fps_analyzer_properties(void *data)
     obs_property_set_visible(dump_delay, dbg_on);
     obs_property_set_visible(dump_btn, dbg_on);
     obs_property_set_visible(dump_status, dbg_on);
+    obs_property_set_visible(trace_prop, dbg_on);
 
     return props;
 }
@@ -1295,6 +1455,12 @@ static void fps_analyzer_update(void *data, obs_data_t *settings)
     if (filter->res_detector)
         resdet_set_fast_spectrum(filter->res_detector, filter->spectrum_fps > 0);
     read_debug_settings(filter, settings);
+    // FPS trace: the file opens lazily on the next frame; parameter changes
+    // get a fresh header; disabling closes the file.
+    if (filter->trace_enabled)
+        filter->trace_header_pending = true;
+    else
+        trace_close(filter);
 }
 
 // --- File helpers ---
@@ -1361,6 +1527,7 @@ static void fps_analyzer_get_defaults(obs_data_t *settings)
     obs_data_set_default_string(settings, "debug_dump_label", "");
     obs_data_set_default_int(settings, "debug_dump_count", 16);
     obs_data_set_default_int(settings, "debug_dump_delay", 5);
+    obs_data_set_default_bool(settings, "debug_fps_trace", false);
 }
 
 // --- Source info ---
