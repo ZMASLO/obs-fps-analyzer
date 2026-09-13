@@ -58,4 +58,4 @@ trace:traces/static_menu.csv ; ; self ; static menu, no motion, covers the stale
 trace:traces/tearing.csv     ; ; self ; VSync off, camera motion, tearing detection active
 trace:traces/interval1s.csv  ; ; self ; as fps60 but with the update interval set to 1 s
 trace:traces/diff_mode.csv   ; ; self ; as fps60 but with the full frame diff analysis method
-trace:traces/gamecap60.csv   ; ; self ; game capture instead of the card: the sync render path, BGRA
+trace:traces/gamecap60.csv   ; ; self, fps@3-21=60+-1 ; game capture of a 60 fps game, 2560x1440 BGRA through the sync render path; 22 s, 1316 unique frames, 60.01 per second

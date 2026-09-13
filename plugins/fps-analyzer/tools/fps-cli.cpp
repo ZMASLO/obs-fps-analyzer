@@ -119,6 +119,14 @@ struct Mismatch {
     std::string expected, got;
 };
 
+struct Publish {
+    double t_s;
+    int fps;
+    double ft;
+    bool tearing;
+    int window, graph_count;
+};
+
 struct ReplayResult {
     bool ok = false;
     std::string error;
@@ -126,6 +134,7 @@ struct ReplayResult {
     double span_s = 0.0;
     int fps_min = 0, fps_max = 0;
     double fps_sum = 0.0;
+    std::vector<Publish> pubs;   // for the fps@/ft@/tear@ expectations
     TraceHeader header;
     std::vector<Mismatch> mismatches;
 };
@@ -287,6 +296,8 @@ static ReplayResult replay_trace(const fs::path &path, double tol, bool verbose)
             if (out.graph_count != want_graph)
                 bad("graph sample count", std::to_string(want_graph), std::to_string(out.graph_count));
 
+            r.pubs.push_back({first_ns ? (double)(now - first_ns) / 1e9 : 0.0, out.fps, out.frametime_ms,
+                              out.tearing_detected, out.window, out.graph_count});
             if (r.ticks == 1 || out.fps < r.fps_min)
                 r.fps_min = out.fps;
             if (out.fps > r.fps_max)
@@ -453,13 +464,6 @@ static uint32_t graph_hash(const fps_core_output &o)
     return h;
 }
 
-struct Publish {
-    double t_s;
-    int fps;
-    double ft;
-    bool tearing;
-    int window, graph_count;
-};
 
 // "fps@0.5-5=60+-0", "ft@1-2=16.67+-0.1", "tear@1-3=1"
 static bool parse_expect(const std::string &spec, Expect &e, std::string &err)
@@ -810,6 +814,25 @@ static int run_manifest(const fs::path &manifest, double tol, bool verbose, bool
             ReplayResult r = replay_trace(src, tol, verbose);
             print_result(src, r);
             ok = r.ok;
+            // Besides reproducing itself, a trace can carry expectations about
+            // what the plugin actually read, taken from the FPS counter that was
+            // on screen while it was recorded.
+            for (const std::string &raw : split(c.expect, ',')) {
+                std::string spec = trim(raw);
+                if (spec.empty() || spec == "self")
+                    continue;
+                Expect e;
+                std::string perr;
+                if (!parse_expect(spec, e, perr)) {
+                    printf("  [FAIL] %s\n", perr.c_str());
+                    ok = false;
+                    continue;
+                }
+                std::string detail;
+                bool good = check_expect(e, r.pubs, detail);
+                printf("  %s %s: %s\n", good ? "[ok]" : "[FAIL]", spec.c_str(), detail.c_str());
+                ok = ok && good;
+            }
         } else {
             ok = run_clip_case(src, c, base, tol, verbose, update_goldens, out_dir);
         }
