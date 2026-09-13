@@ -5,23 +5,53 @@
 #
 # Columns:  source ; params ; expectations ; note
 #
-#   source        trace:<file>   a recording made by the plugin's "Record FPS
-#                                trace" debug option (fpstrace v2 or newer),
-#                                relative to this file
-#   params        reserved; traces carry their own parameters in the header
-#   expectations  self           every recorded tick must be reproduced exactly
-#                                by replaying the recorded per-frame decisions
-#                                through the core
+#   source        <clip.y4m>     a reference clip of known cadence, made by
+#                                gen-fixtures.ps1, replayed through the core
+#                 trace:<file>   a recording made by the plugin's "Record FPS
+#                                trace" debug option (fpstrace v2 or newer)
+#                 paths are relative to this file
+#
+#   params        method=last_line|diff  sens=0.1  tear=1  tsens=1.0
+#                 interval=1/30  tick_hz=60        (empty = plugin defaults)
+#
+#   expectations  comma separated
+#                 fps@A-B=V+-T   every tick published in [A, B) seconds must
+#                                report V within T
+#                 ft@A-B=V+-T    the same for the frametime in milliseconds
+#                 tear@A-B=0|1   the same for the tearing flag
+#                 golden=<file>  the whole run must match tests/golden/<file>
+#                                byte for byte (--update-goldens rewrites it)
+#                 self           traces only: the recorded ticks must be
+#                                reproduced exactly
 #                 prefix "xfail:" marks a known limitation: reported, but not
 #                                counted as a regression
-#   note          what was recorded, and what the FPS counter in the game showed
+#
+#   note          what the material is, and for traces what the in-game FPS
+#                 counter showed
 #
 # A source that is not present is reported as [SKIP], so this file can list
 # recordings that live outside the repository without breaking the build.
 #
-# Traces record a cold start: opening the file resets the analysis state, so a
-# replay into a freshly created core reproduces the session from its first row.
+# The clips are replayed with the async model: OBS ticks at tick_hz and the
+# analysis sees whichever frame is current, so a clip slower than the tick rate
+# produces duplicate frames exactly as a slow source does in libobs. The FPS a
+# clip should read is therefore known from its cadence alone, independently of
+# what the analysis computes. Every clip starts cold, so the first second is
+# the warm-up ramp and the expectations begin after it.
 
+# --- Reference clips: steady cadence ---
+fixtures/gen_60.y4m      ; ; fps@1.1-5=60+-0, ft@1.1-5=16.667+-0.01, tear@0.1-5=0, golden=clip_gen_60.csv      ; 60 fps, every frame new
+fixtures/gen_120.y4m     ; tick_hz=120 ; fps@1.1-5=120+-0, golden=clip_gen_120.csv                             ; 120 fps, ticks at 120 Hz
+fixtures/gen_30in60.y4m  ; ; fps@1.1-5=30+-0, golden=clip_gen_30in60.csv                                       ; 30 fps content duplicated into a 60 fps stream
+fixtures/gen_24in60.y4m  ; ; fps@1.1-5=24+-0, golden=clip_gen_24in60.csv                                       ; 24 fps in 60, the 3:2 cadence
+
+# --- Reference clips: things that change over time ---
+fixtures/gen_stutter.y4m ; ; fps@1.1-2.12=60+-0, fps@2.2-3.01=54+-0, fps@3.2-5=60+-0, golden=clip_gen_stutter.csv ; 100 ms freeze at t=2 s
+fixtures/gen_static.y4m  ; ; fps@1.0-2.96=59+-0, fps@3.0-4=0+-0, golden=clip_gen_static.csv                    ; motion for 1 s then frozen; the reading drops to 0 two seconds later
+fixtures/gen_60to30.y4m  ; ; fps@1.1-3.01=60+-0, fps@4.1-6=30+-0, golden=clip_gen_60to30.csv                   ; the rate halves at t=3 s
+fixtures/gen_tear.y4m    ; ; tear@1-5=1, golden=clip_gen_tear.csv                                              ; the halves update on alternating frames, so the probe lines disagree
+
+# --- Recorded sessions from the live plugin (added as they are captured) ---
 trace:traces/fps60.csv       ; ; self ; capture card, game capped at 60 fps, default settings
 trace:traces/fps30.csv       ; ; self ; capture card, game capped at 30 fps
 trace:traces/static_menu.csv ; ; self ; static menu, no motion, covers the stale-data reset after 2 s
