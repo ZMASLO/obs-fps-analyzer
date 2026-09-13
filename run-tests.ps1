@@ -22,7 +22,7 @@ cmake -S $repo -B $build -G "Visual Studio 17 2022" -A x64 -DCMAKE_PREFIX_PATH="
 if ($LASTEXITCODE -ne 0) { Write-Host "Konfiguracja nie powiodla sie." -ForegroundColor Red; exit 1 }
 
 Write-Host "=== Budowanie narzedzi testowych (Release) ===" -ForegroundColor Cyan
-cmake --build $build --config Release --target fps-selftest resdet-selftest
+cmake --build $build --config Release --target fps-selftest fps-cli resdet-selftest
 if ($LASTEXITCODE -ne 0) { Write-Host "Build nie powiodl sie." -ForegroundColor Red; exit 1 }
 
 if ($UpdateGoldens) {

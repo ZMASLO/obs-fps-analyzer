@@ -1,0 +1,31 @@
+# fps-cli case manifest — real-material regression cases for the FPS analysis.
+#
+# Run:  fps-cli --manifest plugins/fps-analyzer/tests/cases.txt
+#       (ctest runs it as "fps-fixtures"; run-tests.ps1 runs ctest)
+#
+# Columns:  source ; params ; expectations ; note
+#
+#   source        trace:<file>   a recording made by the plugin's "Record FPS
+#                                trace" debug option (fpstrace v2 or newer),
+#                                relative to this file
+#   params        reserved; traces carry their own parameters in the header
+#   expectations  self           every recorded tick must be reproduced exactly
+#                                by replaying the recorded per-frame decisions
+#                                through the core
+#                 prefix "xfail:" marks a known limitation: reported, but not
+#                                counted as a regression
+#   note          what was recorded, and what the FPS counter in the game showed
+#
+# A source that is not present is reported as [SKIP], so this file can list
+# recordings that live outside the repository without breaking the build.
+#
+# Traces record a cold start: opening the file resets the analysis state, so a
+# replay into a freshly created core reproduces the session from its first row.
+
+trace:traces/fps60.csv       ; ; self ; capture card, game capped at 60 fps, default settings
+trace:traces/fps30.csv       ; ; self ; capture card, game capped at 30 fps
+trace:traces/static_menu.csv ; ; self ; static menu, no motion, covers the stale-data reset after 2 s
+trace:traces/tearing.csv     ; ; self ; VSync off, camera motion, tearing detection active
+trace:traces/interval1s.csv  ; ; self ; as fps60 but with the update interval set to 1 s
+trace:traces/diff_mode.csv   ; ; self ; as fps60 but with the full frame diff analysis method
+trace:traces/gamecap60.csv   ; ; self ; game capture instead of the card: the sync render path, BGRA

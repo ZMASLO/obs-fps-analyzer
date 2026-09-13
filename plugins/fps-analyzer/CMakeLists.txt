@@ -24,8 +24,9 @@ if(FPS_ANALYZER_BUILD_TOOLS)
     add_executable(resdet-selftest tools/resdet-selftest.cpp ${RESDET_CORE})
     add_executable(resdet-cli      tools/resdet-cli.cpp      ${RESDET_CORE})
     add_executable(fps-selftest    tools/fps-selftest.cpp    ${FPS_CORE} ${FPS_REF})
+    add_executable(fps-cli         tools/fps-cli.cpp         ${FPS_CORE})
     target_compile_definitions(fps-selftest PRIVATE FPS_SELFTEST_HAVE_CORE)
-    foreach(tool resdet-selftest resdet-cli fps-selftest)
+    foreach(tool resdet-selftest resdet-cli fps-selftest fps-cli)
         target_include_directories(${tool} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_compile_features(${tool} PRIVATE cxx_std_20)
         target_compile_definitions(${tool} PRIVATE _CRT_SECURE_NO_WARNINGS
@@ -43,4 +44,8 @@ if(FPS_ANALYZER_BUILD_TOOLS)
     add_test(NAME fps-selftest COMMAND fps-selftest)
     add_test(NAME resdet-selftest COMMAND resdet-selftest
              WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+    # Replays the recorded traces listed in tests/cases.txt. Recordings that are
+    # not present are reported as skipped, so this passes before any are added.
+    add_test(NAME fps-fixtures COMMAND fps-cli --manifest
+             ${CMAKE_CURRENT_SOURCE_DIR}/tests/cases.txt)
 endif()
