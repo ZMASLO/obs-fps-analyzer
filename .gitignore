@@ -54,3 +54,4 @@ plugins/fps-analyzer/tests/raw/
 _fps_out/
 fpstrace_*.csv
 lines_*.bin
+plugins/fps-analyzer/tests/fixtures/preview/

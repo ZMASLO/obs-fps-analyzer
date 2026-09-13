@@ -10,9 +10,33 @@
 # (fps-cli --manifest ... --update-goldens), ale oczekiwania fps@ nadal musza sie
 # zgadzac - one opisuja kadencje, nie konkretne piksele.
 
+param(
+    # Renderuje powiekszone MP4 do fixtures/preview (gitignore), zeby dalo sie
+    # obejrzec klipy w odtwarzaczu. Same y4m maja 32x18 w skali szarosci, wiec
+    # w VLC to znaczek pocztowy. Podglad nie jest uzywany przez zadne testy.
+    [switch]$Preview
+)
+
 $ErrorActionPreference = "Stop"
 $dir = Join-Path $PSScriptRoot "fixtures"
 New-Item -ItemType Directory -Force $dir | Out-Null
+
+if ($Preview) {
+    $pv = Join-Path $dir "preview"
+    New-Item -ItemType Directory -Force $pv | Out-Null
+    Get-ChildItem $dir -Filter *.y4m | Sort-Object Name | ForEach-Object {
+        $out = Join-Path $pv ($_.BaseName + ".mp4")
+        Write-Host "=== podglad $($_.BaseName)" -ForegroundColor Cyan
+        # neighbor zeby piksele zostaly ostre, fps_mode passthrough zeby
+        # duplikaty klatek przetrwaly - to wlasnie one niosa kadencje
+        & ffmpeg -y -hide_banner -loglevel error -i $_.FullName `
+            -vf "scale=640:-2:flags=neighbor" -fps_mode passthrough `
+            -c:v libx264 -crf 18 -preset veryfast -pix_fmt yuv420p $out
+        if ($LASTEXITCODE -ne 0) { throw "ffmpeg nie powiodl sie dla podgladu $($_.Name)" }
+    }
+    Write-Host "`nPodglad w $pv" -ForegroundColor Green
+    return
+}
 
 $sz = "32x18"
 $noise = "noise=alls=40:allf=t+u:all_seed=1234"
