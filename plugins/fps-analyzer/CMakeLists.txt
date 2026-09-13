@@ -27,6 +27,11 @@ if(FPS_ANALYZER_BUILD_TOOLS)
         target_compile_features(${tool} PRIVATE cxx_std_20)
         target_compile_definitions(${tool} PRIVATE _CRT_SECURE_NO_WARNINGS
             FPS_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests")
+        # The goldens are byte-exact, so pin the float model rather than relying
+        # on the compiler default staying put across toolchain versions.
+        if(MSVC)
+            target_compile_options(${tool} PRIVATE /fp:precise)
+        endif()
     endforeach()
 
     # `ctest -C Release` runs these; run-tests.ps1 and the CI workflow call it.
