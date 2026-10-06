@@ -69,12 +69,17 @@ struct fps_overlay_source
     obs_source_t *spec_label_w;
     obs_source_t *spec_label_h;
     int spec_label_w_val, spec_label_h_val;
+    // Source refresh rate line (own label: colored by verdict)
+    bool show_source_rate;
+    obs_source_t *label_srate;
+    char srate_text[256];
+    uint32_t srate_color;
 };
 
 static const char *fps_overlay_get_name(void *unused)
 {
     UNUSED_PARAMETER(unused);
-    return "FPS Analyzer 0.5";
+    return "FPS Analyzer 0.5.1";
 }
 
 static void update_text_source(struct fps_overlay_source *ctx, const char *text)
@@ -149,6 +154,101 @@ static void set_label_text(obs_source_t *label, const char *text)
     obs_data_set_string(settings, "text", text);
     obs_source_update(label, settings);
     obs_data_release(settings);
+}
+
+// --- Source refresh rate line ---
+
+// text_gdiplus colors are 0xBBGGRR
+#define SRATE_COLOR_OK 0x00FF00
+#define SRATE_COLOR_BAD 0x0000FF
+#define SRATE_COLOR_INFO 0xAAAAAA
+
+static bool srate_visible(struct fps_overlay_source *ctx)
+{
+    return ctx->show_source_rate && ctx->label_srate && ctx->srate_text[0] &&
+           g_fps_shared.active_filter_count == 1;
+}
+
+// Full settings (not just text): font size and background follow the overlay
+static void update_srate_label(struct fps_overlay_source *ctx)
+{
+    if (!ctx->label_srate)
+        return;
+    int size = ctx->font_size * 2 / 3;
+    if (size < 14)
+        size = 14;
+
+    obs_data_t *font_obj = obs_data_create();
+    obs_data_set_string(font_obj, "face", "Arial");
+    obs_data_set_int(font_obj, "size", size);
+    obs_data_set_int(font_obj, "flags", 1); // bold
+    obs_data_set_string(font_obj, "style", "Bold");
+
+    obs_data_t *settings = obs_data_create();
+    obs_data_set_string(settings, "text", ctx->srate_text[0] ? ctx->srate_text : " ");
+    obs_data_set_obj(settings, "font", font_obj);
+    obs_data_set_int(settings, "color1", ctx->srate_color);
+    obs_data_set_int(settings, "color2", ctx->srate_color);
+    obs_data_set_int(settings, "opacity", 100);
+    obs_data_set_bool(settings, "outline", true);
+    obs_data_set_int(settings, "outline_size", 2);
+    obs_data_set_int(settings, "outline_color", 0x000000);
+    obs_data_set_int(settings, "outline_opacity", 100);
+    obs_data_set_int(settings, "bk_color", 0x000000);
+    obs_data_set_int(settings, "bk_opacity", ctx->show_text_background ? 80 : 0);
+
+    obs_source_update(ctx->label_srate, settings);
+
+    obs_data_release(font_obj);
+    obs_data_release(settings);
+}
+
+static void format_beat(double beat_s, char *buf, size_t size)
+{
+    if (beat_s >= 10.0)
+        snprintf(buf, size, "every ~%.0f s", beat_s);
+    else if (beat_s >= 1.0)
+        snprintf(buf, size, "every ~%.1f s", beat_s);
+    else
+        snprintf(buf, size, "constantly");
+}
+
+static void build_srate_text(char *text, size_t size, uint32_t *color)
+{
+    char src[32], obs[32], rec[32], beat[32];
+    *color = SRATE_COLOR_INFO;
+    if (!g_fps_shared.srate_available)
+    {
+        snprintf(text, size, "Source rate: n/a (not a capture device)");
+        return;
+    }
+    srate_format_hz(g_fps_shared.srate_source_hz, src, sizeof(src));
+    srate_format_hz(g_fps_shared.srate_obs_hz, obs, sizeof(obs));
+    switch (g_fps_shared.srate_status)
+    {
+    case SRATE_STATUS_MATCHED:
+        *color = SRATE_COLOR_OK;
+        snprintf(text, size, "Source: %s Hz | OBS: %s FPS - OK", src, obs);
+        break;
+    case SRATE_STATUS_MISMATCH:
+        *color = SRATE_COLOR_BAD;
+        srate_format_hz(g_fps_shared.srate_recommended_hz, rec, sizeof(rec));
+        format_beat(g_fps_shared.srate_beat_s, beat, sizeof(beat));
+        snprintf(text, size,
+                 "Source: %s Hz | OBS: %s FPS - duplicate %s\n"
+                 "Set OBS FPS to %s (Settings > Video)",
+                 src, obs, beat, rec);
+        break;
+    case SRATE_STATUS_UNSTABLE:
+        snprintf(text, size, "Source rate: variable (no fixed refresh rate)");
+        break;
+    default:
+        if (g_fps_shared.srate_source_hz > 0.0)
+            snprintf(text, size, "Source rate: measuring... (~%s Hz)", src);
+        else
+            snprintf(text, size, "Source rate: measuring...");
+        break;
+    }
 }
 
 // --- Spectrum panel ---
@@ -585,6 +685,7 @@ static void *fps_overlay_create(obs_data_t *settings, obs_source_t *source)
     ctx->frametime_scale = obs_data_get_double(settings, "frametime_scale");
     ctx->fps_scale = obs_data_get_double(settings, "fps_scale");
     ctx->show_resolution_spectrum = obs_data_get_bool(settings, "show_resolution_spectrum");
+    ctx->show_source_rate = obs_data_get_bool(settings, "show_source_rate");
 
     ctx->last_text[0] = '\0';
     ctx->spec_tex = NULL;
@@ -608,6 +709,10 @@ static void *fps_overlay_create(obs_data_t *settings, obs_source_t *source)
     ctx->label_fps = create_label_source("FRAMERATE", "fps_label_fps", 18, true);
     ctx->spec_label_w = create_label_source_color("", "fps_spec_label_w", 14, true, 0x00FF00);
     ctx->spec_label_h = create_label_source_color("", "fps_spec_label_h", 14, true, 0x00FF00);
+    ctx->srate_text[0] = '\0';
+    ctx->srate_color = SRATE_COLOR_INFO;
+    ctx->label_srate = create_label_source_color(" ", "fps_srate_label", 20, true, SRATE_COLOR_INFO);
+    update_srate_label(ctx);
     rebuild_grid_labels(ctx);
 
     return ctx;
@@ -628,6 +733,8 @@ static void fps_overlay_destroy(void *data)
             obs_source_release(ctx->spec_label_w);
         if (ctx->spec_label_h)
             obs_source_release(ctx->spec_label_h);
+        if (ctx->label_srate)
+            obs_source_release(ctx->label_srate);
         if (ctx->spec_bgra)
             bfree(ctx->spec_bgra);
         if (ctx->spec_tex)
@@ -684,6 +791,12 @@ static obs_properties_t *fps_overlay_properties(void *data)
         "Shows the 2D DCT spectrum of the frame (low frequencies top-left) with "
         "markers at the detected source resolution. Requires \"Detect upscale "
         "source resolution\" to be enabled in the FPS Analyzer filter.");
+    obs_property_t *srate_prop = obs_properties_add_bool(props, "show_source_rate", "Show Source refresh rate");
+    obs_property_set_long_description(srate_prop,
+        "Measures the real refresh rate of a capture card / camera signal and "
+        "compares it with the OBS FPS (Settings > Video). A mismatch, e.g. a "
+        "59.94 Hz console captured at 60 FPS, makes OBS repeat a frame every "
+        "~17 s. Not available for Game/Display/Window Capture.");
     obs_properties_add_bool(props, "show_text_background", "Show text background");
 
     obs_property_t *ft_toggle = obs_properties_add_bool(props, "show_frametime_graph", "Show frametime graph");
@@ -739,6 +852,7 @@ static void fps_overlay_get_defaults(obs_data_t *settings)
     obs_data_set_default_bool(settings, "show_tearing_text", true);
     obs_data_set_default_bool(settings, "show_resolution_text", true);
     obs_data_set_default_bool(settings, "show_resolution_spectrum", true);
+    obs_data_set_default_bool(settings, "show_source_rate", true);
     obs_data_set_default_bool(settings, "show_text_background", true);
     obs_data_set_default_bool(settings, "show_frametime_graph", true);
     obs_data_set_default_int(settings, "frametime_style", GRAPH_STYLE_COMPACT);
@@ -766,8 +880,10 @@ static void fps_overlay_update(void *data, obs_data_t *settings)
     ctx->frametime_scale = obs_data_get_double(settings, "frametime_scale");
     ctx->fps_scale = obs_data_get_double(settings, "fps_scale");
     ctx->show_resolution_spectrum = obs_data_get_bool(settings, "show_resolution_spectrum");
+    ctx->show_source_rate = obs_data_get_bool(settings, "show_source_rate");
 
     rebuild_grid_labels(ctx);
+    update_srate_label(ctx);
 
     // Force re-render with new settings
     update_text_source(ctx, ctx->last_text[0] ? ctx->last_text : "FPS: --");
@@ -784,7 +900,7 @@ static void fps_overlay_tick(void *data, float seconds)
     {
         snprintf(text, sizeof(text),
                  "No FPS Analyzer filter active.\n"
-                 "Add the \"FPS Analyzer 0.5\" filter\n"
+                 "Add the \"FPS Analyzer 0.5.1\" filter\n"
                  "to a video source to start.");
     }
     else if (g_fps_shared.active_filter_count > 1)
@@ -888,6 +1004,21 @@ static void fps_overlay_tick(void *data, float seconds)
         }
     }
 
+    // Source refresh rate line — relabel/recolor only on change
+    if (ctx->show_source_rate)
+    {
+        char srate_text[sizeof(ctx->srate_text)];
+        uint32_t color;
+        build_srate_text(srate_text, sizeof(srate_text), &color);
+        if (strcmp(srate_text, ctx->srate_text) != 0 || color != ctx->srate_color)
+        {
+            strncpy(ctx->srate_text, srate_text, sizeof(ctx->srate_text));
+            ctx->srate_text[sizeof(ctx->srate_text) - 1] = '\0';
+            ctx->srate_color = color;
+            update_srate_label(ctx);
+        }
+    }
+
     // Only update the text source if the text actually changed
     if (strcmp(text, ctx->last_text) != 0)
     {
@@ -916,6 +1047,18 @@ static void fps_overlay_render(void *data, gs_effect_t *effect)
         obs_source_video_render(ctx->text_source);
         gs_matrix_pop();
         y_offset = obs_source_get_height(ctx->text_source) + GRAPH_MARGIN * 2;
+    }
+
+    // 1b. Source refresh rate line, right under the text
+    if (srate_visible(ctx))
+    {
+        if (y_offset == 0)
+            y_offset = GRAPH_MARGIN;
+        gs_matrix_push();
+        gs_matrix_translate3f(0.0f, (float)y_offset, 0.0f);
+        obs_source_video_render(ctx->label_srate);
+        gs_matrix_pop();
+        y_offset += obs_source_get_height(ctx->label_srate) + GRAPH_MARGIN;
     }
 
     if (!any_graph && !show_spec)
@@ -1009,6 +1152,12 @@ static uint32_t fps_overlay_get_width(void *data)
     uint32_t max_w = 0;
     if (any_text && ctx->text_source)
         max_w = obs_source_get_width(ctx->text_source) + GRAPH_MARGIN * 2;
+    if (srate_visible(ctx))
+    {
+        uint32_t lw = obs_source_get_width(ctx->label_srate) + GRAPH_MARGIN * 2;
+        if (lw > max_w)
+            max_w = lw;
+    }
     if (spectrum_visible(ctx))
     {
         int sw, sh;
@@ -1040,6 +1189,12 @@ static uint32_t fps_overlay_get_height(void *data)
     uint32_t text_h = 0;
     if (any_text && ctx->text_source)
         text_h = obs_source_get_height(ctx->text_source) + GRAPH_MARGIN * 2;
+    if (srate_visible(ctx))
+    {
+        if (text_h == 0)
+            text_h = GRAPH_MARGIN;
+        text_h += obs_source_get_height(ctx->label_srate) + GRAPH_MARGIN;
+    }
     if (spectrum_visible(ctx))
     {
         int sw, sh;
@@ -1087,7 +1242,7 @@ bool obs_module_load(void)
     obs_register_source(&fps_analyzer_filter_info);
     obs_register_source(&fps_overlay_source_info);
     fps_analyzer_register_hotkeys();
-    blog(LOG_INFO, "FPS Analyzer 0.5 loaded");
+    blog(LOG_INFO, "FPS Analyzer 0.5.1 loaded");
     return true;
 }
 
