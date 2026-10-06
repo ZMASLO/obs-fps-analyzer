@@ -89,6 +89,19 @@ Both tools build with the plugin (CMake option `FPS_ANALYZER_BUILD_TOOLS`, on by
 - `resdet-cli --manifest cases.txt [--verbose]` — replays frame dumps through the detector and compares with the expected source resolution. Manifest line: `dir ; WxH|native ; tolerance_px ; note` (see `plugins/fps-analyzer/tools/cases.example.txt`). On failure it prints the per-frame sign/knee picks, the top candidates per axis and writes the spectrum with detected (green) vs expected (yellow) markers. Tuning flags (`--alpha`, `--sign-thr`, `--knee-thr`, `--cand-min`, `--joint-min`, `--flank-min`, `--warmup`, `--min-votes`) sweep detector parameters over the whole corpus; `--dump-votes` writes the full per-position vote/knee profiles as CSV.
 - Workflow: dump frames in OBS (Debug options) for each known-truth case → add lines to your manifest → run the CLI → tune → re-run. The dumps are what the detector sees byte-for-byte, so offline results match the live plugin.
 
+### Source Refresh Rate Check:
+- **Independent feature**: Works with any analysis method, capture cards and cameras only (Video Capture Device and other async sources)
+- **Description**: Measures the real refresh rate of the incoming signal from the timestamps the capture card driver puts on every frame, and compares it with the OBS FPS (Settings → Video)
+- **Why it matters**: A capture card is locked to the HDMI signal. **"Match output FPS"** in Video Capture Device only picks the card's advertised format; it does not change the rate the card delivers. A PS5 sends **59.94 Hz** (Elgato Studio shows it as `2160p59`), so with OBS at 60 FPS the two clocks beat and OBS repeats a frame every `1 / |f_source − f_OBS|` seconds (~17 s). The FPS graph then shows a dip at that interval even though the game runs at a locked 60
+- **Overlay**: "Show Source refresh rate" (default: on) adds a line under the FPS text:
+  - green `Source: 59.94 Hz | OBS: 59.94 FPS - OK`
+  - red `Source: 59.94 Hz | OBS: 60 FPS - duplicate every ~17 s` + the OBS FPS to set
+  - gray while measuring (~5 s), for variable-rate sources, or `n/a` for Game/Display/Window Capture (no frame timestamps)
+- **Rule of thumb**: consoles → OBS **59.94** (119.88 in 120 Hz modes), PC → OBS **60**
+- **Limitation**: OBS only passes the frames it picks for its own clock, so a source running at 2× the OBS FPS or more is measured at its effective rate (119.88 Hz at OBS 60 reads as 59.94), which is also the rate that beats against OBS
+- **Log**: each verdict change writes one line, e.g. `[FPS Analyzer] Source 59.944 Hz vs OBS 60.000 FPS: mismatch, duplicate/skip every 18.0 s`
+- **Offline test**: `srate-selftest` (built with the tools) simulates the OBS frame pick for 59.94/60/119.88/29.97 sources, signal loss and variable rate
+
 ### Tearing Detection:
 - **Independent feature**: Works with any analysis method
 - **Description**: Detects screen tearing by analyzing 3 lines (top, middle, bottom)
@@ -142,6 +155,7 @@ GitHub Actions automatically builds the plugin on every push to `main` and on pu
 - Try "Full frame diff" method
 
 ### Unstable FPS readings:
+- **Dips at a regular interval (e.g. every ~17 s) with a capture card**: the source refresh rate does not match the OBS FPS. Check the "Source refresh rate" line on the overlay and set OBS → Settings → Video → FPS to the value it suggests (59.94 for consoles)
 - Use Last line diff method for stable sources
 - Check if V-Sync is enabled
 - Increase update interval
