@@ -69,11 +69,13 @@ struct fps_overlay_source
     obs_source_t *spec_label_w;
     obs_source_t *spec_label_h;
     int spec_label_w_val, spec_label_h_val;
-    // Source refresh rate line (own label: colored by verdict)
+    // Source refresh rate line (own label: font size follows the overlay)
     bool show_source_rate;
+    bool autohide_source_rate;
     obs_source_t *label_srate;
     char srate_text[256];
-    uint32_t srate_color;
+    uint64_t srate_ok_since_ns; // when the verdict became OK, 0 = not OK
+    bool srate_autohidden;      // OK for long enough, line hidden
 };
 
 static const char *fps_overlay_get_name(void *unused)
@@ -158,14 +160,11 @@ static void set_label_text(obs_source_t *label, const char *text)
 
 // --- Source refresh rate line ---
 
-// text_gdiplus colors are 0xBBGGRR
-#define SRATE_COLOR_OK 0x00FF00
-#define SRATE_COLOR_BAD 0x0000FF
-#define SRATE_COLOR_INFO 0xAAAAAA
+#define SRATE_AUTOHIDE_NS 5000000000ULL // OK shown this long before hiding
 
 static bool srate_visible(struct fps_overlay_source *ctx)
 {
-    return ctx->show_source_rate && ctx->label_srate && ctx->srate_text[0] &&
+    return ctx->show_source_rate && !ctx->srate_autohidden && ctx->label_srate && ctx->srate_text[0] &&
            g_fps_shared.active_filter_count == 1;
 }
 
@@ -187,8 +186,6 @@ static void update_srate_label(struct fps_overlay_source *ctx)
     obs_data_t *settings = obs_data_create();
     obs_data_set_string(settings, "text", ctx->srate_text[0] ? ctx->srate_text : " ");
     obs_data_set_obj(settings, "font", font_obj);
-    obs_data_set_int(settings, "color1", ctx->srate_color);
-    obs_data_set_int(settings, "color2", ctx->srate_color);
     obs_data_set_int(settings, "opacity", 100);
     obs_data_set_bool(settings, "outline", true);
     obs_data_set_int(settings, "outline_size", 2);
@@ -213,10 +210,9 @@ static void format_beat(double beat_s, char *buf, size_t size)
         snprintf(buf, size, "constantly");
 }
 
-static void build_srate_text(char *text, size_t size, uint32_t *color)
+static void build_srate_text(char *text, size_t size)
 {
     char src[32], obs[32], rec[32], beat[32];
-    *color = SRATE_COLOR_INFO;
     if (!g_fps_shared.srate_available)
     {
         snprintf(text, size, "Source rate: n/a (not a capture device)");
@@ -227,11 +223,9 @@ static void build_srate_text(char *text, size_t size, uint32_t *color)
     switch (g_fps_shared.srate_status)
     {
     case SRATE_STATUS_MATCHED:
-        *color = SRATE_COLOR_OK;
         snprintf(text, size, "Source: %s Hz | OBS: %s FPS - OK", src, obs);
         break;
     case SRATE_STATUS_MISMATCH:
-        *color = SRATE_COLOR_BAD;
         srate_format_hz(g_fps_shared.srate_recommended_hz, rec, sizeof(rec));
         format_beat(g_fps_shared.srate_beat_s, beat, sizeof(beat));
         snprintf(text, size,
@@ -686,6 +680,7 @@ static void *fps_overlay_create(obs_data_t *settings, obs_source_t *source)
     ctx->fps_scale = obs_data_get_double(settings, "fps_scale");
     ctx->show_resolution_spectrum = obs_data_get_bool(settings, "show_resolution_spectrum");
     ctx->show_source_rate = obs_data_get_bool(settings, "show_source_rate");
+    ctx->autohide_source_rate = obs_data_get_bool(settings, "autohide_source_rate");
 
     ctx->last_text[0] = '\0';
     ctx->spec_tex = NULL;
@@ -710,8 +705,7 @@ static void *fps_overlay_create(obs_data_t *settings, obs_source_t *source)
     ctx->spec_label_w = create_label_source_color("", "fps_spec_label_w", 14, true, 0x00FF00);
     ctx->spec_label_h = create_label_source_color("", "fps_spec_label_h", 14, true, 0x00FF00);
     ctx->srate_text[0] = '\0';
-    ctx->srate_color = SRATE_COLOR_INFO;
-    ctx->label_srate = create_label_source_color(" ", "fps_srate_label", 20, true, SRATE_COLOR_INFO);
+    ctx->label_srate = create_label_source(" ", "fps_srate_label", 20, true);
     update_srate_label(ctx);
     rebuild_grid_labels(ctx);
 
@@ -797,6 +791,12 @@ static obs_properties_t *fps_overlay_properties(void *data)
         "compares it with the OBS FPS (Settings > Video). A mismatch, e.g. a "
         "59.94 Hz console captured at 60 FPS, makes OBS repeat a frame every "
         "~17 s. Not available for Game/Display/Window Capture.");
+    obs_property_t *srate_hide = obs_properties_add_bool(props, "autohide_source_rate",
+                                                         "Auto-hide Source refresh rate when OK");
+    obs_property_set_long_description(srate_hide,
+        "Hides the Source refresh rate line 5 s after the verdict is OK. It comes "
+        "back on a mismatch, a variable rate or while measuring again (e.g. after "
+        "changing the OBS FPS).");
     obs_properties_add_bool(props, "show_text_background", "Show text background");
 
     obs_property_t *ft_toggle = obs_properties_add_bool(props, "show_frametime_graph", "Show frametime graph");
@@ -853,6 +853,7 @@ static void fps_overlay_get_defaults(obs_data_t *settings)
     obs_data_set_default_bool(settings, "show_resolution_text", true);
     obs_data_set_default_bool(settings, "show_resolution_spectrum", true);
     obs_data_set_default_bool(settings, "show_source_rate", true);
+    obs_data_set_default_bool(settings, "autohide_source_rate", false);
     obs_data_set_default_bool(settings, "show_text_background", true);
     obs_data_set_default_bool(settings, "show_frametime_graph", true);
     obs_data_set_default_int(settings, "frametime_style", GRAPH_STYLE_COMPACT);
@@ -881,6 +882,7 @@ static void fps_overlay_update(void *data, obs_data_t *settings)
     ctx->fps_scale = obs_data_get_double(settings, "fps_scale");
     ctx->show_resolution_spectrum = obs_data_get_bool(settings, "show_resolution_spectrum");
     ctx->show_source_rate = obs_data_get_bool(settings, "show_source_rate");
+    ctx->autohide_source_rate = obs_data_get_bool(settings, "autohide_source_rate");
 
     rebuild_grid_labels(ctx);
     update_srate_label(ctx);
@@ -1004,19 +1006,28 @@ static void fps_overlay_tick(void *data, float seconds)
         }
     }
 
-    // Source refresh rate line — relabel/recolor only on change
+    // Source refresh rate line — relabel only on change
     if (ctx->show_source_rate)
     {
         char srate_text[sizeof(ctx->srate_text)];
-        uint32_t color;
-        build_srate_text(srate_text, sizeof(srate_text), &color);
-        if (strcmp(srate_text, ctx->srate_text) != 0 || color != ctx->srate_color)
+        build_srate_text(srate_text, sizeof(srate_text));
+        if (strcmp(srate_text, ctx->srate_text) != 0)
         {
             strncpy(ctx->srate_text, srate_text, sizeof(ctx->srate_text));
             ctx->srate_text[sizeof(ctx->srate_text) - 1] = '\0';
-            ctx->srate_color = color;
             update_srate_label(ctx);
         }
+
+        // Auto-hide: OK for 5 s -> hidden, anything else -> shown right away
+        bool ok = g_fps_shared.srate_available && g_fps_shared.srate_valid &&
+                  g_fps_shared.srate_status == SRATE_STATUS_MATCHED;
+        uint64_t now = os_gettime_ns();
+        if (!ok)
+            ctx->srate_ok_since_ns = 0;
+        else if (!ctx->srate_ok_since_ns)
+            ctx->srate_ok_since_ns = now;
+        ctx->srate_autohidden = ctx->autohide_source_rate && ctx->srate_ok_since_ns &&
+                                now - ctx->srate_ok_since_ns >= SRATE_AUTOHIDE_NS;
     }
 
     // Only update the text source if the text actually changed

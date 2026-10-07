@@ -94,9 +94,10 @@ Both tools build with the plugin (CMake option `FPS_ANALYZER_BUILD_TOOLS`, on by
 - **Description**: Measures the real refresh rate of the incoming signal from the timestamps the capture card driver puts on every frame, and compares it with the OBS FPS (Settings → Video)
 - **Why it matters**: A capture card is locked to the HDMI signal. **"Match output FPS"** in Video Capture Device only picks the card's advertised format; it does not change the rate the card delivers. A PS5 sends **59.94 Hz** (Elgato Studio shows it as `2160p59`), so with OBS at 60 FPS the two clocks beat and OBS repeats a frame every `1 / |f_source − f_OBS|` seconds (~17 s). The FPS graph then shows a dip at that interval even though the game runs at a locked 60
 - **Overlay**: "Show Source refresh rate" (default: on) adds a line under the FPS text:
-  - green `Source: 59.94 Hz | OBS: 59.94 FPS - OK`
-  - red `Source: 59.94 Hz | OBS: 60 FPS - duplicate every ~17 s` + the OBS FPS to set
-  - gray while measuring (~5 s), for variable-rate sources, or `n/a` for Game/Display/Window Capture (no frame timestamps)
+  - `Source: 59.94 Hz | OBS: 59.94 FPS - OK`
+  - `Source: 59.94 Hz | OBS: 60 FPS - duplicate every ~17 s` + the OBS FPS to set
+  - `measuring...` for the first ~5 s, `variable` for variable-rate sources, or `n/a` for Game/Display/Window Capture (no frame timestamps)
+- **Overlay**: "Auto-hide Source refresh rate when OK" (default: off) hides the line 5 s after the verdict is OK; it comes back on a mismatch, a variable rate or while measuring again (e.g. after changing the OBS FPS)
 - **Rule of thumb**: consoles → OBS **59.94** (119.88 in 120 Hz modes), PC → OBS **60**
 - **Limitation**: OBS only passes the frames it picks for its own clock, so a source running at 2× the OBS FPS or more is measured at its effective rate (119.88 Hz at OBS 60 reads as 59.94), which is also the rate that beats against OBS
 - **Log**: each verdict change writes one line, e.g. `[FPS Analyzer] Source 59.944 Hz vs OBS 60.000 FPS: mismatch, duplicate/skip every 18.0 s`
