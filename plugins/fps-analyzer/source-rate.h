@@ -58,6 +58,25 @@ bool srate_expire(struct srate *s, uint64_t now_ns, uint64_t max_idle_ns);
 // May trim the window when the source rate changes. Returns out->valid.
 bool srate_get(struct srate *s, double obs_hz, struct srate_result *out);
 
+// What happened to the window since the previous call (counters reset on
+// each call), plus its current shape. For the OBS log while measuring.
+struct srate_diag {
+    int pushes;           // frames fed
+    int ignored;          // repeated / older timestamps
+    int gap_resets;       // restarts on a gap > 250 ms between timestamps
+    double max_gap_ms;    // largest such gap
+    double max_back_ms;   // largest step back among ignored timestamps
+    int trims;            // window cut to the recent part (rate change)
+    int expires;          // restarts on no frames for > max_idle_ns
+    int count;            // timestamps in the window
+    double span_s;        // window length
+    double period_ms;     // median interval from the last srate_get
+    double min_ms, max_ms; // shortest / longest interval in the window
+    int fractional;       // intervals that are no whole/half period (last get)
+    double rms_ms;        // fit residual (last get)
+};
+void srate_take_diag(struct srate *s, struct srate_diag *out);
+
 // Formats a rate as a standard label when it matches one ("59.94", "60",
 // "23.976"), otherwise with three decimals ("59.937").
 void srate_format_hz(double hz, char *buf, size_t size);

@@ -21,6 +21,7 @@ struct srate {
     int count = 0;
     uint64_t last = 0;
     uint64_t last_push_ns = 0; // local clock of the newest push, 0 = none
+    srate_diag diag = {};      // counters since the last srate_take_diag
 };
 
 struct std_rate {
@@ -82,12 +83,19 @@ void srate_push(struct srate *s, uint64_t ts_ns, uint64_t now_ns) {
         return;
     std::lock_guard<std::mutex> lock(s->mutex);
     s->last_push_ns = now_ns;
+    s->diag.pushes++;
     if (s->count > 0) {
         // Deinterlacing hands the filter the previous frame again
-        if (ts_ns <= s->last)
+        if (ts_ns <= s->last) {
+            s->diag.ignored++;
+            s->diag.max_back_ms = std::max(s->diag.max_back_ms, (s->last - ts_ns) / 1e6);
             return;
-        if (ts_ns - s->last > SRATE_GAP_NS)
+        }
+        if (ts_ns - s->last > SRATE_GAP_NS) {
+            s->diag.gap_resets++;
+            s->diag.max_gap_ms = std::max(s->diag.max_gap_ms, (ts_ns - s->last) / 1e6);
             reset_locked(s);
+        }
     }
     if (s->count == SRATE_CAPACITY) {
         s->start = (s->start + 1) % SRATE_CAPACITY;
@@ -113,8 +121,32 @@ bool srate_expire(struct srate *s, uint64_t now_ns, uint64_t max_idle_ns) {
     int64_t idle = (int64_t)(now_ns - s->last_push_ns);
     if (idle <= (int64_t)max_idle_ns)
         return false;
+    s->diag.expires++;
     reset_locked(s);
     return true;
+}
+
+void srate_take_diag(struct srate *s, struct srate_diag *out) {
+    *out = srate_diag{};
+    if (!s)
+        return;
+    std::lock_guard<std::mutex> lock(s->mutex);
+    *out = s->diag;
+    out->count = s->count;
+    if (s->count >= 2) {
+        out->span_s = (ts_at(s, s->count - 1) - ts_at(s, 0)) / 1e9;
+        out->min_ms = 1e300;
+        for (int i = 1; i < s->count; i++) {
+            double d = (ts_at(s, i) - ts_at(s, i - 1)) / 1e6;
+            out->min_ms = std::min(out->min_ms, d);
+            out->max_ms = std::max(out->max_ms, d);
+        }
+    }
+    srate_diag keep = {};
+    keep.period_ms = s->diag.period_ms;
+    keep.fractional = s->diag.fractional;
+    keep.rms_ms = s->diag.rms_ms;
+    s->diag = keep;
 }
 
 // Drops everything but the newest `keep` timestamps
@@ -150,6 +182,7 @@ bool srate_get(struct srate *s, double obs_hz, struct srate_result *out) {
             std::vector<double> tail(deltas.end() - recent, deltas.end());
             double recent_period = median(tail);
             if (fabs(recent_period / period - 1.0) > 0.10) {
+                s->diag.trims++;
                 srate_keep_last(s, recent + 1);
                 continue;
             }
@@ -158,6 +191,7 @@ bool srate_get(struct srate *s, double obs_hz, struct srate_result *out) {
     }
     if (period <= 0.0)
         return false;
+    s->diag.period_ms = period / 1e6;
 
     // Count intervals in source periods: a frame OBS skipped leaves a double
     // interval. A decimated source (OBS takes every 2nd frame) shows half
@@ -204,6 +238,8 @@ bool srate_get(struct srate *s, double obs_hz, struct srate_result *out) {
         sse += e * e;
     }
     double rms = sqrt(sse / n);
+    s->diag.fractional = fractional;
+    s->diag.rms_ms = rms / 1e6;
     int intervals = n - 1;
     double span = ys[(size_t)n - 1];
 

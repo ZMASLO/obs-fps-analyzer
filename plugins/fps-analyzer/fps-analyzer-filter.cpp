@@ -101,6 +101,7 @@ struct fps_analyzer_filter {
     // Source refresh rate (async sources: driver timestamps of each frame)
     struct srate *srate;
     int srate_logged_status;      // last status written to the OBS log
+    uint64_t srate_diag_log_ns;   // last diagnostic line while measuring
 };
 
 // --- Utility functions ---
@@ -936,6 +937,20 @@ static void publish_source_rate(struct fps_analyzer_filter *filter, uint64_t now
     g_fps_shared.srate_beat_s = r.beat_period_s;
     g_fps_shared.srate_recommended_hz = r.recommended_hz;
 
+    // Still no verdict: every 5 s, why the window does not fill up
+    if (!r.valid && now - filter->srate_diag_log_ns >= 5000000000ULL) {
+        filter->srate_diag_log_ns = now;
+        struct srate_diag d;
+        srate_take_diag(filter->srate, &d);
+        blog(LOG_INFO, "[FPS Analyzer] Source rate status=%d: %d frames in %.2f s "
+             "(median %.3f ms, min %.3f, max %.3f, off-grid %d, rms %.3f ms) | "
+             "last 5 s: pushed %d, ignored %d (back up to %.3f ms), gap resets %d "
+             "(max %.1f ms), trims %d, idle resets %d",
+             r.status, d.count, d.span_s, d.period_ms, d.min_ms, d.max_ms,
+             d.fractional, d.rms_ms, d.pushes, d.ignored, d.max_back_ms,
+             d.gap_resets, d.max_gap_ms, d.trims, d.expires);
+    }
+
     // One log line per verdict change — useful in user-submitted logs
     if (r.valid && r.status != filter->srate_logged_status) {
         filter->srate_logged_status = r.status;
@@ -1156,6 +1171,7 @@ static void *fps_analyzer_create(obs_data_t *settings, obs_source_t *context)
     filter->dump_csv = NULL;
     filter->srate = srate_create();
     filter->srate_logged_status = -1;
+    filter->srate_diag_log_ns = 0;
     g_dump_hotkey_target.store(filter);
     g_fps_shared.active_filter_count++;
     return filter;

@@ -4,6 +4,7 @@
 // ready_async_frame does, and only the picked frames reach the estimator.
 // Unless a test says otherwise, a frame arrives at its own timestamp.
 #include "source-rate.h"
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -305,6 +306,64 @@ int main() {
         check(bogus.load() == 0, "no torn reads (rate always ~60 Hz)");
         check(r.valid && r.status == SRATE_STATUS_MISMATCH && near(r.source_hz, NTSC60, 0.01),
               "final verdict 59.94 vs 60");
+        srate_destroy(s);
+    }
+
+    printf("[15] 59.94 into OBS 59.94, phase stuck on the tick boundary\n");
+    {
+        // Same nominal rate: the phase drifts by ~1 ms per minute, so it can
+        // sit on the tick boundary for minutes. A driver that hands frames
+        // over in bursts makes them alternately miss and make the tick: OBS
+        // (unbuffered) then shows every 2nd frame, the filter sees 2P steps.
+        const double tick_ns = 1e9 / NTSC60;
+        struct srate *s = srate_create();
+        srate_result r{};
+        uint64_t delivered = 0;
+        for (int i = 0; i < 1500; i++) { // 25 s
+            double tick = 100e9 + i * tick_ns;
+            // Frame i is stamped at the tick; arrival alternates 1 ms late /
+            // on time, so frames 2k+1 always land in the next tick together
+            // with 2k+2, and only the newest is kept
+            uint64_t pick = 0;
+            for (int j = std::max(0, i - 2); j <= i; j++) {
+                double ts = 100e9 + j * tick_ns * (1.0 + 20e-6);
+                double arrival = ts + ((j % 2) ? 1.0e6 : -0.2e6);
+                if (arrival <= tick)
+                    pick = (uint64_t)ts;
+            }
+            if (pick && pick != delivered) {
+                srate_push(s, pick, (uint64_t)tick);
+                delivered = pick;
+            }
+            srate_get(s, NTSC60, &r);
+        }
+        print_result(r);
+        check(r.valid && r.status == SRATE_STATUS_MATCHED, "matched (not stuck measuring)");
+        srate_destroy(s);
+    }
+
+    printf("[16] diagnostics counters\n");
+    {
+        struct srate *s = srate_create();
+        std::vector<uint64_t> a = make_frames({NTSC60}, 2.0, 100.0, 20);
+        std::vector<uint64_t> b = make_frames({NTSC60}, 2.0, 103.0, 21);
+        for (uint64_t ts : a)
+            srate_push(s, ts, ts);
+        srate_push(s, a.back() - 5000000, a.back()); // 5 ms back
+        for (uint64_t ts : b)
+            srate_push(s, ts, ts);
+        srate_result r;
+        srate_get(s, 60.0, &r);
+        srate_diag d;
+        srate_take_diag(s, &d);
+        printf("  -> pushed %d ignored %d back %.1f ms gaps %d max %.0f ms count %d span %.2f s median %.3f ms\n",
+               d.pushes, d.ignored, d.max_back_ms, d.gap_resets, d.max_gap_ms, d.count, d.span_s, d.period_ms);
+        check(d.pushes == (int)(a.size() + b.size() + 1) && d.ignored == 1, "pushes / ignored");
+        check(near(d.max_back_ms, 5.0, 0.01), "step back 5 ms");
+        check(d.gap_resets == 1 && d.max_gap_ms > 900.0, "one gap reset (~1 s)");
+        check(d.count == (int)b.size() && near(d.period_ms, 1000.0 / NTSC60, 0.5), "window = 2nd run");
+        srate_take_diag(s, &d);
+        check(d.pushes == 0 && d.gap_resets == 0 && d.count == (int)b.size(), "counters reset, shape kept");
         srate_destroy(s);
     }
 
