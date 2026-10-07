@@ -2,6 +2,7 @@ add_library(fps-analyzer MODULE
     fps-analyzer-filter.cpp
     fps-analyzer-overlay.cpp
     resolution-detector.cpp
+    source-rate.cpp
     kissfft/kiss_fft.c
     kissfft/kiss_fftr.c
 )
@@ -22,4 +23,12 @@ if(FPS_ANALYZER_BUILD_TOOLS)
         target_compile_features(${tool} PRIVATE cxx_std_20)
         target_compile_definitions(${tool} PRIVATE _CRT_SECURE_NO_WARNINGS)
     endforeach()
+
+    # Source refresh rate estimator suite
+    add_executable(srate-selftest tools/srate-selftest.cpp source-rate.cpp)
+    target_include_directories(srate-selftest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(srate-selftest PRIVATE cxx_std_20)
+    target_compile_definitions(srate-selftest PRIVATE _CRT_SECURE_NO_WARNINGS)
+    find_package(Threads REQUIRED)
+    target_link_libraries(srate-selftest PRIVATE Threads::Threads)
 endif()

@@ -13,6 +13,7 @@
 
 #include "fps-shared-data.h"
 #include "resolution-detector.h"
+#include "source-rate.h"
 
 // Global shared data — read by fps-analyzer-overlay.cpp
 struct fps_shared_data g_fps_shared = {0, 0.0, false, 0, 0, -1, {}, 0};
@@ -97,6 +98,10 @@ struct fps_analyzer_filter {
     char dump_session_dir[640];
     FILE *dump_csv;
     uint64_t dump_start_ns;
+    // Source refresh rate (async sources: driver timestamps of each frame)
+    struct srate *srate;
+    int srate_logged_status;      // last status written to the OBS log
+    uint64_t srate_diag_log_ns;   // last diagnostic line while measuring
 };
 
 // --- Utility functions ---
@@ -685,6 +690,10 @@ static struct obs_source_frame *fps_analyzer_filter_video(void *data,
     if (!frame || !frame->data[0])
         return frame;
 
+    // Faktyczna częstotliwość źródła — znacznik czasu nadany przez sterownik
+    // karty, niezależny od formatu pikseli (liczone także dla nieobsługiwanych)
+    srate_push(filter->srate, frame->timestamp, os_gettime_ns());
+
     // Log format changes for debugging
     if ((int)frame->format != filter->last_logged_format) {
         blog(LOG_INFO, "[FPS Analyzer] Video format: %d, resolution: %ux%u",
@@ -901,6 +910,60 @@ static void fps_analyzer_video_render(void *data, gs_effect_t *effect)
 
 // --- Output (tick) ---
 
+// Real source refresh rate vs OBS FPS — only async sources (capture cards,
+// cameras) carry frame timestamps; sync sources report "not available"
+static void publish_source_rate(struct fps_analyzer_filter *filter, uint64_t now)
+{
+    obs_source_t *parent = obs_filter_get_parent(filter->context);
+    bool async = parent && (obs_source_get_output_flags(parent) & OBS_SOURCE_ASYNC);
+    g_fps_shared.srate_available = async && filter->srate;
+    if (!g_fps_shared.srate_available)
+        return;
+
+    // No frames for a while (source hidden, signal lost): start over
+    srate_expire(filter->srate, now, 1000000000ULL);
+
+    struct obs_video_info ovi;
+    double obs_hz = 0.0;
+    if (obs_get_video_info(&ovi) && ovi.fps_den > 0)
+        obs_hz = (double)ovi.fps_num / ovi.fps_den;
+
+    struct srate_result r;
+    srate_get(filter->srate, obs_hz, &r);
+    g_fps_shared.srate_valid = r.valid;
+    g_fps_shared.srate_status = r.status;
+    g_fps_shared.srate_source_hz = r.source_hz;
+    g_fps_shared.srate_obs_hz = obs_hz;
+    g_fps_shared.srate_beat_s = r.beat_period_s;
+    g_fps_shared.srate_recommended_hz = r.recommended_hz;
+
+    // Still no verdict: every 5 s, why the window does not fill up
+    if (!r.valid && now - filter->srate_diag_log_ns >= 5000000000ULL) {
+        filter->srate_diag_log_ns = now;
+        struct srate_diag d;
+        srate_take_diag(filter->srate, &d);
+        blog(LOG_INFO, "[FPS Analyzer] Source rate status=%d: %d frames in %.2f s "
+             "(median %.3f ms, min %.3f, max %.3f, off-grid %d, rms %.3f ms) | "
+             "last 5 s: pushed %d, ignored %d (back up to %.3f ms), gap resets %d "
+             "(max %.1f ms), trims %d, idle resets %d",
+             r.status, d.count, d.span_s, d.period_ms, d.min_ms, d.max_ms,
+             d.fractional, d.rms_ms, d.pushes, d.ignored, d.max_back_ms,
+             d.gap_resets, d.max_gap_ms, d.trims, d.expires);
+    }
+
+    // One log line per verdict change — useful in user-submitted logs
+    if (r.valid && r.status != filter->srate_logged_status) {
+        filter->srate_logged_status = r.status;
+        if (r.status == SRATE_STATUS_MISMATCH)
+            blog(LOG_INFO, "[FPS Analyzer] Source %.3f Hz vs OBS %.3f FPS: mismatch, "
+                 "duplicate/skip every %.1f s (set OBS FPS to %.3f)",
+                 r.source_hz, obs_hz, r.beat_period_s, r.recommended_hz);
+        else if (r.status == SRATE_STATUS_MATCHED)
+            blog(LOG_INFO, "[FPS Analyzer] Source %.3f Hz matches OBS %.3f FPS",
+                 r.source_hz, obs_hz);
+    }
+}
+
 static void fps_analyzer_video_tick(void *data, float seconds)
 {
     UNUSED_PARAMETER(seconds);
@@ -979,6 +1042,8 @@ static void fps_analyzer_video_tick(void *data, float seconds)
     }
     g_fps_shared.graph_count = count;
 
+    publish_source_rate(filter, now);
+
     // Upscale resolution detection — publish latest result
     g_fps_shared.res_detect_enabled = filter->enable_resolution_detection;
     if (filter->enable_resolution_detection && filter->res_detector) {
@@ -1028,6 +1093,7 @@ static void fps_analyzer_destroy(void *data)
         struct fps_analyzer_filter *expected = filter;
         g_dump_hotkey_target.compare_exchange_strong(expected, nullptr);
         if (filter->res_detector) resdet_destroy(filter->res_detector);
+        srate_destroy(filter->srate);
         obs_enter_graphics();
         if (filter->texrender) gs_texrender_destroy(filter->texrender);
         if (filter->stagesurface) gs_stagesurface_destroy(filter->stagesurface);
@@ -1103,6 +1169,9 @@ static void *fps_analyzer_create(obs_data_t *settings, obs_source_t *context)
     filter->dump_status_refresh_ns = 0;
     filter->dump_index = 0;
     filter->dump_csv = NULL;
+    filter->srate = srate_create();
+    filter->srate_logged_status = -1;
+    filter->srate_diag_log_ns = 0;
     g_dump_hotkey_target.store(filter);
     g_fps_shared.active_filter_count++;
     return filter;
@@ -1111,7 +1180,7 @@ static void *fps_analyzer_create(obs_data_t *settings, obs_source_t *context)
 static const char *fps_analyzer_get_name(void *unused)
 {
     UNUSED_PARAMETER(unused);
-    return "FPS Analyzer 0.5";
+    return "FPS Analyzer 0.5.1";
 }
 
 // --- Properties ---
