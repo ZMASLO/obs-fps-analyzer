@@ -2,11 +2,14 @@
 // Frames get driver timestamps (nominal period, crystal offset, jitter); a
 // simplified OBS clock then picks the newest frame at each tick, as
 // ready_async_frame does, and only the picked frames reach the estimator.
+// Unless a test says otherwise, a frame arrives at its own timestamp.
 #include "source-rate.h"
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <random>
+#include <thread>
 #include <vector>
 
 struct sim_source {
@@ -40,7 +43,7 @@ static void obs_pick(struct srate *s, const std::vector<uint64_t> &frames, doubl
         while (next < frames.size() && (double)frames[next] <= tick)
             pick = frames[next++];
         if (pick && pick != delivered) {
-            srate_push(s, pick);
+            srate_push(s, pick, pick);
             delivered = pick;
         }
     }
@@ -169,8 +172,8 @@ int main() {
     {
         struct srate *s = srate_create();
         for (uint64_t ts : make_frames({NTSC60}, 20.0, 100.0, 12)) {
-            srate_push(s, ts);
-            srate_push(s, ts);
+            srate_push(s, ts, ts);
+            srate_push(s, ts, ts);
         }
         srate_result r;
         srate_get(s, 60.0, &r);
@@ -185,7 +188,7 @@ int main() {
         std::uniform_real_distribution<double> d(10e6, 40e6);
         double t = 100e9;
         for (int i = 0; i < 800; i++, t += d(rng))
-            srate_push(s, (uint64_t)t);
+            srate_push(s, (uint64_t)t, (uint64_t)t);
         srate_result r;
         srate_get(s, 60.0, &r);
         print_result(r);
@@ -197,9 +200,9 @@ int main() {
     {
         struct srate *s = srate_create();
         for (uint64_t ts : make_frames({60.0}, 10.0, 100.0, 14))
-            srate_push(s, ts);
+            srate_push(s, ts, ts);
         for (uint64_t ts : make_frames({120.0}, 12.0, 110.0, 15))
-            srate_push(s, ts);
+            srate_push(s, ts, ts);
         srate_result r;
         srate_get(s, 120.0, &r);
         srate_get(s, 120.0, &r); // first call may only trim the window
@@ -212,6 +215,97 @@ int main() {
     {
         srate_result r = run({NTSC60}, 60.0, 3.0, 16);
         check(!r.valid && r.status == SRATE_STATUS_MEASURING, "measuring");
+    }
+
+    printf("[12] frames arriving during the tick (newer than its clock)\n");
+    {
+        // The filter's tick reads os_gettime_ns() first and checks for idle
+        // later; meanwhile the capture thread pushes a newer frame. That must
+        // not count as idle (regression: unsigned now - last wrapped around
+        // and reset the window every few ticks, stuck on "measuring...")
+        std::vector<uint64_t> frames = make_frames({NTSC60, 73.0}, 20.0, 100.0, 17);
+        struct srate *s = srate_create();
+        const double tick_ns = 1e9 / 60.0;
+        const uint64_t late_ns = 3000000; // frame lands 3 ms into the tick
+        size_t next = 0;
+        int resets = 0;
+        srate_result r{};
+        for (double tick = (double)frames.front(); next < frames.size(); tick += tick_ns) {
+            uint64_t now = (uint64_t)tick;
+            while (next < frames.size() && frames[next] <= now + late_ns) {
+                srate_push(s, frames[next], frames[next]); // arrival > now
+                next++;
+            }
+            if (srate_expire(s, now, 1000000000ULL))
+                resets++;
+            srate_get(s, 60.0, &r);
+        }
+        print_result(r);
+        check(resets == 0, "no idle reset while frames keep coming");
+        check(r.valid && r.status == SRATE_STATUS_MISMATCH, "verdict after 20 s");
+        srate_destroy(s);
+    }
+
+    printf("[13] no frames for over 1 s (source hidden)\n");
+    {
+        std::vector<uint64_t> frames = make_frames({NTSC60}, 10.0, 100.0, 18);
+        struct srate *s = srate_create();
+        for (uint64_t ts : frames)
+            srate_push(s, ts, ts);
+        uint64_t last = frames.back();
+        check(!srate_expire(s, last + 500000000ULL, 1000000000ULL), "0.5 s idle: kept");
+        srate_result r;
+        srate_get(s, 60.0, &r);
+        check(r.valid, "still valid");
+        check(srate_expire(s, last + 1500000000ULL, 1000000000ULL), "1.5 s idle: reset");
+        srate_get(s, 60.0, &r);
+        check(!r.valid && r.status == SRATE_STATUS_MEASURING && r.source_hz == 0.0,
+              "measuring from scratch");
+        check(!srate_expire(s, last + 3000000000ULL, 1000000000ULL), "empty window: nothing to reset");
+        srate_destroy(s);
+    }
+
+    printf("[14] capture thread pushes while the graphics thread reads\n");
+    {
+        std::vector<uint64_t> frames = make_frames({NTSC60, 73.0}, 30.0, 100.0, 19);
+        struct srate *s = srate_create();
+        std::atomic<uint64_t> latest{0};
+        std::atomic<bool> done{false};
+        std::atomic<int> resets{0}, bogus{0}, reads{0};
+        std::thread reader([&] {
+            srate_result r;
+            while (!done.load()) {
+                uint64_t l = latest.load();
+                if (l > 2000000ULL && srate_expire(s, l - 2000000ULL, 1000000000ULL))
+                    resets++;
+                srate_get(s, 60.0, &r);
+                if (r.source_hz != 0.0 && !(r.source_hz > 50.0 && r.source_hz < 70.0))
+                    bogus++;
+                reads++;
+            }
+        });
+        // Hand over to the reader every few frames so the calls interleave
+        for (size_t i = 0; i < frames.size(); i++) {
+            srate_push(s, frames[i], frames[i]);
+            latest.store(frames[i]);
+            if (i % 4 == 0) {
+                int seen = reads.load();
+                while (reads.load() == seen)
+                    std::this_thread::yield();
+            }
+        }
+        done.store(true);
+        reader.join();
+        srate_result r;
+        srate_get(s, 60.0, &r);
+        print_result(r);
+        printf("  -> %d concurrent reads\n", reads.load());
+        check(reads.load() >= (int)frames.size() / 4, "reads interleaved with pushes");
+        check(resets.load() == 0, "no idle reset");
+        check(bogus.load() == 0, "no torn reads (rate always ~60 Hz)");
+        check(r.valid && r.status == SRATE_STATUS_MISMATCH && near(r.source_hz, NTSC60, 0.01),
+              "final verdict 59.94 vs 60");
+        srate_destroy(s);
     }
 
     printf(fails ? "RESULT: %d FAILURES\n" : "RESULT: ALL OK\n", fails);

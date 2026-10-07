@@ -42,9 +42,17 @@ struct srate *srate_create(void);
 void srate_destroy(struct srate *s);
 void srate_reset(struct srate *s);
 
-// Feed the timestamp (ns) of every frame the filter receives. Repeated or
-// out-of-order timestamps are ignored; a gap > 250 ms restarts the window.
-void srate_push(struct srate *s, uint64_t ts_ns);
+// Feed the timestamp (ns) of every frame the filter receives, with the
+// local clock (os_gettime_ns) at arrival. Repeated or out-of-order
+// timestamps are ignored; a gap > 250 ms restarts the window.
+// Thread-safe: push runs on the capture thread, the rest on the graphics one.
+void srate_push(struct srate *s, uint64_t ts_ns, uint64_t now_ns);
+
+// Restarts the window when no frame arrived for longer than max_idle_ns
+// (source hidden, signal lost). now_ns may be older than the last push (a
+// frame can arrive after the caller read its clock): that is not idle.
+// Returns true when the window was reset.
+bool srate_expire(struct srate *s, uint64_t now_ns, uint64_t max_idle_ns);
 
 // Estimate the source rate and compare it with obs_hz (<= 0: no comparison).
 // May trim the window when the source rate changes. Returns out->valid.

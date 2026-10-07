@@ -100,7 +100,6 @@ struct fps_analyzer_filter {
     uint64_t dump_start_ns;
     // Source refresh rate (async sources: driver timestamps of each frame)
     struct srate *srate;
-    uint64_t last_srate_push_ns;  // os time of the last frame fed to srate
     int srate_logged_status;      // last status written to the OBS log
 };
 
@@ -692,8 +691,7 @@ static struct obs_source_frame *fps_analyzer_filter_video(void *data,
 
     // Faktyczna częstotliwość źródła — znacznik czasu nadany przez sterownik
     // karty, niezależny od formatu pikseli (liczone także dla nieobsługiwanych)
-    srate_push(filter->srate, frame->timestamp);
-    filter->last_srate_push_ns = os_gettime_ns();
+    srate_push(filter->srate, frame->timestamp, os_gettime_ns());
 
     // Log format changes for debugging
     if ((int)frame->format != filter->last_logged_format) {
@@ -922,8 +920,7 @@ static void publish_source_rate(struct fps_analyzer_filter *filter, uint64_t now
         return;
 
     // No frames for a while (source hidden, signal lost): start over
-    if (now - filter->last_srate_push_ns > 1000000000ULL)
-        srate_reset(filter->srate);
+    srate_expire(filter->srate, now, 1000000000ULL);
 
     struct obs_video_info ovi;
     double obs_hz = 0.0;
@@ -1158,7 +1155,6 @@ static void *fps_analyzer_create(obs_data_t *settings, obs_source_t *context)
     filter->dump_index = 0;
     filter->dump_csv = NULL;
     filter->srate = srate_create();
-    filter->last_srate_push_ns = 0;
     filter->srate_logged_status = -1;
     g_dump_hotkey_target.store(filter);
     g_fps_shared.active_filter_count++;

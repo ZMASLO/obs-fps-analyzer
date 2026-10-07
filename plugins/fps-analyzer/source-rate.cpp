@@ -2,7 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
+#include <mutex>
 #include <vector>
 
 #define SRATE_CAPACITY 2048
@@ -13,11 +13,14 @@
 #define SRATE_SNAP_TOL 200e-6           // standard-rate snapping tolerance
 #define SRATE_MATCH_TOL 300e-6          // above typical crystal tolerance (~100 ppm)
 
+// push() runs on the source's capture thread, get() on the graphics thread
 struct srate {
-    uint64_t ts[SRATE_CAPACITY];
-    int start;
-    int count;
-    uint64_t last;
+    std::mutex mutex;
+    uint64_t ts[SRATE_CAPACITY] = {};
+    int start = 0;
+    int count = 0;
+    uint64_t last = 0;
+    uint64_t last_push_ns = 0; // local clock of the newest push, 0 = none
 };
 
 struct std_rate {
@@ -54,29 +57,37 @@ static double median(std::vector<double> v) {
 }
 
 struct srate *srate_create(void) {
-    struct srate *s = (struct srate *)calloc(1, sizeof(struct srate));
-    return s;
+    return new srate();
 }
 
 void srate_destroy(struct srate *s) {
-    free(s);
+    delete s;
 }
 
-void srate_reset(struct srate *s) {
+static void reset_locked(struct srate *s) {
     s->start = 0;
     s->count = 0;
     s->last = 0;
 }
 
-void srate_push(struct srate *s, uint64_t ts_ns) {
+void srate_reset(struct srate *s) {
+    if (!s)
+        return;
+    std::lock_guard<std::mutex> lock(s->mutex);
+    reset_locked(s);
+}
+
+void srate_push(struct srate *s, uint64_t ts_ns, uint64_t now_ns) {
     if (!s || ts_ns == 0)
         return;
+    std::lock_guard<std::mutex> lock(s->mutex);
+    s->last_push_ns = now_ns;
     if (s->count > 0) {
         // Deinterlacing hands the filter the previous frame again
         if (ts_ns <= s->last)
             return;
         if (ts_ns - s->last > SRATE_GAP_NS)
-            srate_reset(s);
+            reset_locked(s);
     }
     if (s->count == SRATE_CAPACITY) {
         s->start = (s->start + 1) % SRATE_CAPACITY;
@@ -91,6 +102,21 @@ void srate_push(struct srate *s, uint64_t ts_ns) {
     }
 }
 
+bool srate_expire(struct srate *s, uint64_t now_ns, uint64_t max_idle_ns) {
+    if (!s)
+        return false;
+    std::lock_guard<std::mutex> lock(s->mutex);
+    if (s->count == 0 || s->last_push_ns == 0)
+        return false;
+    // Signed: a push newer than now_ns would wrap to a huge unsigned idle
+    // time and reset the window on almost every tick
+    int64_t idle = (int64_t)(now_ns - s->last_push_ns);
+    if (idle <= (int64_t)max_idle_ns)
+        return false;
+    reset_locked(s);
+    return true;
+}
+
 // Drops everything but the newest `keep` timestamps
 static void srate_keep_last(struct srate *s, int keep) {
     if (s->count <= keep)
@@ -103,7 +129,10 @@ bool srate_get(struct srate *s, double obs_hz, struct srate_result *out) {
     *out = srate_result{};
     out->obs_hz = obs_hz;
     out->status = SRATE_STATUS_MEASURING;
-    if (!s || s->count < 3)
+    if (!s)
+        return false;
+    std::lock_guard<std::mutex> lock(s->mutex);
+    if (s->count < 3)
         return false;
 
     std::vector<double> deltas;

@@ -103,6 +103,11 @@ jobs:
             -DCMAKE_PREFIX_PATH="${{ github.workspace }}/obs-sdk"
           cmake --build build --config Release
 
+      - name: Run source rate selftest
+        run: |
+          exe=$(find build -name "srate-selftest.exe" | head -1)
+          "$exe"
+
       - name: Prepare artifact
         run: |
           mkdir -p release
