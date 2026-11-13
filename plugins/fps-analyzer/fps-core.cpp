@@ -57,6 +57,26 @@ struct fps_core {
     int last_published_fps = 0;
 
     struct fps_core_frame_debug dbg = {};
+
+    // Capture-path beat detector (observes only; see fps-core.h)
+    struct beat_state {
+        int clean_frames = 0;          // consecutive unique frames
+        int clean_ticks = 0;           // consecutive ticks with exactly one frame
+        bool in_cluster = false;
+        uint64_t cluster_start = 0;
+        uint64_t cluster_last = 0;
+        int cluster_events = 0;
+        bool cluster_obs = false;      // the open cluster had an empty tick
+        bool cluster_stall = false;    // FPS_BEAT_STALL_RUN events in a row
+        double cluster_sum_s = 0.0;    // sum of event times relative to cluster_start
+        int run_dup = 0;               // consecutive duplicate frames
+        int run_empty = 0;             // consecutive empty ticks
+        // closed clusters, oldest first (times are the cluster means)
+        uint64_t times[FPS_BEAT_HISTORY] = {};
+        bool obs[FPS_BEAT_HISTORY] = {};
+        int n = 0;
+        int clusters = 0;
+    } beat;
 };
 
 // --- Small helpers ---
@@ -158,6 +178,181 @@ static bool extract_luma_rows(const struct fps_frame_view *frame, uint8_t *luma,
     }
 }
 
+// --- Capture-path beat detector ---
+
+static void beat_close_cluster(struct fps_core *c)
+{
+    auto &b = c->beat;
+    b.in_cluster = false;
+    if (b.cluster_stall || b.cluster_events > FPS_BEAT_MAX_EVENTS)
+        return; // a stall (static scene, loading screen, signal loss), not a beat
+    b.clusters++;
+    if (b.n == FPS_BEAT_HISTORY) {
+        memmove(b.times, b.times + 1, sizeof(b.times[0]) * (FPS_BEAT_HISTORY - 1));
+        memmove(b.obs, b.obs + 1, sizeof(b.obs[0]) * (FPS_BEAT_HISTORY - 1));
+        b.n--;
+    }
+    b.times[b.n] = b.cluster_start + (uint64_t)(b.cluster_sum_s / b.cluster_events * 1e9);
+    b.obs[b.n] = b.cluster_obs;
+    b.n++;
+}
+
+static const double k_std_rates[] = {
+    24000.0 / 1001.0, 24.0, 25.0, 30000.0 / 1001.0, 30.0, 48.0, 50.0,
+    60000.0 / 1001.0, 60.0, 100.0, 120000.0 / 1001.0, 120.0,
+};
+
+static double beat_snap(double hz)
+{
+    for (double r : k_std_rates)
+        if (fabs(hz / r - 1.0) <= FPS_BEAT_SNAP_TOL)
+            return r;
+    return 0.0;
+}
+
+// Closes a cluster that has gone quiet. Called before every new observation.
+static void beat_advance(struct fps_core *c, uint64_t now)
+{
+    auto &b = c->beat;
+    if (b.in_cluster && now - b.cluster_last > FPS_BEAT_CLUSTER_NS)
+        beat_close_cluster(c);
+}
+
+// `run` is how many events in a row this one completes (1 = isolated).
+static void beat_event(struct fps_core *c, uint64_t now, bool from_obs, bool clean_before, int run)
+{
+    auto &b = c->beat;
+    if (!b.in_cluster) {
+        if (!clean_before)
+            return; // not preceded by a steady stream: the game, not the capture path
+        b.in_cluster = true;
+        b.cluster_start = now;
+        b.cluster_events = 0;
+        b.cluster_sum_s = 0.0;
+        b.cluster_obs = false;
+        b.cluster_stall = false;
+    }
+    b.cluster_events++;
+    b.cluster_last = now;
+    b.cluster_sum_s += (double)(now - b.cluster_start) / 1e9;
+    b.cluster_obs = b.cluster_obs || from_obs;
+    if (run >= FPS_BEAT_STALL_RUN)
+        b.cluster_stall = true;
+}
+
+static void beat_on_frame(struct fps_core *c, bool unique, uint64_t now)
+{
+    auto &b = c->beat;
+    beat_advance(c, now);
+    if (unique) {
+        b.clean_frames++;
+        b.run_dup = 0;
+        return;
+    }
+    b.run_dup++;
+    beat_event(c, now, false, b.clean_frames >= FPS_BEAT_CLEAN_RUN, b.run_dup);
+    b.clean_frames = 0;
+}
+
+void fps_core_obs_tick(struct fps_core *c, uint64_t now_ns, int frames)
+{
+    if (!c)
+        return;
+    auto &b = c->beat;
+    beat_advance(c, now_ns);
+    if (frames == 1) {
+        b.clean_ticks++;
+        b.run_empty = 0;
+        return;
+    }
+    if (frames == 0) {
+        b.run_empty++;
+        beat_event(c, now_ns, true, b.clean_ticks >= FPS_BEAT_CLEAN_RUN, b.run_empty);
+    } else {
+        b.run_empty = 0;
+    }
+    b.clean_ticks = 0;
+}
+
+// Index of the closed cluster of the given kind within tol of t, searching
+// below index `below`; -1 if none. Clusters are in time order.
+static int beat_find(const struct fps_core::beat_state &b, bool obs, double t, double tol, int below)
+{
+    for (int i = below - 1; i >= 0; i--) {
+        double d = (double)b.times[i] / 1e9 - t;
+        if (d < -tol)
+            break;
+        if (b.obs[i] == obs && fabs(d) <= tol)
+            return i;
+    }
+    return -1;
+}
+
+void fps_core_get_beat(const struct fps_core *c, uint64_t now_ns, double delivery_hz, struct fps_beat *out)
+{
+    if (!out)
+        return;
+    memset(out, 0, sizeof(*out));
+    if (!c)
+        return;
+    const auto &b = c->beat;
+    out->clusters = b.clusters;
+    if (b.n < 2)
+        return;
+
+    // Chains ending at one of the latest clusters L (the newest may be a
+    // stray: a game hitch, a fragment of a wide OBS burst), through clusters
+    // of L's kind only: for each earlier cluster E of that kind as the first
+    // step, walk back by the period refined from the chain so far. The
+    // shortest period with a full chain wins (a 2P chain exists whenever a
+    // P chain does).
+    for (int last = b.n - 1; last >= 1 && last >= b.n - 1 - FPS_BEAT_END_SEARCH; last--) {
+        const bool obs = b.obs[last];
+        const double tol = obs ? FPS_BEAT_TOL_OBS_S : FPS_BEAT_TOL_CAPTURE_S;
+        const int need = obs ? FPS_BEAT_CHAIN_OBS : FPS_BEAT_CHAIN_CAPTURE;
+        const double tl = (double)b.times[last] / 1e9;
+        for (int e = last - 1; e >= 0; e--) {
+            if (b.obs[e] != obs)
+                continue;
+            double p = tl - (double)b.times[e] / 1e9;
+            if (p < FPS_BEAT_MIN_PERIOD_S)
+                continue;
+            int chain = 2, oldest = e;
+            for (;;) {
+                double step = (tl - (double)b.times[oldest] / 1e9) / (chain - 1);
+                int k = beat_find(b, obs, (double)b.times[oldest] / 1e9 - step, tol, oldest);
+                if (k < 0)
+                    break;
+                oldest = k;
+                chain++;
+            }
+            if (chain < need)
+                continue;
+            // The shortest regular period decides. If it is no standard-rate
+            // difference (a game hitching on a 5 s timer), its multiples (15 s
+            // -> 59.933 Hz, close to 59.94) are not considered either.
+            double period = (tl - (double)b.times[oldest] / 1e9) / (chain - 1);
+            double signal = delivery_hz > 0.0 ? delivery_hz - 1.0 / period : 0.0;
+            double nominal = delivery_hz > 0.0 ? beat_snap(signal) : 0.0;
+            if (delivery_hz > 0.0 && nominal == 0.0)
+                return; // not the difference of two standard clocks
+            if (nominal > 0.0 && fabs(nominal / delivery_hz - 1.0) < 1e-9 &&
+                chain < need + FPS_BEAT_CHAIN_DRIFT_EXTRA)
+                return; // same nominal rate (crystal drift): needs a longer chain
+            // Gone quiet for three periods (settings fixed, source changed): expired.
+            if (now_ns > b.times[last] && (double)(now_ns - b.times[last]) / 1e9 > 3.0 * period)
+                return;
+            out->detected = true;
+            out->period_s = period;
+            out->origin = obs ? FPS_BEAT_ORIGIN_OBS : FPS_BEAT_ORIGIN_CAPTURE;
+            out->signal_hz = signal;
+            out->nominal_hz = nominal;
+            out->chain = chain;
+            return;
+        }
+    }
+}
+
 // --- Unique-frame bookkeeping ---
 
 // Everything v0.5.0 did under `if (is_unique)`. Split out so a recorded trace
@@ -237,6 +432,7 @@ static void analyze_luma_frame(struct fps_core *c, const uint8_t *luma_ptr, size
     c->dbg.unique = is_unique;
     if (is_unique)
         analyze_unique(c, now);
+    beat_on_frame(c, is_unique, now);
     c->dbg.pos = c->frametime_pos;
     c->dbg.count = c->frametime_count;
 }
@@ -550,6 +746,7 @@ void fps_core_debug_feed_decision(struct fps_core *c, bool unique, bool tearing,
     c->dbg.unique = unique;
     if (unique)
         analyze_unique(c, now_ns);
+    beat_on_frame(c, unique, now_ns);
     c->dbg.pos = c->frametime_pos;
     c->dbg.count = c->frametime_count;
 }

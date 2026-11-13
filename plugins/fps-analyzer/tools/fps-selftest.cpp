@@ -1286,6 +1286,298 @@ static void s20_decision_replay(Runner &r)
     r.end(false);
 }
 
+#ifdef FPS_SELFTEST_HAVE_CORE
+// ------------------------------------------------ capture-path beat (core) ----
+//
+// The beat detector only exists in fps-core (the v0.5.0 oracle has no
+// counterpart), so these scenarios drive the core directly, at the decision
+// level: an OBS tick loop at `obs_hz`, a source clock at `src_hz`, and a game
+// whose frames the source carries.
+//
+//   card mode: the capture device resamples the source to the OBS rate itself.
+//              Every tick delivers one frame; a frame repeats when the source
+//              did not advance (Elgato 4K X at "60" with a 59.94 Hz console).
+//   obs mode:  source frames arrive at src_hz with +-jitter; OBS picks the
+//              newest frame per tick (unbuffered). No arrival = empty tick,
+//              two arrivals = the older one is dropped.
+
+struct BeatSim {
+    double obs_hz = 60.0;
+    double src_hz = 60000.0 / 1001.0;
+    bool card = true;
+    double jitter_ms = 0.0;
+    double phase = 0.5;          // source phase offset, in source periods
+    int game_div = 1;            // game shows a new image every game_div source frames
+    double drop_p = 0.0;         // per game frame: chance the game repeats its last image
+    double switch_s = -1.0;      // from here on the source runs at switch_hz
+    double switch_hz = 60.0;
+    double hitch_every_s = 0.0;  // the game repeats one image every N s exactly (timer-driven stutter)
+    double freeze_every_s = 0.0; // the game freezes for freeze_len_s every N s exactly
+    double freeze_len_s = 0.0;
+    double empty_p = 0.0;        // per tick: a stray empty tick (obs-side hiccup), card mode
+    uint64_t seed = 1;
+};
+
+struct BeatRun {
+    fps_beat beat{};             // at the end
+    double first_detect_s = -1;  // first whole second at which a beat was reported
+};
+
+static BeatRun run_beat(const BeatSim &s, double seconds)
+{
+    BeatRun br;
+    fps_core_params p = fps_core_params_defaults();
+    fps_core *c = fps_core_create(&p);
+    uint64_t rng = s.seed * 0x9E3779B97F4A7C15ull + 1;
+    auto rnd = [&rng]() {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        return (double)(rng >> 11) / 9007199254740992.0;
+    };
+
+    // Source frame k: when it is captured and which game image it shows.
+    std::vector<double> src_t;      // arrival time (s)
+    std::vector<long long> gid;     // game image id
+    long long game_img = 0;
+    auto ensure_src = [&](double until) {
+        while (src_t.empty() || src_t.back() < until + 1.0) {
+            size_t k = src_t.size();
+            double t;
+            if (k == 0) {
+                t = s.phase / s.src_hz;
+            } else {
+                double base = src_t.size() >= 1 ? src_t[k - 1] : 0.0;
+                double hz = (s.switch_s >= 0.0 && base >= s.switch_s) ? s.switch_hz : s.src_hz;
+                t = base + 1.0 / hz;
+            }
+            src_t.push_back(t);
+            bool hold = s.drop_p > 0.0 && rnd() < s.drop_p;
+            if (s.hitch_every_s > 0.0 && k > 0) {
+                double prev = src_t[k - 1];
+                hold = hold || floor(t / s.hitch_every_s) != floor(prev / s.hitch_every_s);
+            }
+            if (s.freeze_every_s > 0.0 && fmod(t, s.freeze_every_s) < s.freeze_len_s && t > s.freeze_every_s)
+                hold = true;
+            if (k % (size_t)s.game_div == 0 && !hold)
+                game_img++;
+            gid.push_back(game_img);
+        }
+    };
+    auto arrival = [&](size_t k) { return src_t[k] + (s.jitter_ms > 0.0 ? (rnd() - 0.5) * 2e-3 * s.jitter_ms : 0.0); };
+
+    std::vector<double> arr; // jittered arrival per source frame (obs mode)
+    long long prev_gid = -1;
+    size_t next_src = 0;
+    int last_reported = -1;
+    const uint64_t base_ns = 1000000000ull;
+    const long long nticks = (long long)(seconds * s.obs_hz);
+    for (long long n = 1; n <= nticks; n++) {
+        double t = n / s.obs_hz;
+        uint64_t now = base_ns + (uint64_t)(t * 1e9);
+        ensure_src(t);
+        int frames = 1;
+        long long shown;
+        if (s.card) {
+            // newest source frame captured by now
+            while (next_src + 1 < src_t.size() && src_t[next_src + 1] <= t)
+                next_src++;
+            shown = gid[next_src];
+            if (s.empty_p > 0.0 && rnd() < s.empty_p)
+                frames = 0;
+        } else {
+            while (arr.size() < src_t.size())
+                arr.push_back(arrival(arr.size()));
+            int count = 0;
+            size_t newest = next_src;
+            while (next_src < arr.size() && arr[next_src] <= t) {
+                newest = next_src;
+                next_src++;
+                count++;
+            }
+            frames = count ? 1 : 0;
+            shown = count ? gid[newest] : prev_gid;
+        }
+        if (frames) {
+            bool unique = shown != prev_gid;
+            fps_core_debug_feed_decision(c, unique, false, now);
+            prev_gid = shown;
+        }
+        fps_core_obs_tick(c, now, frames);
+        int sec = (int)t;
+        if (sec != last_reported) {
+            last_reported = sec;
+            fps_beat b{};
+            fps_core_get_beat(c, now, s.obs_hz, &b);
+            if (b.detected && br.first_detect_s < 0)
+                br.first_detect_s = t;
+        }
+    }
+    fps_core_get_beat(c, base_ns + (uint64_t)(seconds * 1e9), s.obs_hz, &br.beat);
+    fps_core_destroy(c);
+    return br;
+}
+
+static void b_report(Runner &r, const char *name, const BeatRun &br)
+{
+    if (r.verbose)
+        printf("    %s: detected=%d period %.3f s signal %.4f nominal %.4f origin %d chain %d clusters %d first %.1f s\n",
+               name, br.beat.detected, br.beat.period_s, br.beat.signal_hz, br.beat.nominal_hz, br.beat.origin,
+               br.beat.chain, br.beat.clusters, br.first_detect_s);
+}
+
+static void s23_capture_beat(Runner &r)
+{
+    r.begin("s23_capture_beat", fps_core_params_defaults());
+    if (!r.active()) return;
+    const double ntsc60 = 60000.0 / 1001.0;
+
+    {   // 59.94 console through a card that outputs 60 (Elgato 4K X at "60")
+        BeatSim s;
+        BeatRun br = run_beat(s, 120);
+        b_report(r, "card 59.94->60", br);
+        r.check(br.beat.detected, "card 59.94 into 60: beat detected");
+        r.check(fabs(br.beat.signal_hz - ntsc60) < 0.005, "card 59.94 into 60: signal %.4f Hz", br.beat.signal_hz);
+        r.check(br.beat.nominal_hz == ntsc60, "card 59.94 into 60: snapped to 59.94 (%.4f)", br.beat.nominal_hz);
+        r.check(br.beat.origin == FPS_BEAT_ORIGIN_CAPTURE, "card 59.94 into 60: origin is the capture device");
+        r.check(fabs(br.beat.period_s - 1001.0 / 60.0) < 0.1, "card 59.94 into 60: period %.3f s", br.beat.period_s);
+        r.check(br.first_detect_s > 0 && br.first_detect_s < 70, "card 59.94 into 60: detected after %.1f s",
+                br.first_detect_s);
+    }
+    // 59.94 source frames into OBS at 60 (unbuffered pick). The 4K X traces
+    // show bursts of ~0.4 s, i.e. about +-0.2 ms of arrival jitter; 1 ms
+    // spreads each burst over ~2 s.
+    for (double jit : {0.2, 1.0}) {
+        BeatSim s;
+        s.card = false;
+        s.jitter_ms = jit;
+        BeatRun br = run_beat(s, 120);
+        b_report(r, "obs 59.94->60", br);
+        r.check(br.beat.detected, "OBS 59.94 into 60, jitter %.1f ms: beat detected", jit);
+        r.check(br.beat.nominal_hz == ntsc60, "OBS 59.94 into 60, jitter %.1f ms: snapped to 59.94 (%.4f)", jit,
+                br.beat.signal_hz);
+        r.check(br.beat.origin == FPS_BEAT_ORIGIN_OBS, "OBS 59.94 into 60, jitter %.1f ms: origin is OBS", jit);
+        // four bursts (~50-67 s) at 0.2 ms; wide bursts fragment and take longer
+        double limit = jit < 0.5 ? 70.0 : 100.0;
+        r.check(br.first_detect_s > 0 && br.first_detect_s < limit,
+                "OBS 59.94 into 60, jitter %.1f ms: detected after %.1f s", jit, br.first_detect_s);
+        // the burst is timed at its centre, so the period stays sharp even when
+        // jitter spreads the burst over a second or two
+        r.check(fabs(br.beat.period_s - 1001.0 / 60.0) < 0.03, "OBS 59.94 into 60, jitter %.1f ms: period %.3f s", jit,
+                br.beat.period_s);
+    }
+    {   // matched 60 into 60, jitter away from the tick boundary: nothing
+        BeatSim s;
+        s.card = false;
+        s.src_hz = 60.0;
+        s.jitter_ms = 1.0;
+        BeatRun br = run_beat(s, 300);
+        b_report(r, "obs 60->60", br);
+        r.check(!br.beat.detected && br.beat.clusters == 0, "matched 60 into 60: no beat (%d clusters)",
+                br.beat.clusters);
+    }
+    {   // card at exactly 60: nothing
+        BeatSim s;
+        s.src_hz = 60.0;
+        BeatRun br = run_beat(s, 300);
+        r.check(!br.beat.detected && br.beat.clusters == 0, "card 60 into 60: no beat");
+    }
+    {   // 60 Hz source 50 ppm slow (two crystals): a beat every ~333 s, nominal 60
+        BeatSim s;
+        s.card = false;
+        s.src_hz = 60.0 * (1.0 - 50e-6);
+        s.jitter_ms = 0.05;
+        BeatRun br = run_beat(s, 2400); // five crossings, ~333 s apart
+        b_report(r, "obs 60-50ppm->60", br);
+        r.check(br.beat.detected, "clock drift 50 ppm: beat detected");
+        r.check(br.beat.nominal_hz == 60.0, "clock drift 50 ppm: nominal 60 (%.4f)", br.beat.nominal_hz);
+        r.check(fabs(br.beat.period_s - 1.0 / (60.0 * 50e-6)) < 5.0, "clock drift 50 ppm: period %.1f s",
+                br.beat.period_s);
+        // drift cannot be fixed in settings and is the easiest to fake, so it
+        // needs one crossing more than a 59.94/60 beat (four are at ~1170 s)
+        r.check(br.first_detect_s > 1300, "clock drift 50 ppm: not reported before a fifth crossing (%.0f s)",
+                br.first_detect_s);
+    }
+    {   // a game that drops the odd frame (one per ~8 s) on a matched pipeline
+        for (uint64_t seed = 1; seed <= 5; seed++) {
+            BeatSim s;
+            s.src_hz = 60.0;
+            s.drop_p = 1.0 / 480.0;
+            s.seed = seed;
+            BeatRun br = run_beat(s, 900);
+            b_report(r, "random drops", br);
+            r.check(!br.beat.detected && br.first_detect_s < 0,
+                    "random game drops (seed %llu): no beat (%d clusters, false alarm at %.1f s)",
+                    (unsigned long long)seed, br.beat.clusters, br.first_detect_s);
+        }
+    }
+    {   // game locked to 30 on a 60 pipeline: every other frame repeats
+        BeatSim s;
+        s.src_hz = 60.0;
+        s.game_div = 2;
+        BeatRun br = run_beat(s, 300);
+        r.check(!br.beat.detected && br.beat.clusters == 0, "game at 30 in 60: no beat (%d clusters)",
+                br.beat.clusters);
+    }
+    {   // 59.94 through the card plus a game that drops the odd frame
+        BeatSim s;
+        s.drop_p = 1.0 / 480.0;
+        s.seed = 7;
+        BeatRun br = run_beat(s, 300);
+        b_report(r, "card 59.94 + drops", br);
+        r.check(br.beat.detected && br.beat.nominal_hz == ntsc60,
+                "59.94 into 60 with random game drops: beat still detected at 59.94 (%.4f)", br.beat.signal_hz);
+    }
+    {   // a game that hitches on a 5 s timer: perfectly regular, but 60 - 1/5 =
+        // 59.8 Hz is no standard rate, so it is the game, not two clocks
+        BeatSim s;
+        s.src_hz = 60.0;
+        s.hitch_every_s = 5.0;
+        BeatRun br = run_beat(s, 300);
+        b_report(r, "5 s game hitch", br);
+        r.check(br.beat.clusters > 40, "5 s game hitch: the hitches do form clusters (%d)", br.beat.clusters);
+        r.check(!br.beat.detected && br.first_detect_s < 0, "5 s game hitch: no beat (not a standard-rate difference)");
+    }
+    {   // stray empty ticks (~1 per 20 s) plus a game dropping the odd frame:
+        // neither kind is regular on its own and they must not be chained together
+        for (uint64_t seed = 1; seed <= 4; seed++) {
+            BeatSim s;
+            s.src_hz = 60.0;
+            s.drop_p = 1.0 / 300.0;
+            s.empty_p = 1.0 / 1200.0;
+            s.seed = 100 + seed;
+            BeatRun br = run_beat(s, 900);
+            b_report(r, "stray empties + drops", br);
+            r.check(!br.beat.detected && br.first_detect_s < 0,
+                    "stray empty ticks + random drops (seed %llu): no beat (false alarm at %.1f s)",
+                    (unsigned long long)seed, br.first_detect_s);
+        }
+    }
+    {   // the game freezes for half a second every 16.68 s (a loading hitch on a
+        // timer that happens to look like 59.94 vs 60): a freeze is a stall,
+        // not a repeated frame, and must not count
+        BeatSim s;
+        s.src_hz = 60.0;
+        s.freeze_every_s = 1001.0 / 60.0;
+        s.freeze_len_s = 0.5;
+        BeatRun br = run_beat(s, 200);
+        b_report(r, "periodic freeze", br);
+        r.check(!br.beat.detected && br.first_detect_s < 0, "periodic 0.5 s freeze: no beat (%d clusters)",
+                br.beat.clusters);
+    }
+    {   // fixed after 90 s (source now matches): the verdict expires
+        BeatSim s;
+        s.switch_s = 90.0;
+        s.switch_hz = 60.0;
+        BeatRun at90 = run_beat(s, 89);
+        BeatRun later = run_beat(s, 160);
+        r.check(at90.beat.detected, "before the fix: beat detected");
+        r.check(!later.beat.detected, "70 s after the fix: the verdict has expired");
+    }
+    r.end(false);
+}
+#endif
+
 // --------------------------------------------------------------- main ----
 
 int main(int argc, char **argv)
@@ -1351,6 +1643,9 @@ int main(int argc, char **argv)
     s20_decision_replay(r);
     s21_below_clamp(r);
     s22_above_clamp(r);
+#ifdef FPS_SELFTEST_HAVE_CORE
+    s23_capture_beat(r);
+#endif
 
     printf(r.fails ? "RESULT: %d FAILURES\n" : "RESULT: ALL OK\n", r.fails);
     return r.fails;

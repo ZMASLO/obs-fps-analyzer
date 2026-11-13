@@ -6,6 +6,7 @@
 #include <string.h>
 #include <math.h>
 
+#include "fps-core.h"
 #include "fps-shared-data.h"
 
 // Declare filter info for registration
@@ -210,9 +211,55 @@ static void format_beat(double beat_s, char *buf, size_t size)
         snprintf(buf, size, "constantly");
 }
 
+// The cadence verdict: a frame repeats every P seconds although the game is
+// steady. Says which setting to change (OBS FPS, the device FPS, or both).
+static bool build_beat_text(char *text, size_t size)
+{
+    if (!g_fps_shared.beat_detected)
+        return false;
+    char sig[32], obs[32], dev[32], beat[32];
+    srate_format_hz(g_fps_shared.beat_signal_hz, sig, sizeof(sig));
+    srate_format_hz(g_fps_shared.srate_obs_hz, obs, sizeof(obs));
+    format_beat(g_fps_shared.beat_period_s, beat, sizeof(beat));
+    const char *who = g_fps_shared.beat_origin == FPS_BEAT_ORIGIN_OBS ? "OBS" : "capture device";
+
+    if (g_fps_shared.beat_drift) {
+        snprintf(text, size,
+                 "Signal ~%s Hz | OBS: %s FPS - %s repeats a frame %s\n"
+                 "Clock drift between source and PC, not fixable in settings",
+                 sig, obs, who, beat);
+        return true;
+    }
+
+    const double target = g_fps_shared.beat_signal_hz;
+    const bool need_obs = fabs(g_fps_shared.srate_obs_hz / target - 1.0) > 1e-4;
+    const bool need_dev = !g_fps_shared.device_matching && g_fps_shared.device_hz > 0.0 &&
+                          fabs(g_fps_shared.device_hz / target - 1.0) > 1e-4;
+    char line1[160];
+    if (g_fps_shared.device_hz > 0.0 && !g_fps_shared.device_matching) {
+        srate_format_hz(g_fps_shared.device_hz, dev, sizeof(dev));
+        snprintf(line1, sizeof(line1), "Signal ~%s Hz | Device: %s | OBS: %s FPS - %s repeats a frame %s", sig,
+                 dev, obs, who, beat);
+    } else {
+        snprintf(line1, sizeof(line1), "Signal ~%s Hz | OBS: %s FPS - %s repeats a frame %s", sig, obs, who,
+                 beat);
+    }
+    if (need_obs && need_dev)
+        snprintf(text, size, "%s\nSet the capture device FPS and OBS FPS to %s", line1, sig);
+    else if (need_dev)
+        snprintf(text, size, "%s\nSet the capture device FPS to %s (source properties)", line1, sig);
+    else if (need_obs)
+        snprintf(text, size, "%s\nSet OBS FPS to %s (Settings > Video)", line1, sig);
+    else
+        snprintf(text, size, "%s", line1);
+    return true;
+}
+
 static void build_srate_text(char *text, size_t size)
 {
     char src[32], obs[32], rec[32], beat[32];
+    if (build_beat_text(text, size))
+        return;
     if (!g_fps_shared.srate_available)
     {
         snprintf(text, size, "Source rate: n/a (not a capture device)");
@@ -1020,7 +1067,7 @@ static void fps_overlay_tick(void *data, float seconds)
 
         // Auto-hide: OK for 5 s -> hidden, anything else -> shown right away
         bool ok = g_fps_shared.srate_available && g_fps_shared.srate_valid &&
-                  g_fps_shared.srate_status == SRATE_STATUS_MATCHED;
+                  g_fps_shared.srate_status == SRATE_STATUS_MATCHED && !g_fps_shared.beat_detected;
         uint64_t now = os_gettime_ns();
         if (!ok)
             ctx->srate_ok_since_ns = 0;

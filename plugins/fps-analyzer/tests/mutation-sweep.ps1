@@ -21,6 +21,14 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# CMake z wingeta nie zawsze jest w PATH (alias pojawia sie dopiero w nowej sesji)
+if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
+    $wingetCmake = Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WinGet\Packages" -Recurse -Filter cmake.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $wingetCmake) { throw "Nie znaleziono cmake. Zainstaluj: winget install Kitware.CMake" }
+    Set-Alias cmake $wingetCmake.FullName
+}
+
 $repo = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
 $core = Join-Path $repo "plugins\fps-analyzer\fps-core.cpp"
 $bin = Join-Path $Build "plugins\fps-analyzer\Release"
@@ -49,12 +57,36 @@ $mutations = @(
     @{ name = "ROI ostatniej linii: h-1 na h-2";     find = 'roi_line = height - 1;'; repl = 'roi_line = height - 2;' },
     @{ name = "stale zeruje takze EMA";              find = 'c->frametime_pos = 0;' + $nl + '    }'; repl = 'c->frametime_pos = 0;' + $nl + '        c->ema_frametime = 0.0;' + $nl + '    }' },
     @{ name = "kolejnosc: tearing po agregacji";     find = 'c->tearing_detected = tearing;' + $nl + '    c->dbg.tearing_flag = tearing;'; repl = 'c->dbg.tearing_flag = tearing;' },
-    @{ name = "okno per-klatka bez clampu do count"; find = 'if (window > c->frametime_count) window = c->frametime_count;' + $nl + '        if (window < 1) window = 1;'; repl = 'if (window < 1) window = 1;' }
+    @{ name = "okno per-klatka bez clampu do count"; find = 'if (window > c->frametime_count) window = c->frametime_count;' + $nl + '        if (window < 1) window = 1;'; repl = 'if (window < 1) window = 1;' },
+    # Detektor dudnienia toru przechwytywania (s23_capture_beat + slady z 4K X)
+    @{ name = "dudnienie: bez dopasowania do standardu"; find = 'return; // not the difference of two standard clocks'; repl = '{} // snap ignored' },
+    @{ name = "dudnienie: znak sygnalu - na +";      find = 'delivery_hz - 1.0 / period : 0.0;'; repl = 'delivery_hz + 1.0 / period : 0.0;' },
+    @{ name = "dudnienie: wygasanie 3 okresy na 30"; find = '> 3.0 * period)'; repl = '> 30.0 * period)' },
+    @{ name = "dudnienie: czas klastra = 1. zdarzenie"; find = '(uint64_t)(b.cluster_sum_s / b.cluster_events * 1e9)'; repl = '(uint64_t)0' },
+    @{ name = "dudnienie: rodzaje klastrow razem";   find = 'if (b.obs[e] != obs)'; repl = 'if (false)' },
+    @{ name = "dudnienie: brak zastoju";             find = 'b.cluster_stall = true;'; repl = '(void)0;' },
+    @{ name = "dudnienie: duplikat bez czystego ciagu"; find = 'beat_event(c, now, false, b.clean_frames >= FPS_BEAT_CLEAN_RUN, b.run_dup);'; repl = 'beat_event(c, now, false, true, b.run_dup);';
+       equivalent = 'gra ponizej tempa dostarczania daje ciagly klaster, ktory i tak odrzuca limit FPS_BEAT_MAX_EVENTS; regula zostaje jako druga zapora' },
+    @{ name = "dudnienie: pusty tick nie jest zdarzeniem"; find = 'if (frames == 0) {'; repl = 'if (frames == -5) {' }
 )
 
 function Run-Layer([string]$exe, [string[]]$argv) {
-    $out = & $exe @argv 2>&1
-    return @{ code = $LASTEXITCODE; text = ($out -join "`n") }
+    # Smart App Control (Windows 11) moze zablokowac swiezo zlinkowany,
+    # niepodpisany plik - kazda nowa wersja dostaje osobna ocene. Wtedy
+    # linkujemy go od nowa, zamiast liczyc blokade jako "test zlapal".
+    # stderr narzedzia (np. FAIL) nie moze przerwac skryptu w PowerShellu 5.1
+    $ErrorActionPreference = "Continue"
+    for ($try = 1; $try -le 6; $try++) {
+        try {
+            if ($argv -and $argv.Count -gt 0) { $out = & $exe @argv 2>&1 } else { $out = & $exe 2>&1 }
+            return @{ code = $LASTEXITCODE; text = ($out -join "`n") }
+        } catch [System.Management.Automation.ApplicationFailedException] {
+            $target = [System.IO.Path]::GetFileNameWithoutExtension($exe)
+            Remove-Item $exe -ErrorAction SilentlyContinue
+            & cmake --build $Build --config Release --target $target 2>&1 | Out-Null
+        }
+    }
+    throw "$exe jest wciaz blokowany przez kontrole aplikacji"
 }
 
 # Czytaj i pisz bajtami przez .NET: Set-Content -Encoding utf8 w PowerShellu 5.1

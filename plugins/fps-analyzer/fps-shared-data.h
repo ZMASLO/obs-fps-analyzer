@@ -38,6 +38,15 @@ struct fps_shared_data {
     double srate_obs_hz;         // OBS canvas FPS
     double srate_beat_s;         // seconds between duplicates/skips, 0 = none
     double srate_recommended_hz; // OBS FPS that would match, 0 = none
+    // Capture-path beat from the frame cadence (fps-core.h) — works where the
+    // device's timestamps only echo its configured rate (Elgato 4K X)
+    bool beat_detected;
+    int beat_origin;             // FPS_BEAT_ORIGIN_* (OBS / capture device)
+    double beat_period_s;
+    double beat_signal_hz;       // standard rate the signal snapped to (raw estimate if none)
+    bool beat_drift;             // signal and OBS share a nominal rate: crystal drift
+    double device_hz;            // capture device FPS setting, 0 = unknown / highest
+    bool device_matching;        // device set to "Match output FPS"
 };
 
 // Defined in fps-analyzer-filter.cpp

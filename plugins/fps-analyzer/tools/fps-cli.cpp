@@ -1,7 +1,8 @@
 // fps-cli — replays recorded material through the FPS analysis core.
 //
 // Today it replays traces recorded by the plugin's "Record FPS trace" debug
-// option (fpstrace v2). Every row of a trace is a decision the live plugin
+// option (fpstrace v2 and v3; v3 adds the source frame timestamp to F rows
+// and per-tick K rows, which replay ignores). Every row of a trace is a decision the live plugin
 // made, with the timestamp it made it at, so feeding those decisions into a
 // freshly created core must reproduce the recorded frametimes, EMA values and
 // published ticks exactly. That is the proof that the extracted core behaves
@@ -74,6 +75,8 @@ struct TraceHeader {
     std::string plugin, path, fmt;
     fps_core_params params = fps_core_params_defaults();
     uint32_t w = 0, h = 0;
+    double obs_hz = 0.0;            // v3: obs_fps=num/den
+    long long dev_interval = 0;     // v3: capture device frame interval, 100 ns units (0 = unknown)
 };
 
 // "# fpstrace v2 ; plugin=0.5.0 ; path=async ; method=0 ; sens=0.1 ; ..."
@@ -107,6 +110,12 @@ static bool parse_header(const std::string &line, TraceHeader &out, std::string 
         else if (k == "interval") out.params.update_interval = strtod(val.c_str(), nullptr);
         else if (k == "w") out.w = (uint32_t)atoi(val.c_str());
         else if (k == "h") out.h = (uint32_t)atoi(val.c_str());
+        else if (k == "obs_fps") {
+            double num = strtod(val.c_str(), nullptr);
+            size_t sl = val.find('/');
+            double den = sl == std::string::npos ? 1.0 : strtod(val.c_str() + sl + 1, nullptr);
+            out.obs_hz = den > 0.0 ? num / den : 0.0;
+        } else if (k == "dev_interval") out.dev_interval = strtoll(val.c_str(), nullptr, 10);
     }
     return true;
 }
@@ -135,6 +144,8 @@ struct ReplayResult {
     int fps_min = 0, fps_max = 0;
     double fps_sum = 0.0;
     std::vector<Publish> pubs;   // for the fps@/ft@/tear@ expectations
+    int k_rows = 0;              // v3 per-tick rows fed to the beat detector
+    struct fps_beat beat = {};   // verdict at the end of the trace (beat= / nobeat)
     TraceHeader header;
     std::vector<Mismatch> mismatches;
 };
@@ -306,11 +317,23 @@ static ReplayResult replay_trace(const fs::path &path, double tol, bool verbose)
             if (verbose)
                 printf("    T line %d: fps %d, frametime %.3f ms, window %d, graph %d\n", lineno, out.fps,
                        out.frametime_ms, out.window, out.graph_count);
+        } else if (f[0] == "K") {
+            // K,now_ns,video_time_ns,frames (v3): one OBS tick on an async source
+            if (f.size() < 4) {
+                r.error = "short K row at line " + std::to_string(lineno);
+                break;
+            }
+            uint64_t now = (uint64_t)ll(f, 1);
+            fps_core_obs_tick(core, now, ival(f, 3));
+            r.k_rows++;
+            last_ns = now > last_ns ? now : last_ns;
         }
     }
 
-    if (core)
+    if (core) {
+        fps_core_get_beat(core, last_ns, r.header.obs_hz, &r.beat);
         fps_core_destroy(core);
+    }
     if (r.error.empty() && !have_header)
         r.error = "no fpstrace header found";
     r.span_s = last_ns > first_ns ? (double)(last_ns - first_ns) / 1e9 : 0.0;
@@ -333,6 +356,13 @@ static void print_result(const fs::path &path, const ReplayResult &r)
     if (r.span_s > 0.0)
         printf("  unique frames/s %.2f, published FPS min %d max %d avg %.1f\n", r.uniques / r.span_s, r.fps_min,
                r.fps_max, r.ticks ? r.fps_sum / r.ticks : 0.0);
+    if (r.beat.detected)
+        printf("  capture beat: repeat every %.2f s (%s), signal ~%.3f Hz (%.3f) at OBS %.3f FPS; chain %d of %d "
+               "clusters\n",
+               r.beat.period_s, r.beat.origin == FPS_BEAT_ORIGIN_OBS ? "OBS" : "capture device", r.beat.signal_hz,
+               r.beat.nominal_hz, r.header.obs_hz, r.beat.chain, r.beat.clusters);
+    else
+        printf("  capture beat: none (%d clusters%s)\n", r.beat.clusters, r.k_rows ? "" : ", no K rows");
     if (r.mismatches.empty()) {
         printf("  [PASS] the core reproduced every recorded frame and tick exactly\n");
         return;
@@ -821,6 +851,25 @@ static int run_manifest(const fs::path &manifest, double tol, bool verbose, bool
                 std::string spec = trim(raw);
                 if (spec.empty() || spec == "self")
                     continue;
+                // Capture-path beat verdict at the end of the trace:
+                // "nobeat", or "beat=59.94+-0.01" (the estimated signal rate)
+                if (spec == "nobeat") {
+                    bool good = !r.beat.detected;
+                    printf("  %s nobeat\n", good ? "[ok]" : "[FAIL]");
+                    ok = ok && good;
+                    continue;
+                }
+                if (spec.rfind("beat=", 0) == 0) {
+                    std::string val = spec.substr(5);
+                    size_t pm = val.find("+-");
+                    double want = strtod(val.substr(0, pm).c_str(), nullptr);
+                    double tolb = pm == std::string::npos ? 0.01 : strtod(val.substr(pm + 2).c_str(), nullptr);
+                    bool good = r.beat.detected && fabs(r.beat.signal_hz - want) <= tolb;
+                    printf("  %s %s: %s\n", good ? "[ok]" : "[FAIL]", spec.c_str(),
+                           r.beat.detected ? ("signal " + num(r.beat.signal_hz) + " Hz").c_str() : "no beat");
+                    ok = ok && good;
+                    continue;
+                }
                 Expect e;
                 std::string perr;
                 if (!parse_expect(spec, e, perr)) {

@@ -23,6 +23,9 @@
 #                                byte for byte (--update-goldens rewrites it)
 #                 self           traces only: the recorded ticks must be
 #                                reproduced exactly
+#                 beat=HZ+-T     traces only (v3): at the end the capture-path
+#                                beat detector reports a signal of HZ within T
+#                 nobeat         traces only: no beat reported
 #                 prefix "xfail:" marks a known limitation: reported, but not
 #                                counted as a regression
 #
@@ -58,4 +61,6 @@ trace:traces/static_menu.csv ; ; self ; static menu, no motion, covers the stale
 trace:traces/tearing.csv     ; ; self ; VSync off, camera motion, tearing detection active
 trace:traces/interval1s.csv  ; ; self ; as fps60 but with the update interval set to 1 s
 trace:traces/diff_mode.csv   ; ; self ; as fps60 but with the full frame diff analysis method
-trace:traces/gamecap60.csv   ; ; self, fps@3-21=60+-1 ; game capture of a 60 fps game, 2560x1440 BGRA through the sync render path; 22 s, 1316 unique frames, 60.01 per second
+trace:traces/gamecap60.csv   ; ; self, fps@3-21=60+-1, nobeat ; game capture of a 60 fps game, 2560x1440 BGRA through the sync render path; 22 s, 1316 unique frames, 60.01 per second
+trace:traces/4kx_dev60_obs60_ps5.csv   ; ; self, beat=59.94+-0.01   ; Elgato 4K X, device 60 / OBS 60, PS5 at 59.94 Hz (GTA V, locked 60): the card repeats a frame every 16.68 s while its timestamps claim a perfect 60.000 Hz
+trace:traces/4kx_dev5994_obs60_ps5.csv ; ; self, beat=59.94+-0.01   ; Elgato 4K X, device 59.94 / OBS 60, PS5 at 59.94 Hz: OBS repeats (and drops) frames in bursts every ~16.7 s
