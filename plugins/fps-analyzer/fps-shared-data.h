@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "resolution-detector.h"
+#include "source-rate.h"
 
 #define FPS_GRAPH_HISTORY 960
 
@@ -29,6 +30,14 @@ struct fps_shared_data {
     int res_status;           // RESDET_STATUS_* (detected / no signature / periodic-unreliable)
     uint8_t res_spectrum[RESDET_SPEC_W * RESDET_SPEC_H]; // DCT log-magnitude thumbnail
     uint32_t res_spectrum_version; // bumped when res_spectrum changes (0 = none yet)
+    // Real source refresh rate vs OBS FPS (source-rate.h)
+    bool srate_available;        // filter sits on an async source (has frame timestamps)
+    bool srate_valid;            // window long enough for a verdict
+    int srate_status;            // SRATE_STATUS_*
+    double srate_source_hz;      // measured (preliminary while measuring)
+    double srate_obs_hz;         // OBS canvas FPS
+    double srate_beat_s;         // seconds between duplicates/skips, 0 = none
+    double srate_recommended_hz; // OBS FPS that would match, 0 = none
 };
 
 // Defined in fps-analyzer-filter.cpp

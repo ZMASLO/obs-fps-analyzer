@@ -10,8 +10,16 @@
 
 param(
     [switch]$UpdateGoldens,
-    [string]$ObsPrefix = "C:\Sources\obs-studio\build\libobs;C:\Sources\obs-studio\build\deps\w32-pthreads"
+    [string]$ObsPrefix = "C:/Soruces/obs-sdk;C:/Soruces/obs-sdk-build/obs-src/.deps/obs-deps-2026-10-23-x64"
 )
+
+# CMake z wingeta nie zawsze jest w PATH (alias pojawia sie dopiero w nowej sesji)
+if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
+    $wingetCmake = Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WinGet\Packages" -Recurse -Filter cmake.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $wingetCmake) { Write-Host "Nie znaleziono cmake. Zainstaluj: winget install Kitware.CMake" -ForegroundColor Red; exit 1 }
+    Set-Alias cmake $wingetCmake.FullName
+    Set-Alias ctest (Join-Path $wingetCmake.DirectoryName "ctest.exe")
+}
 
 $ErrorActionPreference = "Stop"
 $repo = $PSScriptRoot
@@ -22,7 +30,7 @@ cmake -S $repo -B $build -G "Visual Studio 17 2022" -A x64 -DCMAKE_PREFIX_PATH="
 if ($LASTEXITCODE -ne 0) { Write-Host "Konfiguracja nie powiodla sie." -ForegroundColor Red; exit 1 }
 
 Write-Host "=== Budowanie narzedzi testowych (Release) ===" -ForegroundColor Cyan
-cmake --build $build --config Release --target fps-selftest fps-cli resdet-selftest
+cmake --build $build --config Release --target fps-selftest fps-cli resdet-selftest srate-selftest
 if ($LASTEXITCODE -ne 0) { Write-Host "Build nie powiodl sie." -ForegroundColor Red; exit 1 }
 
 if ($UpdateGoldens) {

@@ -3,6 +3,7 @@ add_library(fps-analyzer MODULE
     fps-core.cpp
     fps-analyzer-overlay.cpp
     resolution-detector.cpp
+    source-rate.cpp
     kissfft/kiss_fft.c
     kissfft/kiss_fftr.c
 )
@@ -38,6 +39,14 @@ if(FPS_ANALYZER_BUILD_TOOLS)
         endif()
     endforeach()
 
+    # Source refresh rate estimator suite
+    add_executable(srate-selftest tools/srate-selftest.cpp source-rate.cpp)
+    target_include_directories(srate-selftest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(srate-selftest PRIVATE cxx_std_20)
+    target_compile_definitions(srate-selftest PRIVATE _CRT_SECURE_NO_WARNINGS)
+    find_package(Threads REQUIRED)
+    target_link_libraries(srate-selftest PRIVATE Threads::Threads)
+
     # `ctest -C Release` runs these; run-tests.ps1 and the CI workflow call it.
     # resdet-selftest writes spectrum_*.bmp next to itself, so keep its working
     # directory inside the build tree.
@@ -48,4 +57,5 @@ if(FPS_ANALYZER_BUILD_TOOLS)
     # not present are reported as skipped, so this passes before any are added.
     add_test(NAME fps-fixtures COMMAND fps-cli --manifest
              ${CMAKE_CURRENT_SOURCE_DIR}/tests/cases.txt)
+    add_test(NAME srate-selftest COMMAND srate-selftest)
 endif()
