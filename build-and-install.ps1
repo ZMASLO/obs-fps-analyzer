@@ -3,7 +3,15 @@
 
 $ErrorActionPreference = "Stop"
 $repo = $PSScriptRoot
-$obsPrefix = "C:\Sources\obs-studio\build\libobs;C:\Sources\obs-studio\build\deps\w32-pthreads"
+# SDK libobs 33.0.1 (cmake --install --component Development) + obs-deps pobrane przez CMake OBS-a
+$obsPrefix = "C:/Soruces/obs-sdk;C:/Soruces/obs-sdk-build/obs-src/.deps/obs-deps-2026-10-23-x64"
+
+# CMake z wingeta nie zawsze jest w PATH (alias pojawia sie dopiero w nowej sesji)
+if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
+    $wingetCmake = Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WinGet\Packages" -Recurse -Filter cmake.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $wingetCmake) { Write-Host "Nie znaleziono cmake. Zainstaluj: winget install Kitware.CMake" -ForegroundColor Red; exit 1 }
+    Set-Alias cmake $wingetCmake.FullName
+}
 $dll = "$repo\build\plugins\fps-analyzer\Release\fps-analyzer.dll"
 $dest = "C:\Program Files\obs-studio\obs-plugins\64bit"
 
