@@ -13,6 +13,7 @@
 // Exit code = number of failures.
 
 #include "fps-core.h"
+#include "plot-layout.h"
 #include "fps-ref-v050.h"
 
 #include <cmath>
@@ -1807,6 +1808,102 @@ static void s25_frame_pacing(Runner &r)
     }
 }
 
+// --- s26: graph geometry on a time axis (plot-layout) ---
+static struct plot_ring g_s26_ring; // large: kept off the stack
+
+// Frames of the given durations (ms), repeated, ending exactly at end_ms
+static void s26_fill(struct plot_ring *r, const std::vector<double> &pattern, int frames, double end_ms)
+{
+    plot_ring_clear(r);
+    std::vector<double> ft;
+    for (int i = 0; i < frames; i++)
+        ft.push_back(pattern[(size_t)i % pattern.size()]);
+    double t = end_ms;
+    std::vector<double> ts(frames);
+    for (int i = frames - 1; i >= 0; i--) {
+        ts[(size_t)i] = t;
+        t -= ft[(size_t)i];
+    }
+    for (int i = 0; i < frames; i++) {
+        struct plot_sample s = {};
+        s.t_ms = ts[(size_t)i];
+        s.ft_ms = ft[(size_t)i];
+        s.pacing_ms = ft[(size_t)i];
+        plot_ring_push(r, &s);
+    }
+}
+
+static void s26_plot_layout(Runner &r)
+{
+    r.begin("s26_plot_layout", fps_core_params_defaults());
+    static struct plot_span spans[FPS_PLOT_CAP];
+    const double now = 1000000.0;
+    const double P = 1000.0 / 59.94;
+    {   // fixed pixels per second whatever the frame rate: 30 and 60 FPS, 10 s in 1000 px
+        bool ok = true;
+        for (double ft : {2 * P, P}) {
+            s26_fill(&g_s26_ring, {ft}, 2000, now);
+            int n = plot_window(&g_s26_ring, now, 10.0, 1000.0f, spans, FPS_PLOT_CAP);
+            for (int i = 1; i < n; i++) // the first one may be clipped at the left edge
+                ok = ok && fabs((spans[i].x1 - spans[i].x0) - ft * 0.1) < 0.01;
+        }
+        r.check(ok, "30 and 60 FPS: every frame is as wide as its time (0.1 px per ms)");
+    }
+    {   // judder: a 50 ms frame is three times as wide as a 16.7 ms one
+        s26_fill(&g_s26_ring, {P, 3 * P}, 600, now);
+        int n = plot_window(&g_s26_ring, now, 5.0, 900.0f, spans, FPS_PLOT_CAP);
+        bool ok = n > 10;
+        for (int i = 2; i + 1 < n; i += 2) {
+            double a = spans[i].x1 - spans[i].x0, b = spans[i + 1].x1 - spans[i + 1].x0;
+            double small = a < b ? a : b, big = a < b ? b : a;
+            ok = ok && fabs(big / small - 3.0) < 0.01;
+        }
+        r.check(ok, "judder 16.7 / 50 ms: the long frames are exactly 3x as wide");
+    }
+    {   // the window: only the last 5 s, the right edge is now, older samples in the ring stay off
+        s26_fill(&g_s26_ring, {2 * P}, 1200, now); // 40 s in the ring
+        int n = plot_window(&g_s26_ring, now, 5.0, 500.0f, spans, FPS_PLOT_CAP);
+        const struct plot_sample *first = plot_ring_at(&g_s26_ring, spans[0].idx);
+        bool in = first->t_ms > now - 5000.0;
+        const struct plot_sample *before = plot_ring_at(&g_s26_ring, spans[0].idx - 1);
+        bool prev_out = before && before->t_ms <= now - 5000.0;
+        r.check(in && prev_out && fabs(spans[n - 1].x1 - 500.0f) < 0.01 && spans[0].x0 >= 0.0f &&
+                    n >= 149 && n <= 151,
+                "5 s window: %d frames of 1200, right edge at now (%.2f), nothing older", n, spans[n - 1].x1);
+    }
+    {   // a 20 s window shows twice the time in the same width
+        s26_fill(&g_s26_ring, {2 * P}, 1200, now);
+        int n10 = plot_window(&g_s26_ring, now, 10.0, 1000.0f, spans, FPS_PLOT_CAP);
+        float w10 = spans[n10 - 1].x1 - spans[n10 - 1].x0;
+        int n20 = plot_window(&g_s26_ring, now, 20.0, 1000.0f, spans, FPS_PLOT_CAP);
+        float w20 = spans[n20 - 1].x1 - spans[n20 - 1].x0;
+        r.check(abs(n20 - 2 * n10) <= 2 && fabs(w10 / w20 - 2.0) < 0.01,
+                "20 s window: twice the frames (%d vs %d), half as wide", n20, n10);
+    }
+    {   // the axis: normal 0 at the bottom, inverted (Digital Foundry) 0 at the top
+        float n16 = plot_value_y(16.7, 100.0, 100.0f, false), n50 = plot_value_y(50.0, 100.0, 100.0f, false);
+        float i16 = plot_value_y(16.7, 100.0, 100.0f, true), i50 = plot_value_y(50.0, 100.0, 100.0f, true);
+        r.check(n16 > n50 && i16 < i50 && fabs(i16 - 16.7f) < 0.01 && fabs(n16 - 83.3f) < 0.01,
+                "axis: normal puts 50 ms above 16.7, inverted below (%.1f / %.1f)", i16, i50);
+        r.check(plot_value_y(500.0, 100.0, 100.0f, true) == 100.0f && plot_value_y(-5.0, 100.0, 100.0f, false) == 100.0f,
+                "values beyond the scale are clipped at the edge");
+    }
+    {   // the ring wraps and keeps the order
+        plot_ring_clear(&g_s26_ring);
+        for (int i = 0; i < FPS_PLOT_CAP + 1808; i++) {
+            struct plot_sample s = {};
+            s.t_ms = i;
+            s.ft_ms = 1.0;
+            plot_ring_push(&g_s26_ring, &s);
+        }
+        bool ordered = g_s26_ring.count == FPS_PLOT_CAP && plot_ring_at(&g_s26_ring, 0)->t_ms == 1808.0;
+        for (int i = 1; i < g_s26_ring.count && ordered; i++)
+            ordered = plot_ring_at(&g_s26_ring, i)->t_ms > plot_ring_at(&g_s26_ring, i - 1)->t_ms;
+        r.check(ordered && plot_ring_at(&g_s26_ring, FPS_PLOT_CAP) == nullptr,
+                "ring: full at %d, oldest dropped first, order kept", FPS_PLOT_CAP);
+    }
+}
+
 static void s23_capture_beat(Runner &r)
 {
     r.begin("s23_capture_beat", fps_core_params_defaults());
@@ -2141,6 +2238,7 @@ int main(int argc, char **argv)
     s23_capture_beat(r);
     s24_altered_frames(r);
     s25_frame_pacing(r);
+    s26_plot_layout(r);
 #endif
 
     printf(r.fails ? "RESULT: %d FAILURES\n" : "RESULT: ALL OK\n", r.fails);

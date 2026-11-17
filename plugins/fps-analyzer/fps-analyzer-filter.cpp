@@ -753,6 +753,21 @@ static void analyze_frame(struct fps_analyzer_filter *filter, const struct fps_f
     fps_core_feed(filter->core, view, now);
     if (filter->trace_file)
         trace_write_frame(filter, now);
+
+    // A new game frame: one sample on the graphs' time axis
+    struct fps_core_frame_debug d;
+    fps_core_debug_last_frame(filter->core, &d);
+    if (d.sample_written && g_fps_shared.blocked_reason == FPS_BLOCK_NONE) {
+        struct plot_sample s;
+        s.t_ms = (double)now / 1e6;
+        s.ft_ms = d.ft_ms;
+        s.ema_ms = d.ema;
+        s.fps_pf = d.fps_pf;
+        s.pacing_ms = d.pacing_ms;
+        s.gap = d.pacing_gap;
+        s.tearing = d.tearing_flag;
+        plot_ring_push(&g_fps_shared.plot, &s);
+    }
 }
 
 // --- Async source path (filter_video) ---
@@ -1207,6 +1222,7 @@ static void fps_analyzer_video_tick(void *data, float seconds)
     if (gen != filter->history_gen_seen) {
         filter->history_gen_seen = gen;
         fps_core_clear_history(filter->core);
+        plot_ring_clear(&g_fps_shared.plot);
         g_fps_shared.graph_count = 0;
         g_fps_shared.fps = 0;
         g_fps_shared.frametime_ms = 0.0;
@@ -1283,6 +1299,7 @@ static void fps_analyzer_video_tick(void *data, float seconds)
         g_fps_shared.frametime_ms = 0.0;
         g_fps_shared.tearing_detected = false;
         g_fps_shared.graph_count = 0;
+        plot_ring_clear(&g_fps_shared.plot);
         g_fps_shared.last_update_ns = now;
         publish_source_rate(filter, now);
         return;

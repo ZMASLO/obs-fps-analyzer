@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include "resolution-detector.h"
 #include "source-rate.h"
+#include "plot-layout.h"
 
 #define FPS_GRAPH_HISTORY 960
 
@@ -36,6 +37,9 @@ struct fps_shared_data {
     bool graph_tearing[FPS_GRAPH_HISTORY];
     double graph_pacing[FPS_GRAPH_HISTORY];     // frame pacing per game frame, unsmoothed (ms)
     bool graph_pacing_gap[FPS_GRAPH_HISTORY];   // the capture device lost a frame in this sample
+    // The overlay's graphs: one time-stamped sample per new game frame
+    // (plot-layout.h). Each graph shows its own window of it.
+    struct plot_ring plot;
     int graph_count;
     // Upscale source resolution detection (DCT spectral analysis)
     bool res_detect_enabled;  // filter checkbox state

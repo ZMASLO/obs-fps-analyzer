@@ -90,7 +90,14 @@ $mutations = @(
     @{ name = "pacing: bez przeniesienia na nastepna";    find = 'c->carry_gap = c->frame_after_gap;'; repl = 'c->carry_gap = false;' },
     @{ name = "pacing: sync bez zaokraglenia";            find = 'return k * per;'; repl = 'return ft_ms;' },
     @{ name = "reset historii: czysci tez werdykt";       find = "    c->carry_gap = false;`n    c->last_published_fps = 0;"; repl = "    c->carry_gap = false;`n    c->last_published_fps = 0;`n    altered_reset(c);" },
-    @{ name = "reset historii: zostawia probki";          find = "    c->frametime_count = 0;`n    c->ema_frametime = 0.0;"; repl = "    c->ema_frametime = 0.0;" }
+    @{ name = "reset historii: zostawia probki";          find = "    c->frametime_count = 0;`n    c->ema_frametime = 0.0;"; repl = "    c->ema_frametime = 0.0;" },
+    # Wykresy w czasie (plot-layout.cpp): okno, skala czasu, os odwrocona, pierscien
+    @{ name = "wykres: okno 2x dluzsze";                 file = "plot-layout.cpp"; find = 'const double window_ms = window_s * 1000.0;'; repl = 'const double window_ms = window_s * 2000.0;' },
+    @{ name = "wykres: os X z indeksu zamiast czasu";     file = "plot-layout.cpp"; find = 'double x0 = (s->t_ms - s->ft_ms - start_ms) * px_per_ms;'; repl = 'double x0 = x1 - 1.0;' },
+    @{ name = "wykres: brak odwrocenia osi";              file = "plot-layout.cpp"; find = 'return (float)(inverted ? f * height : (1.0 - f) * height);'; repl = 'return (float)((1.0 - f) * height);' },
+    @{ name = "wykres: bez przyciecia wartosci";          file = "plot-layout.cpp"; find = '    if (f > 1.0)'; repl = '    if (f > 100.0)' },
+    @{ name = "wykres: stare probki w oknie";             file = "plot-layout.cpp"; find = 'if (s->t_ms <= start_ms)'; repl = 'if (s->t_ms <= start_ms - 1000.0)' },
+    @{ name = "wykres: pierscien bez zawijania";          file = "plot-layout.cpp"; find = 'int idx = (r->head - r->count + i + FPS_PLOT_CAP) % FPS_PLOT_CAP;'; repl = 'int idx = i % FPS_PLOT_CAP;' }
 )
 
 function Run-Layer([string]$exe, [string[]]$argv) {
@@ -119,7 +126,14 @@ $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 function Read-Source([string]$path) { [System.IO.File]::ReadAllText($path, $utf8NoBom) }
 function Write-Source([string]$path, [string]$text) { [System.IO.File]::WriteAllText($path, $text, $utf8NoBom) }
 
-$original = Read-Source $core
+# A mutation edits fps-core.cpp unless it names another source file (`file`).
+# Every mutated file is restored right after its run and once more at the end.
+$originals = @{}
+function Target-Of($m) { if ($m.file) { Join-Path (Split-Path $core) $m.file } else { $core } }
+foreach ($m in $mutations) {
+    $t = Target-Of $m
+    if (-not $originals.ContainsKey($t)) { $originals[$t] = Read-Source $t }
+}
 $results = @()
 $i = 0
 
@@ -131,7 +145,8 @@ try {
         $equivalent = $m.equivalent
 
         # Pliki maja konce linii LF albo CRLF zaleznie od checkoutu - sprobuj obu.
-        $text = $original
+        $target = Target-Of $m
+        $text = $originals[$target]
         $found = $text.Contains($find)
         if (-not $found) {
             $lf = $find.Replace("`r`n", "`n"); $rl = $repl.Replace("`r`n", "`n")
@@ -147,9 +162,10 @@ try {
             continue
         }
 
-        Write-Source $core $text.Replace($find, $repl)
+        Write-Source $target $text.Replace($find, $repl)
         & cmake --build $Build --config Release --target fps-selftest fps-cli 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) {
+            Write-Source $target $originals[$target]
             Write-Host ("{0,2}. {1,-42} NIE KOMPILUJE SIE" -f $i, $name) -ForegroundColor DarkYellow
             $results += [pscustomobject]@{ n = $i; name = $name; core = "-"; diff = "-"; clips = "-"; verdict = "NOBUILD" }
             continue
@@ -158,6 +174,7 @@ try {
         $rCore  = Run-Layer "$bin\fps-selftest.exe" @("--impl", "core")
         $rDiff  = Run-Layer "$bin\fps-selftest.exe" @()
         $rClips = Run-Layer "$bin\fps-cli.exe" @("--manifest", $manifest)
+        Write-Source $target $originals[$target]
 
         $c = if ($rCore.code -ne 0) { "lapie" } else { "PRZECHODZI" }
         $d = if ($rDiff.code -ne 0) { "lapie" } else { "PRZECHODZI" }
@@ -178,7 +195,7 @@ try {
         $results += [pscustomobject]@{ n = $i; name = $name; core = $c; diff = $d; clips = $l; verdict = $verdict }
     }
 } finally {
-    Write-Source $core $original
+    foreach ($t in $originals.Keys) { Write-Source $t $originals[$t] }
     & cmake --build $Build --config Release --target fps-selftest fps-cli 2>&1 | Out-Null
 }
 

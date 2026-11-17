@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <stdlib.h>
+#include <algorithm>
 
 #include "fps-core.h"
 #include "fps-shared-data.h"
@@ -23,9 +25,10 @@ void fps_analyzer_unregister_hotkeys(void);
 // Graph styles
 #define GRAPH_STYLE_BIG 0
 #define GRAPH_STYLE_COMPACT 1
+#define GRAPH_STYLE_CUSTOM 2
 
 // Big: 1920x360
-#define BIG_PLOT_W 1920
+#define BIG_PLOT_W (1920 - 2 * GRAPH_MARGIN - GRAPH_LEGEND_WIDTH) // labels fit a 1920 canvas
 #define BIG_PLOT_H 360
 // Compact: 300x80
 #define COMPACT_PLOT_W 300
@@ -56,6 +59,11 @@ struct fps_overlay_source
     bool show_fps_graph;
     int pacing_style;
     double pacing_scale; // 0 = auto, otherwise fixed max in ms
+    // Per graph: custom size (GRAPH_STYLE_CUSTOM), time window, inverted axis
+    int pacing_width, pacing_height, frametime_width, frametime_height, fps_width, fps_height;
+    double pacing_window, frametime_window, fps_window; // seconds shown
+    bool pacing_invert, frametime_invert;
+    double pc_label_step; // frame pacing grid label step in use (follows the game's frame time)
     int frametime_style; // GRAPH_STYLE_BIG or GRAPH_STYLE_COMPACT
     int fps_style;
     double frametime_scale; // 0 = auto, otherwise fixed max (e.g. 16.67, 33.33)
@@ -529,9 +537,15 @@ static void build_grid_labels(obs_source_t **labels, double *values, int *out_co
     }
 }
 
-static void get_graph_dims(int style, int *pw, int *ph, int *total_w, int *total_h)
+static void get_graph_dims(int style, int *pw, int *ph, int *total_w, int *total_h, int custom_w = 0,
+                           int custom_h = 0)
 {
-    if (style == GRAPH_STYLE_COMPACT)
+    if (style == GRAPH_STYLE_CUSTOM && custom_w > 0 && custom_h > 0)
+    {
+        *pw = custom_w;
+        *ph = custom_h;
+    }
+    else if (style == GRAPH_STYLE_COMPACT)
     {
         *pw = COMPACT_PLOT_W;
         *ph = COMPACT_PLOT_H;
@@ -545,27 +559,39 @@ static void get_graph_dims(int style, int *pw, int *ph, int *total_w, int *total
     *total_h = GRAPH_MARGIN + *ph + GRAPH_MARGIN;
 }
 
-// --- Graph rendering ---
+// --- Graph rendering (time axis) ---
 
-// ref_label1/ref_label2: text sources for reference line labels
-// max_override: if >0, use as fixed Y-axis max; if 0, auto-scale
-// ref_step: distance between reference lines (e.g. 10 for every 10 units). 0 = no grid.
-static void render_line_graph(const double *values, int count,
-                              double ref_step,
-                              bool show_tearing, bool higher_is_better,
-                              double green_thresh, double yellow_thresh,
-                              double max_override,
-                              obs_source_t **grid_labels, double *grid_values, int grid_count,
-                              int style, bool stepped = false, const bool *gaps = NULL)
+enum plot_field { PLOT_PACING = 0, PLOT_FRAMETIME = 1, PLOT_FPS = 2 };
+
+static double plot_field_value(const struct plot_sample *s, int field)
 {
-    if (count < 2)
-        return;
+    switch (field) {
+    case PLOT_PACING: return s->pacing_ms;
+    case PLOT_FRAMETIME: return s->ema_ms;
+    default: return s->fps_pf;
+    }
+}
 
+// One graph panel: the last window_s seconds of g_fps_shared.plot, the right
+// edge is now. stepped: each sample is a flat step as wide as the frame was
+// on screen (frame pacing); otherwise a line through the samples. inverted:
+// 0 at the top (Digital Foundry's frame-time graph). max_override > 0 fixes
+// the scale; 0 scales to the samples in the window (+10 %), pacing_auto picks
+// 50 / 66.67 / 100 ms instead.
+static void render_time_graph(int field, double ref_step, bool show_tearing, bool higher_is_better,
+                              double green_thresh, double yellow_thresh, double max_override, bool pacing_auto,
+                              obs_source_t **grid_labels, double *grid_values, int grid_count, int style,
+                              int custom_w, int custom_h, double window_s, bool inverted, bool stepped)
+{
     int gw, gh, total_w, total_h;
-    get_graph_dims(style, &gw, &gh, &total_w, &total_h);
-    float step = (float)gw / (float)(FPS_GRAPH_HISTORY - 1);
+    get_graph_dims(style, &gw, &gh, &total_w, &total_h, custom_w, custom_h);
 
-    // Y-axis scaling
+    static struct plot_span spans[FPS_PLOT_CAP];
+    const double now_ms = (double)os_gettime_ns() / 1e6;
+    const struct plot_ring *ring = &g_fps_shared.plot;
+    int n = plot_window(ring, now_ms, window_s, (float)gw, spans, FPS_PLOT_CAP);
+
+    // Y-axis scaling from the samples on screen
     double max_val;
     if (max_override > 0)
     {
@@ -573,13 +599,17 @@ static void render_line_graph(const double *values, int count,
     }
     else
     {
-        max_val = 1.0;
-        for (int i = 0; i < count; i++)
+        double hi = 0.0;
+        for (int i = 0; i < n; i++)
         {
-            if (values[i] > max_val)
-                max_val = values[i];
+            double v = plot_field_value(plot_ring_at(ring, spans[i].idx), field);
+            if (v > hi)
+                hi = v;
         }
-        max_val *= 1.1; // 10% headroom
+        if (pacing_auto)
+            max_val = hi <= 48.0 ? 50.0 : hi <= 64.0 ? 66.67 : 100.0;
+        else
+            max_val = hi > 1.0 ? hi * 1.1 : 1.1; // 10% headroom
     }
 
     gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
@@ -591,8 +621,6 @@ static void render_line_graph(const double *values, int count,
         return;
 
     struct vec4 col;
-
-    // === PASS 1: All solid geometry ===
     gs_technique_begin(tech);
     gs_technique_begin_pass(tech, 0);
 
@@ -601,13 +629,11 @@ static void render_line_graph(const double *values, int count,
     gs_effect_set_vec4(color_param, &col);
     gs_draw_sprite(0, 0, (uint32_t)total_w, (uint32_t)total_h);
 
-    // Enter plot area
     gs_matrix_push();
     gs_matrix_translate3f((float)GRAPH_MARGIN, (float)GRAPH_MARGIN, 0.0f);
 
-    // Reference grid lines (including 0 at bottom). At most ~12: an auto scale
-    // stretched by one long sample would otherwise draw hundreds of them,
-    // which merge into a grey block.
+    // Reference grid lines. At most ~12: an auto scale stretched by one long
+    // sample would otherwise draw hundreds of them, merging into a grey block.
     double grid_step = ref_step;
     while (grid_step > 0 && max_val / grid_step > 12.0)
         grid_step *= 2.0;
@@ -615,10 +641,9 @@ static void render_line_graph(const double *values, int count,
     {
         vec4_set(&col, 1.0f, 1.0f, 1.0f, 0.15f);
         gs_effect_set_vec4(color_param, &col);
-        for (int n = 0; n * grid_step <= max_val + 0.01; n++)
+        for (int k = 0; k * grid_step <= max_val + 0.01; k++)
         {
-            double v = n * grid_step;
-            int y_ref = gh - (int)((v / max_val) * gh);
+            int y_ref = (int)plot_value_y(k * grid_step, max_val, (float)gh, inverted);
             if (y_ref >= 0 && y_ref < gh)
             {
                 gs_matrix_push();
@@ -629,156 +654,128 @@ static void render_line_graph(const double *values, int count,
         }
     }
 
-    // Tearing indicators
-    int data_offset = FPS_GRAPH_HISTORY - count;
+    // Tearing indicators: a band over the frame's time span
     if (show_tearing)
     {
         vec4_set(&col, 1.0f, 0.0f, 0.0f, 0.4f);
         gs_effect_set_vec4(color_param, &col);
-        for (int i = 0; i < count; i++)
+        for (int i = 0; i < n; i++)
         {
-            if (g_fps_shared.graph_tearing[i])
-            {
-                float x = (float)(data_offset + i) * step;
-                int seg_w = (int)(step + 1.0f);
-                if (seg_w < 2)
-                    seg_w = 2;
-                gs_matrix_push();
-                gs_matrix_translate3f(x, 0.0f, 0.0f);
-                gs_draw_sprite(0, 0, (uint32_t)seg_w, (uint32_t)gh);
-                gs_matrix_pop();
-            }
-        }
-    }
-
-    // Stepped (frame pacing, Digital Foundry style): each game frame is a
-    // flat segment as long as it stayed on screen, a change is a vertical
-    // jump. A sample in which the capture device lost a frame is grey: its
-    // value is not the game's pacing.
-    if (stepped)
-    {
-        for (int i = 0; i < count; i++)
-        {
-            double v = values[i];
-            float x0 = (float)(data_offset + i) * step;
-            float x1 = (float)(data_offset + i + 1) * step;
-            float fy = (float)(gh - (v / max_val) * gh);
-            if (fy < 0)
-                fy = 0;
-            if (fy > gh - LINE_THICKNESS)
-                fy = (float)(gh - LINE_THICKNESS);
-            if (gaps && gaps[i])
-                vec4_set(&col, 0.55f, 0.55f, 0.55f, 1.0f);
-            else if (v <= green_thresh + 0.05)
-                vec4_set(&col, 0.0f, 1.0f, 0.0f, 1.0f);
-            else if (v <= yellow_thresh + 0.05)
-                vec4_set(&col, 1.0f, 1.0f, 0.0f, 1.0f);
-            else
-                vec4_set(&col, 1.0f, 0.0f, 0.0f, 1.0f);
-            gs_effect_set_vec4(color_param, &col);
-            float seg_w = x1 - x0;
-            if (seg_w < 1.0f)
-                seg_w = 1.0f;
+            if (!plot_ring_at(ring, spans[i].idx)->tearing)
+                continue;
+            float w = spans[i].x1 - spans[i].x0;
+            if (w < 2.0f)
+                w = 2.0f;
             gs_matrix_push();
-            gs_matrix_translate3f(x0, fy, 0.0f);
-            gs_draw_sprite(0, 0, (uint32_t)(seg_w + 1.0f), (uint32_t)LINE_THICKNESS);
+            gs_matrix_translate3f(spans[i].x0, 0.0f, 0.0f);
+            gs_draw_sprite(0, 0, (uint32_t)w, (uint32_t)gh);
             gs_matrix_pop();
-            if (i + 1 < count)
-            {
-                float ny = (float)(gh - (values[i + 1] / max_val) * gh);
-                if (ny < 0)
-                    ny = 0;
-                if (ny > gh - LINE_THICKNESS)
-                    ny = (float)(gh - LINE_THICKNESS);
-                float top = fy < ny ? fy : ny;
-                float bot = fy > ny ? fy : ny;
-                gs_matrix_push();
-                gs_matrix_translate3f(x1, top, 0.0f);
-                gs_draw_sprite(0, 0, (uint32_t)LINE_THICKNESS, (uint32_t)(bot - top + LINE_THICKNESS));
-                gs_matrix_pop();
-            }
         }
     }
 
-    // Data line
-    for (int i = 0; i < count - 1 && !stepped; i++)
-    {
-        double v0 = values[i];
-        double v1 = values[i + 1];
-        float x0 = (float)(data_offset + i) * step;
-        float x1 = (float)(data_offset + i + 1) * step;
-        float fy0 = (float)(gh - (v0 / max_val) * gh);
-        float fy1 = (float)(gh - (v1 / max_val) * gh);
-        if (fy0 < 0)
-            fy0 = 0;
-        if (fy0 > gh)
-            fy0 = (float)gh;
-        if (fy1 < 0)
-            fy1 = 0;
-        if (fy1 > gh)
-            fy1 = (float)gh;
-
-        double v_worst = higher_is_better ? (v0 < v1 ? v0 : v1) : (v0 > v1 ? v0 : v1);
-        if (higher_is_better)
+    auto set_color = [&](double v, bool gap) {
+        if (gap)
+            vec4_set(&col, 0.55f, 0.55f, 0.55f, 1.0f);
+        else if (higher_is_better)
         {
-            if (v_worst >= green_thresh)
+            if (v >= green_thresh)
                 vec4_set(&col, 0.0f, 1.0f, 0.0f, 1.0f);
-            else if (v_worst >= yellow_thresh)
+            else if (v >= yellow_thresh)
                 vec4_set(&col, 1.0f, 1.0f, 0.0f, 1.0f);
             else
                 vec4_set(&col, 1.0f, 0.0f, 0.0f, 1.0f);
         }
         else
         {
-            if (v_worst <= green_thresh)
+            if (v <= green_thresh + 0.05)
                 vec4_set(&col, 0.0f, 1.0f, 0.0f, 1.0f);
-            else if (v_worst <= yellow_thresh)
+            else if (v <= yellow_thresh + 0.05)
                 vec4_set(&col, 1.0f, 1.0f, 0.0f, 1.0f);
             else
                 vec4_set(&col, 1.0f, 0.0f, 0.0f, 1.0f);
         }
         gs_effect_set_vec4(color_param, &col);
+    };
+    const float ymax = (float)(gh - LINE_THICKNESS);
+    auto yof = [&](double v) {
+        float y = plot_value_y(v, max_val, (float)gh, inverted);
+        return y > ymax ? ymax : y;
+    };
 
-        float top = fy0 < fy1 ? fy0 : fy1;
-        float bot = fy0 > fy1 ? fy0 : fy1;
-        float seg_h = bot - top;
-        if (seg_h < LINE_THICKNESS)
-            seg_h = (float)LINE_THICKNESS;
-        float seg_w = x1 - x0;
-        if (seg_w < 1.0f)
-            seg_w = 1.0f;
-
-        gs_matrix_push();
-        gs_matrix_translate3f(x0, top, 0.0f);
-        gs_draw_sprite(0, 0, (uint32_t)(seg_w + 1.0f), (uint32_t)seg_h);
-        gs_matrix_pop();
+    if (stepped)
+    {
+        // Each frame a flat step as wide as it was on screen, a jump between them
+        for (int i = 0; i < n; i++)
+        {
+            const struct plot_sample *s = plot_ring_at(ring, spans[i].idx);
+            double v = plot_field_value(s, field);
+            float y = yof(v);
+            set_color(v, s->gap);
+            float w = spans[i].x1 - spans[i].x0;
+            if (w < 1.0f)
+                w = 1.0f;
+            gs_matrix_push();
+            gs_matrix_translate3f(spans[i].x0, y, 0.0f);
+            gs_draw_sprite(0, 0, (uint32_t)(w + 1.0f), (uint32_t)LINE_THICKNESS);
+            gs_matrix_pop();
+            if (i + 1 < n)
+            {
+                float ny = yof(plot_field_value(plot_ring_at(ring, spans[i + 1].idx), field));
+                float top = y < ny ? y : ny;
+                float bot = y > ny ? y : ny;
+                gs_matrix_push();
+                gs_matrix_translate3f(spans[i + 1].x0, top, 0.0f);
+                gs_draw_sprite(0, 0, (uint32_t)LINE_THICKNESS, (uint32_t)(bot - top + LINE_THICKNESS));
+                gs_matrix_pop();
+            }
+        }
+    }
+    else
+    {
+        // A line through the samples (each at the end of its frame)
+        for (int i = 0; i + 1 < n; i++)
+        {
+            double v0 = plot_field_value(plot_ring_at(ring, spans[i].idx), field);
+            double v1 = plot_field_value(plot_ring_at(ring, spans[i + 1].idx), field);
+            float x0 = spans[i].x1, x1 = spans[i + 1].x1;
+            float y0 = yof(v0), y1 = yof(v1);
+            double worst = higher_is_better ? (v0 < v1 ? v0 : v1) : (v0 > v1 ? v0 : v1);
+            set_color(worst, false);
+            float top = y0 < y1 ? y0 : y1;
+            float bot = y0 > y1 ? y0 : y1;
+            float seg_h = bot - top;
+            if (seg_h < LINE_THICKNESS)
+                seg_h = (float)LINE_THICKNESS;
+            float seg_w = x1 - x0;
+            if (seg_w < 1.0f)
+                seg_w = 1.0f;
+            gs_matrix_push();
+            gs_matrix_translate3f(x0, top, 0.0f);
+            gs_draw_sprite(0, 0, (uint32_t)(seg_w + 1.0f), (uint32_t)seg_h);
+            gs_matrix_pop();
+        }
     }
 
-    // Leave plot area
     gs_matrix_pop();
-
     gs_technique_end_pass(tech);
     gs_technique_end(tech);
 
-    // Grid labels — rendered right of plot area; one that would overlap the
-    // previous one (a compact graph, a wide scale) is skipped
+    // Grid labels right of the plot; one that would overlap the previous one
+    // (a small graph, a wide scale) is skipped
     int last_label_y = -100000;
     for (int g = 0; g < grid_count; g++)
     {
         if (!grid_labels[g])
             continue;
-        double v = grid_values[g];
-        int y_ref = gh - (int)((v / max_val) * gh);
-        if (y_ref < 0 || y_ref >= gh)
+        int y_ref = (int)plot_value_y(grid_values[g], max_val, (float)gh, inverted);
+        if (grid_values[g] > max_val + 0.01 || y_ref < 0 || y_ref > gh)
             continue;
-
         uint32_t lh = obs_source_get_height(grid_labels[g]);
         if (abs(y_ref - last_label_y) < (int)lh)
             continue;
         last_label_y = y_ref;
         gs_matrix_push();
-        gs_matrix_translate3f((float)(GRAPH_MARGIN + gw + 8),
-                              (float)(GRAPH_MARGIN + y_ref - (int)lh / 2), 0.0f);
+        gs_matrix_translate3f((float)(GRAPH_MARGIN + gw + 8), (float)(GRAPH_MARGIN + y_ref - (int)lh / 2), 0.0f);
         obs_source_video_render(grid_labels[g]);
         gs_matrix_pop();
     }
@@ -788,7 +785,8 @@ static void rebuild_grid_labels(struct fps_overlay_source *ctx)
 {
     // Frame pacing grid — refresh periods
     double pc_max = ctx->pacing_scale > 0 ? ctx->pacing_scale : 100.0; // auto tops out at 100
-    double pc_step = (pc_max > 33.33) ? (1000.0 / 60.0) : (1000.0 / 120.0);
+    double pc_step = ctx->pc_label_step > 0 ? ctx->pc_label_step
+                     : (pc_max > 33.33) ? (1000.0 / 60.0) : (1000.0 / 120.0);
     build_grid_labels(ctx->pc_grid_labels, ctx->pc_grid_values, &ctx->pc_grid_count,
                       pc_step, pc_max, true);
 
@@ -826,6 +824,17 @@ static void *fps_overlay_create(obs_data_t *settings, obs_source_t *source)
     ctx->show_pacing_graph = obs_data_get_bool(settings, "show_pacing_graph");
     ctx->pacing_style = (int)obs_data_get_int(settings, "pacing_style");
     ctx->pacing_scale = obs_data_get_double(settings, "pacing_scale");
+    ctx->pacing_width = (int)obs_data_get_int(settings, "pacing_width");
+    ctx->pacing_height = (int)obs_data_get_int(settings, "pacing_height");
+    ctx->frametime_width = (int)obs_data_get_int(settings, "frametime_width");
+    ctx->frametime_height = (int)obs_data_get_int(settings, "frametime_height");
+    ctx->fps_width = (int)obs_data_get_int(settings, "fps_width");
+    ctx->fps_height = (int)obs_data_get_int(settings, "fps_height");
+    ctx->pacing_window = obs_data_get_double(settings, "pacing_window");
+    ctx->frametime_window = obs_data_get_double(settings, "frametime_window");
+    ctx->fps_window = obs_data_get_double(settings, "fps_window");
+    ctx->pacing_invert = obs_data_get_bool(settings, "pacing_invert");
+    ctx->frametime_invert = obs_data_get_bool(settings, "frametime_invert");
     ctx->show_frametime_graph = obs_data_get_bool(settings, "show_frametime_graph");
     ctx->frametime_style = (int)obs_data_get_int(settings, "frametime_style");
     ctx->show_fps_graph = obs_data_get_bool(settings, "show_fps_graph");
@@ -910,21 +919,63 @@ static void fps_overlay_destroy(void *data)
 static bool graph_toggle_modified(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
 {
     UNUSED_PARAMETER(p);
-    bool pc_on = obs_data_get_bool(settings, "show_pacing_graph");
-    bool ft_on = obs_data_get_bool(settings, "show_frametime_graph");
-    bool fps_on = obs_data_get_bool(settings, "show_fps_graph");
-    obs_property_set_visible(obs_properties_get(props, "pacing_style"), pc_on);
-    obs_property_set_visible(obs_properties_get(props, "pacing_scale"), pc_on);
-    obs_property_set_visible(obs_properties_get(props, "frametime_style"), ft_on);
-    obs_property_set_visible(obs_properties_get(props, "frametime_scale"), ft_on);
-    obs_property_set_visible(obs_properties_get(props, "fps_style"), fps_on);
-    obs_property_set_visible(obs_properties_get(props, "fps_scale"), fps_on);
+    static const char *const graphs[3][2] = {
+        {"pacing", "show_pacing_graph"}, {"frametime", "show_frametime_graph"}, {"fps", "show_fps_graph"}};
+    for (int g = 0; g < 3; g++)
+    {
+        const char *pre = graphs[g][0];
+        bool on = obs_data_get_bool(settings, graphs[g][1]);
+        char key[64];
+        snprintf(key, sizeof(key), "%s_style", pre);
+        bool custom = on && obs_data_get_int(settings, key) == GRAPH_STYLE_CUSTOM;
+        static const char *const fields[] = {"style", "scale", "window", "invert"};
+        for (const char *f : fields)
+        {
+            snprintf(key, sizeof(key), "%s_%s", pre, f);
+            obs_property_t *pr = obs_properties_get(props, key);
+            if (pr)
+                obs_property_set_visible(pr, on);
+        }
+        snprintf(key, sizeof(key), "%s_width", pre);
+        obs_property_set_visible(obs_properties_get(props, key), custom);
+        snprintf(key, sizeof(key), "%s_height", pre);
+        obs_property_set_visible(obs_properties_get(props, key), custom);
+    }
     return true;
+}
+
+// Size (Custom), time window and inverted axis of one graph
+static void add_graph_extras(obs_properties_t *props, const char *pre, const char *title, bool with_invert)
+{
+    char key[64], name[96];
+    snprintf(key, sizeof(key), "%s_width", pre);
+    snprintf(name, sizeof(name), "%s graph width (px)", title);
+    obs_properties_add_int(props, key, name, 100, 3840, 10);
+    snprintf(key, sizeof(key), "%s_height", pre);
+    snprintf(name, sizeof(name), "%s graph height (px)", title);
+    obs_properties_add_int(props, key, name, 40, 2160, 10);
+    snprintf(key, sizeof(key), "%s_window", pre);
+    snprintf(name, sizeof(name), "%s time window", title);
+    obs_property_t *w = obs_properties_add_list(props, key, name, OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_FLOAT);
+    obs_property_list_add_float(w, "3 s", 3.0);
+    obs_property_list_add_float(w, "5 s", 5.0);
+    obs_property_list_add_float(w, "10 s", 10.0);
+    obs_property_list_add_float(w, "20 s", 20.0);
+    obs_property_list_add_float(w, "30 s", 30.0);
+    obs_property_list_add_float(w, "60 s", 60.0);
+    obs_property_set_long_description(w,
+        "How many seconds the graph shows; the right edge is now. The scale is fixed in "
+        "time, so a 50 ms frame is always three times as wide as a 16.7 ms one.");
+    if (with_invert)
+    {
+        snprintf(key, sizeof(key), "%s_invert", pre);
+        snprintf(name, sizeof(name), "%s: long frames down (Digital Foundry style)", title);
+        obs_properties_add_bool(props, key, name);
+    }
 }
 
 static obs_properties_t *fps_overlay_properties(void *data)
 {
-    UNUSED_PARAMETER(data);
     obs_properties_t *props = obs_properties_create();
 
     obs_property_t *font = obs_properties_add_list(
@@ -975,6 +1026,8 @@ static obs_properties_t *fps_overlay_properties(void *data)
         OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
     obs_property_list_add_int(pc_style, "Big (1920x360)", GRAPH_STYLE_BIG);
     obs_property_list_add_int(pc_style, "Compact (300x80)", GRAPH_STYLE_COMPACT);
+    obs_property_list_add_int(pc_style, "Custom", GRAPH_STYLE_CUSTOM);
+    obs_property_set_modified_callback(pc_style, graph_toggle_modified);
 
     obs_property_t *pc_scale = obs_properties_add_list(
         props, "pacing_scale", "Frame pacing scale",
@@ -984,6 +1037,7 @@ static obs_properties_t *fps_overlay_properties(void *data)
     obs_property_list_add_float(pc_scale, "50 ms", 50.0);
     obs_property_list_add_float(pc_scale, "66.67 ms", 66.67);
     obs_property_list_add_float(pc_scale, "100 ms", 100.0);
+    add_graph_extras(props, "pacing", "Frame pacing", true);
 
     obs_property_t *ft_toggle = obs_properties_add_bool(props, "show_frametime_graph", "Show frametime graph");
     obs_property_set_modified_callback(ft_toggle, graph_toggle_modified);
@@ -993,6 +1047,8 @@ static obs_properties_t *fps_overlay_properties(void *data)
         OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
     obs_property_list_add_int(ft_style, "Big (1920x360)", GRAPH_STYLE_BIG);
     obs_property_list_add_int(ft_style, "Compact (300x80)", GRAPH_STYLE_COMPACT);
+    obs_property_list_add_int(ft_style, "Custom", GRAPH_STYLE_CUSTOM);
+    obs_property_set_modified_callback(ft_style, graph_toggle_modified);
 
     obs_property_t *ft_scale = obs_properties_add_list(
         props, "frametime_scale", "Frametime scale",
@@ -1001,6 +1057,7 @@ static obs_properties_t *fps_overlay_properties(void *data)
     obs_property_list_add_float(ft_scale, "16.67 ms", 16.67);
     obs_property_list_add_float(ft_scale, "33.33 ms", 33.33);
     obs_property_list_add_float(ft_scale, "66.67 ms", 66.67);
+    add_graph_extras(props, "frametime", "Frametime", true);
 
     obs_property_t *fps_toggle = obs_properties_add_bool(props, "show_fps_graph", "Show framerate graph");
     obs_property_set_modified_callback(fps_toggle, graph_toggle_modified);
@@ -1010,6 +1067,8 @@ static obs_properties_t *fps_overlay_properties(void *data)
         OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
     obs_property_list_add_int(fps_style_prop, "Big (1920x360)", GRAPH_STYLE_BIG);
     obs_property_list_add_int(fps_style_prop, "Compact (300x80)", GRAPH_STYLE_COMPACT);
+    obs_property_list_add_int(fps_style_prop, "Custom", GRAPH_STYLE_CUSTOM);
+    obs_property_set_modified_callback(fps_style_prop, graph_toggle_modified);
 
     obs_property_t *fps_scale = obs_properties_add_list(
         props, "fps_scale", "Framerate scale",
@@ -1018,17 +1077,15 @@ static obs_properties_t *fps_overlay_properties(void *data)
     obs_property_list_add_float(fps_scale, "120 FPS", 120.0);
     obs_property_list_add_float(fps_scale, "60 FPS", 60.0);
     obs_property_list_add_float(fps_scale, "30 FPS", 30.0);
+    add_graph_extras(props, "fps", "Framerate", false);
 
     // Initial visibility
-    bool pc_on = data ? ((struct fps_overlay_source *)data)->show_pacing_graph : false;
-    obs_property_set_visible(pc_style, pc_on);
-    obs_property_set_visible(pc_scale, pc_on);
-    bool ft_on = data ? ((struct fps_overlay_source *)data)->show_frametime_graph : false;
-    bool fps_on = data ? ((struct fps_overlay_source *)data)->show_fps_graph : false;
-    obs_property_set_visible(ft_style, ft_on);
-    obs_property_set_visible(ft_scale, ft_on);
-    obs_property_set_visible(fps_style_prop, fps_on);
-    obs_property_set_visible(fps_scale, fps_on);
+    obs_data_t *cur = data ? obs_source_get_settings(((struct fps_overlay_source *)data)->self) : NULL;
+    if (cur)
+    {
+        graph_toggle_modified(props, NULL, cur);
+        obs_data_release(cur);
+    }
 
     return props;
 }
@@ -1053,6 +1110,18 @@ static void fps_overlay_get_defaults(obs_data_t *settings)
     obs_data_set_default_bool(settings, "show_fps_graph", true);
     obs_data_set_default_int(settings, "fps_style", GRAPH_STYLE_COMPACT);
     obs_data_set_default_double(settings, "fps_scale", 0.0);
+    // per graph: custom size, time window (frame graphs half the framerate's), axis
+    obs_data_set_default_int(settings, "pacing_width", 350);
+    obs_data_set_default_int(settings, "pacing_height", 120);
+    obs_data_set_default_int(settings, "frametime_width", 350);
+    obs_data_set_default_int(settings, "frametime_height", 120);
+    obs_data_set_default_int(settings, "fps_width", 1800);
+    obs_data_set_default_int(settings, "fps_height", 200);
+    obs_data_set_default_double(settings, "pacing_window", 10.0);
+    obs_data_set_default_double(settings, "frametime_window", 10.0);
+    obs_data_set_default_double(settings, "fps_window", 20.0);
+    obs_data_set_default_bool(settings, "pacing_invert", true);
+    obs_data_set_default_bool(settings, "frametime_invert", false);
 }
 
 static void fps_overlay_update(void *data, obs_data_t *settings)
@@ -1069,6 +1138,17 @@ static void fps_overlay_update(void *data, obs_data_t *settings)
     ctx->show_pacing_graph = obs_data_get_bool(settings, "show_pacing_graph");
     ctx->pacing_style = (int)obs_data_get_int(settings, "pacing_style");
     ctx->pacing_scale = obs_data_get_double(settings, "pacing_scale");
+    ctx->pacing_width = (int)obs_data_get_int(settings, "pacing_width");
+    ctx->pacing_height = (int)obs_data_get_int(settings, "pacing_height");
+    ctx->frametime_width = (int)obs_data_get_int(settings, "frametime_width");
+    ctx->frametime_height = (int)obs_data_get_int(settings, "frametime_height");
+    ctx->fps_width = (int)obs_data_get_int(settings, "fps_width");
+    ctx->fps_height = (int)obs_data_get_int(settings, "fps_height");
+    ctx->pacing_window = obs_data_get_double(settings, "pacing_window");
+    ctx->frametime_window = obs_data_get_double(settings, "frametime_window");
+    ctx->fps_window = obs_data_get_double(settings, "fps_window");
+    ctx->pacing_invert = obs_data_get_bool(settings, "pacing_invert");
+    ctx->frametime_invert = obs_data_get_bool(settings, "frametime_invert");
     ctx->show_frametime_graph = obs_data_get_bool(settings, "show_frametime_graph");
     ctx->frametime_style = (int)obs_data_get_int(settings, "frametime_style");
     ctx->show_fps_graph = obs_data_get_bool(settings, "show_fps_graph");
@@ -1219,6 +1299,31 @@ static void fps_overlay_tick(void *data, float seconds)
         }
     }
 
+    // Frame pacing labels follow the game's frame time, like Digital Foundry's
+    // 33.0 / 66.3 / 99.6 for a 30 or 20 FPS game: every 33.3 ms when the
+    // typical frame is that long, every 16.7 ms otherwise
+    if (ctx->show_pacing_graph)
+    {
+        static struct plot_span spans[FPS_PLOT_CAP];
+        static double vals[FPS_PLOT_CAP];
+        int n = plot_window(&g_fps_shared.plot, (double)os_gettime_ns() / 1e6, ctx->pacing_window, 1000.0f,
+                            spans, FPS_PLOT_CAP);
+        for (int i = 0; i < n; i++)
+            vals[i] = plot_ring_at(&g_fps_shared.plot, spans[i].idx)->pacing_ms;
+        double step = 1000.0 / 60.0;
+        if (n > 0)
+        {
+            std::nth_element(vals, vals + n / 2, vals + n);
+            if (vals[n / 2] >= 30.0)
+                step = 1000.0 / 30.0;
+        }
+        if (fabs(step - ctx->pc_label_step) > 0.01)
+        {
+            ctx->pc_label_step = step;
+            rebuild_grid_labels(ctx);
+        }
+    }
+
     // Source refresh rate line — relabel only on change. Showing it is what
     // makes the filter compute it (srate_wanted_ns): hidden, it costs nothing.
     if (ctx->show_source_rate && obs_source_active(ctx->self))
@@ -1259,9 +1364,8 @@ static void fps_overlay_render(void *data, gs_effect_t *effect)
 {
     UNUSED_PARAMETER(effect);
     struct fps_overlay_source *ctx = (struct fps_overlay_source *)data;
-    int count = g_fps_shared.graph_count;
     bool any_graph = (ctx->show_pacing_graph || ctx->show_frametime_graph || ctx->show_fps_graph) &&
-                     count >= 2;
+                     g_fps_shared.plot.count >= 2;
     bool show_spec = spectrum_visible(ctx);
 
     // 1. Render text at top with margin
@@ -1314,23 +1418,12 @@ static void fps_overlay_render(void *data, gs_effect_t *effect)
         gs_matrix_push();
         gs_matrix_translate3f(0.0f, (float)y_offset, 0.0f);
         double pc_step = (ctx->pacing_scale > 0 && ctx->pacing_scale <= 33.33) ? 8.33 : 16.67;
-        // Auto: the smallest of 50 / 66.67 / 100 ms that holds the frames, capped at
-        // 100 ms like Digital Foundry's graph; a longer frame (a pause, the source
-        // starting) is clipped at the top instead of flattening everything else.
-        double pc_max = ctx->pacing_scale;
-        if (pc_max <= 0)
-        {
-            double hi = 0;
-            for (int i = 0; i < count; i++)
-                if (g_fps_shared.graph_pacing[i] > hi)
-                    hi = g_fps_shared.graph_pacing[i];
-            pc_max = hi <= 48.0 ? 50.0 : hi <= 64.0 ? 66.67 : 100.0;
-        }
-        render_line_graph(g_fps_shared.graph_pacing, count,
-                          pc_step, false, false, 16.67, 33.33,
-                          pc_max,
-                          ctx->pc_grid_labels, ctx->pc_grid_values, ctx->pc_grid_count,
-                          ctx->pacing_style, true, g_fps_shared.graph_pacing_gap);
+        // Auto scale: 50 / 66.67 / 100 ms (Digital Foundry's graph tops out at 100); a
+        // longer frame (a pause, the source starting) is clipped at the edge.
+        render_time_graph(PLOT_PACING, pc_step, false, false, 16.67, 33.33, ctx->pacing_scale,
+                          ctx->pacing_scale <= 0, ctx->pc_grid_labels, ctx->pc_grid_values,
+                          ctx->pc_grid_count, ctx->pacing_style, ctx->pacing_width, ctx->pacing_height,
+                          ctx->pacing_window, ctx->pacing_invert, true);
         if (ctx->label_pacing)
         {
             gs_matrix_push();
@@ -1341,7 +1434,7 @@ static void fps_overlay_render(void *data, gs_effect_t *effect)
         gs_matrix_pop();
         {
             int pw, ph, tw, th;
-            get_graph_dims(ctx->pacing_style, &pw, &ph, &tw, &th);
+            get_graph_dims(ctx->pacing_style, &pw, &ph, &tw, &th, ctx->pacing_width, ctx->pacing_height);
             y_offset += th + GRAPH_MARGIN;
         }
     }
@@ -1353,11 +1446,10 @@ static void fps_overlay_render(void *data, gs_effect_t *effect)
         gs_matrix_translate3f(0.0f, (float)y_offset, 0.0f);
         double ft_step = (ctx->frametime_scale > 33.33) ? 16.67 : 8.33;
 
-        render_line_graph(g_fps_shared.graph_frametimes, count,
-                          ft_step, true, false, 16.67, 33.33,
-                          ctx->frametime_scale,
-                          ctx->ft_grid_labels, ctx->ft_grid_values, ctx->ft_grid_count,
-                          ctx->frametime_style);
+        render_time_graph(PLOT_FRAMETIME, ft_step, true, false, 16.67, 33.33, ctx->frametime_scale, false,
+                          ctx->ft_grid_labels, ctx->ft_grid_values, ctx->ft_grid_count, ctx->frametime_style,
+                          ctx->frametime_width, ctx->frametime_height, ctx->frametime_window,
+                          ctx->frametime_invert, false);
         // Title label
         if (ctx->label_frametime)
         {
@@ -1369,7 +1461,7 @@ static void fps_overlay_render(void *data, gs_effect_t *effect)
         gs_matrix_pop();
         {
             int pw, ph, tw, th;
-            get_graph_dims(ctx->frametime_style, &pw, &ph, &tw, &th);
+            get_graph_dims(ctx->frametime_style, &pw, &ph, &tw, &th, ctx->frametime_width, ctx->frametime_height);
             y_offset += th + GRAPH_MARGIN;
         }
     }
@@ -1390,11 +1482,9 @@ static void fps_overlay_render(void *data, gs_effect_t *effect)
         else
             fps_step = 10.0; // auto: every 10 FPS
 
-        render_line_graph(g_fps_shared.graph_fps, count,
-                          fps_step, true, true, 60.0, 30.0,
-                          ctx->fps_scale,
-                          ctx->fps_grid_labels, ctx->fps_grid_values, ctx->fps_grid_count,
-                          ctx->fps_style);
+        render_time_graph(PLOT_FPS, fps_step, true, true, 60.0, 30.0, ctx->fps_scale, false,
+                          ctx->fps_grid_labels, ctx->fps_grid_values, ctx->fps_grid_count, ctx->fps_style,
+                          ctx->fps_width, ctx->fps_height, ctx->fps_window, false, false);
         // Title label
         if (ctx->label_fps)
         {
@@ -1432,19 +1522,19 @@ static uint32_t fps_overlay_get_width(void *data)
     int pw, ph, tw, th;
     if (ctx->show_pacing_graph)
     {
-        get_graph_dims(ctx->pacing_style, &pw, &ph, &tw, &th);
+        get_graph_dims(ctx->pacing_style, &pw, &ph, &tw, &th, ctx->pacing_width, ctx->pacing_height);
         if ((uint32_t)tw > max_w)
             max_w = (uint32_t)tw;
     }
     if (ctx->show_frametime_graph)
     {
-        get_graph_dims(ctx->frametime_style, &pw, &ph, &tw, &th);
+        get_graph_dims(ctx->frametime_style, &pw, &ph, &tw, &th, ctx->frametime_width, ctx->frametime_height);
         if ((uint32_t)tw > max_w)
             max_w = (uint32_t)tw;
     }
     if (ctx->show_fps_graph)
     {
-        get_graph_dims(ctx->fps_style, &pw, &ph, &tw, &th);
+        get_graph_dims(ctx->fps_style, &pw, &ph, &tw, &th, ctx->fps_width, ctx->fps_height);
         if ((uint32_t)tw > max_w)
             max_w = (uint32_t)tw;
     }
@@ -1474,11 +1564,13 @@ static uint32_t fps_overlay_get_height(void *data)
     int pw, ph, tw, th;
     const bool shown[3] = {ctx->show_pacing_graph, ctx->show_frametime_graph, ctx->show_fps_graph};
     const int styles[3] = {ctx->pacing_style, ctx->frametime_style, ctx->fps_style};
+    const int widths[3] = {ctx->pacing_width, ctx->frametime_width, ctx->fps_width};
+    const int heights[3] = {ctx->pacing_height, ctx->frametime_height, ctx->fps_height};
     for (int g = 0; g < 3; g++)
     {
         if (!shown[g])
             continue;
-        get_graph_dims(styles[g], &pw, &ph, &tw, &th);
+        get_graph_dims(styles[g], &pw, &ph, &tw, &th, widths[g], heights[g]);
         if (graph_h > 0)
             graph_h += GRAPH_MARGIN;
         graph_h += (uint32_t)th;
