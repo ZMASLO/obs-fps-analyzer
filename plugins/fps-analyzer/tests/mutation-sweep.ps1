@@ -65,9 +65,16 @@ $mutations = @(
     @{ name = "dudnienie: czas klastra = 1. zdarzenie"; find = '(uint64_t)(b.cluster_sum_s / b.cluster_events * 1e9)'; repl = '(uint64_t)0' },
     @{ name = "dudnienie: rodzaje klastrow razem";   find = 'if (b.obs[e] != obs)'; repl = 'if (false)' },
     @{ name = "dudnienie: brak zastoju";             find = 'b.cluster_stall = true;'; repl = '(void)0;' },
-    @{ name = "dudnienie: duplikat bez czystego ciagu"; find = 'beat_event(c, now, false, b.clean_frames >= FPS_BEAT_CLEAN_RUN, b.run_dup);'; repl = 'beat_event(c, now, false, true, b.run_dup);';
-       equivalent = 'gra ponizej tempa dostarczania daje ciagly klaster, ktory i tak odrzuca limit FPS_BEAT_MAX_EVENTS; regula zostaje jako druga zapora' },
-    @{ name = "dudnienie: pusty tick nie jest zdarzeniem"; find = 'if (frames == 0) {'; repl = 'if (frames == -5) {' }
+    @{ name = "dudnienie: duplikat bez czystego ciagu"; find = 'beat_event(c, now, false, b.clean_frames >= FPS_BEAT_CLEAN_RUN, b.run_dup);'; repl = 'beat_event(c, now, false, true, b.run_dup);' },
+    @{ name = "dudnienie: pusty tick nie jest zdarzeniem"; find = 'if (frames == 0) {'; repl = 'if (frames == -5) {' },
+    # Sprawdzanie sygnalu: "OK" dopiero, gdy rozjazd 59.94/60 jest wykluczony
+    @{ name = "sprawdzanie: powtorka nie wstrzymuje"; find = 'held = now_s - t[i] < 2.0 * p + tol;'; repl = 'held = false;' },
+    @{ name = "sprawdzanie: wstrzymanie 1P zamiast 2P"; find = 'held = now_s - t[i] < 2.0 * p + tol;'; repl = 'held = now_s - t[i] < 1.0 * p + tol;' },
+    @{ name = "sprawdzanie: OK po pol okna";         find = 'if (!held && out->observed_s >= out->verify_s)'; repl = 'if (!held && out->observed_s >= 0.5 * out->verify_s)' },
+    @{ name = "sprawdzanie: brak resetu po utracie sygnalu"; find = 'now - b.last_activity > FPS_BEAT_RESET_GAP_NS'; repl = 'now - b.last_activity > 10 * FPS_BEAT_RESET_GAP_NS' },
+    @{ name = "sprawdzanie: uneven nigdy";           find = 'out->uneven = irregular >= FPS_BEAT_UNEVEN_CLUSTERS;'; repl = 'out->uneven = false;' },
+    @{ name = "sprawdzanie: uneven liczy dudnienie";  find = 'irregular += regular ? 0 : 1;'; repl = 'irregular += 1;' },
+    @{ name = "sprawdzanie: otwarty klaster pominiety"; find = 'if (b.in_cluster && !b.cluster_stall) {'; repl = 'if (false) {' }
 )
 
 function Run-Layer([string]$exe, [string[]]$argv) {
@@ -76,7 +83,7 @@ function Run-Layer([string]$exe, [string[]]$argv) {
     # linkujemy go od nowa, zamiast liczyc blokade jako "test zlapal".
     # stderr narzedzia (np. FAIL) nie moze przerwac skryptu w PowerShellu 5.1
     $ErrorActionPreference = "Continue"
-    for ($try = 1; $try -le 6; $try++) {
+    for ($try = 1; $try -le 15; $try++) {
         try {
             if ($argv -and $argv.Count -gt 0) { $out = & $exe @argv 2>&1 } else { $out = & $exe 2>&1 }
             return @{ code = $LASTEXITCODE; text = ($out -join "`n") }

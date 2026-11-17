@@ -1315,12 +1315,20 @@ struct BeatSim {
     double freeze_every_s = 0.0; // the game freezes for freeze_len_s every N s exactly
     double freeze_len_s = 0.0;
     double empty_p = 0.0;        // per tick: a stray empty tick (obs-side hiccup), card mode
+    double reset_at_s = -1.0;    // fps_core_beat_reset at this time (settings changed)
+    int mask_repeat = 0;         // card mode: the Nth capture repeat goes unseen (delivered as new)
     uint64_t seed = 1;
 };
 
 struct BeatRun {
     fps_beat beat{};             // at the end
     double first_detect_s = -1;  // first whole second at which a beat was reported
+    double first_clear_s = -1;   // first whole second at which CLEAR was reported
+    bool clear_before_detect = false;
+    bool uneven_seen = false;
+    bool uneven_before_detect = false; // the card's own beat blamed on the game
+    std::vector<int> status;     // status at each whole second (index = second)
+    std::vector<double> observed;
 };
 
 static BeatRun run_beat(const BeatSim &s, double seconds)
@@ -1368,6 +1376,7 @@ static BeatRun run_beat(const BeatSim &s, double seconds)
 
     std::vector<double> arr; // jittered arrival per source frame (obs mode)
     long long prev_gid = -1;
+    int card_repeats = 0;
     size_t next_src = 0;
     int last_reported = -1;
     const uint64_t base_ns = 1000000000ull;
@@ -1400,10 +1409,14 @@ static BeatRun run_beat(const BeatSim &s, double seconds)
         }
         if (frames) {
             bool unique = shown != prev_gid;
+            if (s.card && !unique && ++card_repeats == s.mask_repeat)
+                unique = true; // this repeat is missed (e.g. hidden behind a game hitch)
             fps_core_debug_feed_decision(c, unique, false, now);
             prev_gid = shown;
         }
         fps_core_obs_tick(c, now, frames);
+        if (s.reset_at_s >= 0.0 && t >= s.reset_at_s && t - 1.0 / s.obs_hz < s.reset_at_s)
+            fps_core_beat_reset(c, now);
         int sec = (int)t;
         if (sec != last_reported) {
             last_reported = sec;
@@ -1411,6 +1424,19 @@ static BeatRun run_beat(const BeatSim &s, double seconds)
             fps_core_get_beat(c, now, s.obs_hz, &b);
             if (b.detected && br.first_detect_s < 0)
                 br.first_detect_s = t;
+            if (b.status == FPS_BEAT_CLEAR) {
+                if (br.first_clear_s < 0)
+                    br.first_clear_s = t;
+                if (br.first_detect_s < 0)
+                    br.clear_before_detect = true;
+            }
+            br.uneven_seen = br.uneven_seen || b.uneven;
+            if (b.uneven && br.first_detect_s < 0)
+                br.uneven_before_detect = true;
+            br.status.resize((size_t)sec + 1, -1);
+            br.observed.resize((size_t)sec + 1, 0.0);
+            br.status[(size_t)sec] = b.status;
+            br.observed[(size_t)sec] = b.observed_s;
         }
     }
     fps_core_get_beat(c, base_ns + (uint64_t)(seconds * 1e9), s.obs_hz, &br.beat);
@@ -1518,6 +1544,8 @@ static void s23_capture_beat(Runner &r)
         BeatRun br = run_beat(s, 300);
         r.check(!br.beat.detected && br.beat.clusters == 0, "game at 30 in 60: no beat (%d clusters)",
                 br.beat.clusters);
+        r.check(br.first_clear_s > 0 && br.first_clear_s < 45 && !br.uneven_seen,
+                "game at 30 in 60: OK at %.0f s, not called uneven (%d)", br.first_clear_s, (int)br.uneven_seen);
     }
     {   // 59.94 through the card plus a game that drops the odd frame
         BeatSim s;
@@ -1570,9 +1598,120 @@ static void s23_capture_beat(Runner &r)
         s.switch_s = 90.0;
         s.switch_hz = 60.0;
         BeatRun at90 = run_beat(s, 89);
-        BeatRun later = run_beat(s, 160);
+        BeatRun later = run_beat(s, 200);
         r.check(at90.beat.detected, "before the fix: beat detected");
-        r.check(!later.beat.detected, "70 s after the fix: the verdict has expired");
+        r.check(!later.beat.detected, "after the fix: the verdict has expired");
+        r.check(later.beat.status == FPS_BEAT_CLEAR, "after the fix: the check ends CLEAR (status %d)",
+                later.beat.status);
+    }
+
+    // --- The check: never "OK" before the warning, OK once it is ruled out ---
+    for (int ph = 0; ph < 10; ph++) {
+        for (int mode = 0; mode < 2; mode++) {
+            BeatSim s;
+            s.card = mode == 0;
+            s.jitter_ms = s.card ? 0.0 : 0.2;
+            s.phase = ph / 10.0;
+            BeatRun br = run_beat(s, 120);
+            r.check(!br.clear_before_detect && br.beat.status == FPS_BEAT_DETECTED,
+                    "%s 59.94 into 60, phase %.1f: never CLEAR before the warning (first CLEAR %.0f s, "
+                    "detected %.0f s, final status %d)",
+                    s.card ? "card" : "OBS", s.phase, br.first_clear_s, br.first_detect_s, br.beat.status);
+            r.check(!br.uneven_before_detect, "%s 59.94 into 60, phase %.1f: the beat is not called uneven game pacing",
+                    s.card ? "card" : "OBS", s.phase);
+        }
+    }
+    // One of the card's repeats goes unseen: the remaining ones are 2P apart
+    // for a while, which must still hold the check back.
+    for (int ph = 0; ph < 10; ph++) {
+        BeatSim s;
+        s.phase = ph / 10.0;
+        s.mask_repeat = 2;
+        BeatRun br = run_beat(s, 150);
+        r.check(!br.clear_before_detect && br.beat.status == FPS_BEAT_DETECTED,
+                "card 59.94 into 60, 2nd repeat missed, phase %.1f: never CLEAR before the warning "
+                "(first CLEAR %.0f s, detected %.0f s)",
+                s.phase, br.first_clear_s, br.first_detect_s);
+        r.check(!br.uneven_before_detect,
+                "card 59.94 into 60, 2nd repeat missed, phase %.1f: the beat is not called uneven game pacing", s.phase);
+    }
+    {   // matched 60 into 60: CHECKING with a running clock, CLEAR at 40 s
+        BeatSim s;
+        s.src_hz = 60.0;
+        BeatRun br = run_beat(s, 60);
+        r.check(br.status.size() > 45 && br.status[20] == FPS_BEAT_CHECKING && br.status[39] == FPS_BEAT_CHECKING,
+                "matched 60: CHECKING through 39 s");
+        r.check(br.observed.size() > 20 && fabs(br.observed[20] - 20.0) < 1.1, "matched 60: the clock runs (%.1f s at 20)",
+                br.observed.size() > 20 ? br.observed[20] : -1.0);
+        r.check(br.first_clear_s >= 40.0 && br.first_clear_s < 42.0, "matched 60: CLEAR at %.0f s",
+                br.first_clear_s);
+        // 2.4 periods of 1001/60 s = 40.04 s
+        r.check(fabs(br.beat.verify_s - 2.4 * 1001.0 / 60.0) < 1e-9, "matched 60: verify window %.2f s",
+                br.beat.verify_s);
+    }
+    {   // matched 30 into 30: the 1000/1001 period is 33.4 s, so the check is 80 s
+        BeatSim s;
+        s.obs_hz = 30.0;
+        s.src_hz = 30.0;
+        BeatRun br = run_beat(s, 100);
+        r.check(br.first_clear_s >= 80.0 && br.first_clear_s < 82.5, "matched 30: CLEAR at %.0f s (verify %.1f)",
+                br.first_clear_s, br.beat.verify_s);
+    }
+    {   // 29.97 console into 30: never CLEAR before the warning either
+        BeatSim s;
+        s.obs_hz = 30.0;
+        s.src_hz = 30000.0 / 1001.0;
+        BeatRun br = run_beat(s, 200);
+        b_report(r, "card 29.97->30", br);
+        r.check(!br.clear_before_detect && br.beat.detected, "29.97 into 30: warned, never CLEAR before (%.0f / %.0f)",
+                br.first_clear_s, br.first_detect_s);
+    }
+    {   // a game that drops a frame now and then (~every 45 s): the check waits
+        // out each one and ends CLEAR, never warning
+        for (uint64_t seed = 1; seed <= 5; seed++) {
+            BeatSim s;
+            s.src_hz = 60.0;
+            s.drop_p = 1.0 / 2700.0;
+            s.seed = seed;
+            BeatRun br = run_beat(s, 400);
+            r.check(br.first_clear_s > 0 && br.first_clear_s < 300 && br.first_detect_s < 0,
+                    "occasional game drops (seed %llu): CLEAR at %.0f s, no warning", (unsigned long long)seed,
+                    br.first_clear_s);
+        }
+    }
+    {   // a game dropping a frame every ~8 s: flagged uneven, never a warning
+        for (uint64_t seed = 1; seed <= 5; seed++) {
+            BeatSim s;
+            s.src_hz = 60.0;
+            s.drop_p = 1.0 / 480.0;
+            s.seed = seed;
+            BeatRun br = run_beat(s, 300);
+            r.check(br.uneven_seen && br.first_detect_s < 0,
+                    "frequent game drops (seed %llu): flagged uneven, no warning", (unsigned long long)seed);
+        }
+    }
+    {   // settings changed at 50 s: the check starts over
+        BeatSim s;
+        s.src_hz = 60.0;
+        s.reset_at_s = 50.0;
+        BeatRun br = run_beat(s, 100);
+        r.check(br.status.size() > 92 && br.status[45] == FPS_BEAT_CLEAR && br.status[60] == FPS_BEAT_CHECKING &&
+                    br.status[92] == FPS_BEAT_CLEAR,
+                "reset at 50 s: CLEAR -> CHECKING -> CLEAR");
+        r.check(br.observed.size() > 52 && br.observed[52] < 3.0, "reset at 50 s: clock restarted (%.1f s at 52)",
+                br.observed.size() > 52 ? br.observed[52] : -1.0);
+    }
+    {   // the signal drops out for 3 s at 60 s: the check starts over
+        BeatSim s;
+        s.card = false;
+        s.src_hz = 60.0;
+        s.jitter_ms = 0.2;
+        s.switch_s = 60.0;
+        s.switch_hz = 1.0 / 3.0; // frames 3 s apart from here on (next one at ~63.01 s)
+        BeatRun br = run_beat(s, 65);
+        r.check(br.status.size() > 64 && br.observed[64] < 1.5,
+                "3 s signal loss: the check restarts (%.1f s observed at 64 s)",
+                br.observed.size() > 64 ? br.observed[64] : -1.0);
     }
     r.end(false);
 }

@@ -82,7 +82,7 @@ struct fps_overlay_source
 static const char *fps_overlay_get_name(void *unused)
 {
     UNUSED_PARAMETER(unused);
-    return "FPS Analyzer 0.5.1";
+    return "FPS Analyzer 0.5.2";
 }
 
 static void update_text_source(struct fps_overlay_source *ctx, const char *text)
@@ -267,6 +267,32 @@ static void build_srate_text(char *text, size_t size)
     }
     srate_format_hz(g_fps_shared.srate_source_hz, src, sizeof(src));
     srate_format_hz(g_fps_shared.srate_obs_hz, obs, sizeof(obs));
+
+    // Timestamps that agree with OBS only prove the device is set to the OBS
+    // rate (a card may stamp its configured rate whatever the signal is).
+    // "OK" waits until the cadence check has ruled a 59.94-vs-60 repeat out.
+    const bool ts_bad = g_fps_shared.srate_valid && (g_fps_shared.srate_status == SRATE_STATUS_MISMATCH ||
+                                                    g_fps_shared.srate_status == SRATE_STATUS_UNSTABLE);
+    if (!ts_bad && g_fps_shared.beat_status == FPS_BEAT_CLEAR) {
+        snprintf(text, size, "Signal: %s Hz | OBS: %s FPS - OK", g_fps_shared.srate_valid ? src : obs, obs);
+        return;
+    }
+    if (!ts_bad && g_fps_shared.beat_status == FPS_BEAT_CHECKING && g_fps_shared.beat_verify_s > 0.0) {
+        char head[64] = "";
+        if (g_fps_shared.device_hz > 0.0 && !g_fps_shared.device_matching) {
+            char dev[32];
+            srate_format_hz(g_fps_shared.device_hz, dev, sizeof(dev));
+            snprintf(head, sizeof(head), "Device: %s | ", dev);
+        }
+        double shown = g_fps_shared.beat_observed_s;
+        if (shown > g_fps_shared.beat_verify_s)
+            shown = g_fps_shared.beat_verify_s; // waiting out a suspect repeat
+        snprintf(text, size, "%sOBS: %s FPS - checking signal... %.0f/%.0f s%s", head, obs, floor(shown),
+                 g_fps_shared.beat_verify_s,
+                 g_fps_shared.beat_uneven ? "\nGame frame pacing is uneven, the check takes longer" : "");
+        return;
+    }
+
     switch (g_fps_shared.srate_status)
     {
     case SRATE_STATUS_MATCHED:
@@ -949,7 +975,7 @@ static void fps_overlay_tick(void *data, float seconds)
     {
         snprintf(text, sizeof(text),
                  "No FPS Analyzer filter active.\n"
-                 "Add the \"FPS Analyzer 0.5.1\" filter\n"
+                 "Add the \"FPS Analyzer 0.5.2\" filter\n"
                  "to a video source to start.");
     }
     else if (g_fps_shared.active_filter_count > 1)
@@ -1067,7 +1093,7 @@ static void fps_overlay_tick(void *data, float seconds)
 
         // Auto-hide: OK for 5 s -> hidden, anything else -> shown right away
         bool ok = g_fps_shared.srate_available && g_fps_shared.srate_valid &&
-                  g_fps_shared.srate_status == SRATE_STATUS_MATCHED && !g_fps_shared.beat_detected;
+                  g_fps_shared.srate_status == SRATE_STATUS_MATCHED && g_fps_shared.beat_status == FPS_BEAT_CLEAR;
         uint64_t now = os_gettime_ns();
         if (!ok)
             ctx->srate_ok_since_ns = 0;
@@ -1300,7 +1326,7 @@ bool obs_module_load(void)
     obs_register_source(&fps_analyzer_filter_info);
     obs_register_source(&fps_overlay_source_info);
     fps_analyzer_register_hotkeys();
-    blog(LOG_INFO, "FPS Analyzer 0.5.1 loaded");
+    blog(LOG_INFO, "FPS Analyzer 0.5.2 loaded");
     return true;
 }
 

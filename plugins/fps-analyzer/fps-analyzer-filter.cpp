@@ -25,7 +25,7 @@ extern struct obs_source_info fps_overlay_source_info;
 
 #define FPS_CSV_HISTORY_LIMIT 300
 // Version stamped into FPS trace headers (see trace_note_frame)
-#define FPS_TRACE_PLUGIN_VERSION "0.5.1"
+#define FPS_TRACE_PLUGIN_VERSION "0.5.2"
 
 // Dodaj enum do wyboru metody analizy
 typedef enum {
@@ -106,6 +106,10 @@ struct fps_analyzer_filter {
     int srate_logged_status;      // last status written to the OBS log
     uint64_t srate_diag_log_ns;   // last diagnostic line while measuring
     bool beat_logged;             // a beat verdict is in the OBS log
+    bool beat_clear_logged;       // the signal check's OK is in the OBS log
+    bool beat_seen_rates;         // beat_obs_hz / beat_device_hz are set
+    double beat_obs_hz;           // rates the current signal check runs under
+    double beat_device_hz;
 };
 
 // --- Utility functions ---
@@ -915,15 +919,41 @@ static void read_device_rate(obs_source_t *parent, double obs_hz, double *hz, bo
 // echo its configured rate.
 static void publish_beat(struct fps_analyzer_filter *filter, obs_source_t *parent, uint64_t now, double obs_hz)
 {
+    // A changed OBS FPS or device FPS is a different pipeline: check it anew.
+    double device_hz;
+    bool matching;
+    read_device_rate(parent, obs_hz, &device_hz, &matching);
+    if (filter->beat_seen_rates &&
+        (fabs(obs_hz - filter->beat_obs_hz) > 1e-6 || fabs(device_hz - filter->beat_device_hz) > 1e-6)) {
+        fps_core_beat_reset(filter->core, now);
+        blog(LOG_INFO, "[FPS Analyzer] Signal check restarted: OBS %.3f FPS, device %.3f%s", obs_hz, device_hz,
+             matching ? " (match output)" : "");
+    }
+    filter->beat_seen_rates = true;
+    filter->beat_obs_hz = obs_hz;
+    filter->beat_device_hz = device_hz;
+    g_fps_shared.device_hz = device_hz;
+    g_fps_shared.device_matching = matching;
+
     struct fps_beat b;
     fps_core_get_beat(filter->core, now, obs_hz, &b);
+    g_fps_shared.beat_status = b.status;
+    g_fps_shared.beat_observed_s = b.observed_s;
+    g_fps_shared.beat_verify_s = b.verify_s;
+    g_fps_shared.beat_uneven = b.uneven;
     g_fps_shared.beat_detected = b.detected;
     g_fps_shared.beat_origin = b.origin;
     g_fps_shared.beat_period_s = b.period_s;
     g_fps_shared.beat_signal_hz = b.nominal_hz > 0.0 ? b.nominal_hz : b.signal_hz;
     g_fps_shared.beat_drift = b.detected && b.nominal_hz > 0.0 && obs_hz > 0.0 &&
                               fabs(b.nominal_hz / obs_hz - 1.0) < 1e-9;
-    read_device_rate(parent, obs_hz, &g_fps_shared.device_hz, &g_fps_shared.device_matching);
+
+    if (b.status == FPS_BEAT_CLEAR && !filter->beat_clear_logged) {
+        filter->beat_clear_logged = true;
+        blog(LOG_INFO, "[FPS Analyzer] Signal check: no capture repeats in %.0f s - OK", b.observed_s);
+    } else if (b.status != FPS_BEAT_CLEAR) {
+        filter->beat_clear_logged = false;
+    }
 
     if (b.detected && !filter->beat_logged) {
         filter->beat_logged = true;
@@ -1202,7 +1232,7 @@ static void *fps_analyzer_create(obs_data_t *settings, obs_source_t *context)
 static const char *fps_analyzer_get_name(void *unused)
 {
     UNUSED_PARAMETER(unused);
-    return "FPS Analyzer 0.5.1";
+    return "FPS Analyzer 0.5.2";
 }
 
 // --- Properties ---

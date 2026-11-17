@@ -25,7 +25,11 @@
 #                                reproduced exactly
 #                 beat=HZ+-T     traces only (v3): at the end the capture-path
 #                                beat detector reports a signal of HZ within T
+#                                and the signal check never said CLEAR
+#                                before that warning
 #                 nobeat         traces only: no beat reported
+#                 clear<=S       traces only (v3): the signal check said CLEAR
+#                                within S seconds of the start
 #                 prefix "xfail:" marks a known limitation: reported, but not
 #                                counted as a regression
 #

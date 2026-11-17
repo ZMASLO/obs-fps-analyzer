@@ -146,6 +146,8 @@ struct ReplayResult {
     std::vector<Publish> pubs;   // for the fps@/ft@/tear@ expectations
     int k_rows = 0;              // v3 per-tick rows fed to the beat detector
     struct fps_beat beat = {};   // verdict at the end of the trace (beat= / nobeat)
+    double first_clear_s = -1;   // first second the signal check said CLEAR (clear<=)
+    double first_detect_s = -1;  // first second a beat was confirmed
     TraceHeader header;
     std::vector<Mismatch> mismatches;
 };
@@ -175,7 +177,7 @@ static ReplayResult replay_trace(const fs::path &path, double tol, bool verbose)
 
     struct fps_core *core = nullptr;
     bool have_header = false;
-    uint64_t first_ns = 0, last_ns = 0;
+    uint64_t first_ns = 0, last_ns = 0, last_beat_poll = 0;
     std::string line;
     int lineno = 0;
     const int max_report = 10;
@@ -327,6 +329,19 @@ static ReplayResult replay_trace(const fs::path &path, double tol, bool verbose)
             fps_core_obs_tick(core, now, ival(f, 3));
             r.k_rows++;
             last_ns = now > last_ns ? now : last_ns;
+            if (!first_ns)
+                first_ns = now;
+            // what the overlay would show, once per second
+            if (now - last_beat_poll >= 1000000000ULL) {
+                last_beat_poll = now;
+                struct fps_beat b;
+                fps_core_get_beat(core, now, r.header.obs_hz, &b);
+                double t = (double)(now - first_ns) / 1e9;
+                if (b.status == FPS_BEAT_DETECTED && r.first_detect_s < 0)
+                    r.first_detect_s = t;
+                if (b.status == FPS_BEAT_CLEAR && r.first_clear_s < 0)
+                    r.first_clear_s = t;
+            }
         }
     }
 
@@ -363,6 +378,10 @@ static void print_result(const fs::path &path, const ReplayResult &r)
                r.beat.nominal_hz, r.header.obs_hz, r.beat.chain, r.beat.clusters);
     else
         printf("  capture beat: none (%d clusters%s)\n", r.beat.clusters, r.k_rows ? "" : ", no K rows");
+    if (r.k_rows)
+        printf("  signal check: first CLEAR %s, first warning %s\n",
+               r.first_clear_s >= 0 ? (num(r.first_clear_s) + " s").c_str() : "never",
+               r.first_detect_s >= 0 ? (num(r.first_detect_s) + " s").c_str() : "never");
     if (r.mismatches.empty()) {
         printf("  [PASS] the core reproduced every recorded frame and tick exactly\n");
         return;
@@ -867,6 +886,18 @@ static int run_manifest(const fs::path &manifest, double tol, bool verbose, bool
                     bool good = r.beat.detected && fabs(r.beat.signal_hz - want) <= tolb;
                     printf("  %s %s: %s\n", good ? "[ok]" : "[FAIL]", spec.c_str(),
                            r.beat.detected ? ("signal " + num(r.beat.signal_hz) + " Hz").c_str() : "no beat");
+                    // the overlay must never have said OK before the warning
+                    bool honest = !(r.first_clear_s >= 0 && (r.first_detect_s < 0 || r.first_clear_s < r.first_detect_s));
+                    printf("  %s never CLEAR before the warning\n", honest ? "[ok]" : "[FAIL]");
+                    ok = ok && good && honest;
+                    continue;
+                }
+                // "clear<=45": the signal check ended CLEAR within 45 s
+                if (spec.rfind("clear<=", 0) == 0) {
+                    double lim = strtod(spec.c_str() + 7, nullptr);
+                    bool good = r.first_clear_s >= 0 && r.first_clear_s <= lim;
+                    printf("  %s %s: first CLEAR %s\n", good ? "[ok]" : "[FAIL]", spec.c_str(),
+                           r.first_clear_s >= 0 ? (num(r.first_clear_s) + " s").c_str() : "never");
                     ok = ok && good;
                     continue;
                 }

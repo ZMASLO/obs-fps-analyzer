@@ -143,6 +143,20 @@ bool fps_core_tick(struct fps_core *c, uint64_t now_ns, struct fps_core_output *
 //     same nominal rate drifting, P of minutes) FPS_BEAT_CHAIN_DRIFT_EXTRA
 //     more clusters are required.
 //
+// Until a beat is confirmed the verdict is CHECKING, not "fine": a console
+// at 59.94 Hz into 60 FPS repeats a frame only every 1001/D seconds, so
+// "no repeat yet" means nothing for the first ~17 s. CLEAR is given once the
+// detector has watched for verify_s = max(FPS_BEAT_VERIFY_MIN_S,
+// FPS_BEAT_VERIFY_PERIODS * 1001 / D) and no repeat was seen in the last
+// 2 * 1001/D: a beat would have repeated within that time, even with one of
+// its repeats missed. A game that keeps dropping frames keeps the check
+// waiting (`uneven`); that stutter is the game's and shows on the FPS graph.
+// Repeats 1 or 2 periods from one another are the card's own beat, not the
+// game, and do not count towards `uneven`. A lost signal (no frames for
+// FPS_BEAT_RESET_GAP_NS) or fps_core_beat_reset() starts the check over.
+// Clock drift (a period of minutes) cannot be ruled out this fast; CLEAR
+// means "no 1000/1001 mismatch", and drift is still reported if it shows.
+//
 // It only observes: the FPS readings are unaffected.
 
 #define FPS_BEAT_CLEAN_RUN 30
@@ -158,6 +172,16 @@ bool fps_core_tick(struct fps_core *c, uint64_t now_ns, struct fps_core_output *
 #define FPS_BEAT_SNAP_TOL 150e-6   // a real beat lands within ~20 ppm; crystals add up to ~100
 #define FPS_BEAT_END_SEARCH 3   // chains may end this many clusters before the newest
 #define FPS_BEAT_HISTORY 16
+#define FPS_BEAT_VERIFY_MIN_S 40.0
+#define FPS_BEAT_VERIFY_PERIODS 2.4
+#define FPS_BEAT_RESET_GAP_NS 2000000000ULL
+#define FPS_BEAT_UNEVEN_CLUSTERS 3
+
+enum fps_beat_status {
+    FPS_BEAT_CHECKING = 0,  // not watched long enough to rule a mismatch out
+    FPS_BEAT_CLEAR = 1,     // watched verify_s without a suspect repeat
+    FPS_BEAT_DETECTED = 2   // a confirmed beat (see the fields below)
+};
 
 enum fps_beat_origin {
     FPS_BEAT_ORIGIN_NONE = 0,
@@ -166,7 +190,11 @@ enum fps_beat_origin {
 };
 
 struct fps_beat {
-    bool detected;
+    int status;          // fps_beat_status
+    double observed_s;   // time watched since the check (re)started
+    double verify_s;     // how long CLEAR needs (0 when the delivery rate is unknown)
+    bool uneven;         // FPS_BEAT_UNEVEN_CLUSTERS+ repeats in the window that no beat explains: the game drops frames
+    bool detected;       // == (status == FPS_BEAT_DETECTED)
     double period_s;     // span of the chain / its number of steps
     int origin;          // fps_beat_origin of the chain
     double signal_hz;    // delivery_hz - 1/period_s (0 when delivery_hz <= 0)
@@ -178,6 +206,9 @@ struct fps_beat {
 // One OBS video tick on an async source: `frames` is how many source frames
 // reached the filter since the previous tick (0 = OBS repeated a frame).
 void fps_core_obs_tick(struct fps_core *c, uint64_t now_ns, int frames);
+
+// Starts the check over (the OBS FPS or the capture device's FPS changed).
+void fps_core_beat_reset(struct fps_core *c, uint64_t now_ns);
 
 // The current beat verdict. delivery_hz is the rate frames are delivered at
 // (the OBS FPS); 0 skips the standard-rate check. Expires after 3 periods

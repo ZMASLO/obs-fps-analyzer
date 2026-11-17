@@ -40,6 +40,10 @@ struct fps_shared_data {
     double srate_recommended_hz; // OBS FPS that would match, 0 = none
     // Capture-path beat from the frame cadence (fps-core.h) — works where the
     // device's timestamps only echo its configured rate (Elgato 4K X)
+    int beat_status;             // FPS_BEAT_CHECKING / CLEAR / DETECTED
+    double beat_observed_s;      // how long the current signal check has run
+    double beat_verify_s;        // how long it needs before CLEAR
+    bool beat_uneven;            // the game drops frames: the check takes longer
     bool beat_detected;
     int beat_origin;             // FPS_BEAT_ORIGIN_* (OBS / capture device)
     double beat_period_s;

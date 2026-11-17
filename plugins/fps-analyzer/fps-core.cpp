@@ -76,6 +76,8 @@ struct fps_core {
         bool obs[FPS_BEAT_HISTORY] = {};
         int n = 0;
         int clusters = 0;
+        uint64_t obs_start = 0;        // when the current check started (0 = no frame yet)
+        uint64_t last_activity = 0;    // last frame / tick that delivered one
     } beat;
 };
 
@@ -210,10 +212,32 @@ static double beat_snap(double hz)
     return 0.0;
 }
 
-// Closes a cluster that has gone quiet. Called before every new observation.
-static void beat_advance(struct fps_core *c, uint64_t now)
+static void beat_reset(struct fps_core *c, uint64_t now)
+{
+    int clusters = c->beat.clusters;
+    c->beat = fps_core::beat_state();
+    c->beat.clusters = clusters; // diagnostic total survives
+    c->beat.obs_start = now;
+    c->beat.last_activity = now;
+}
+
+void fps_core_beat_reset(struct fps_core *c, uint64_t now_ns)
+{
+    if (c)
+        beat_reset(c, now_ns);
+}
+
+// Called before every new observation: starts the check over after a lost
+// signal, closes a cluster that has gone quiet. `delivered` is true for a
+// frame or a tick that brought one.
+static void beat_advance(struct fps_core *c, uint64_t now, bool delivered)
 {
     auto &b = c->beat;
+    if (delivered) {
+        if (!b.obs_start || now - b.last_activity > FPS_BEAT_RESET_GAP_NS)
+            beat_reset(c, now);
+        b.last_activity = now;
+    }
     if (b.in_cluster && now - b.cluster_last > FPS_BEAT_CLUSTER_NS)
         beat_close_cluster(c);
 }
@@ -243,7 +267,7 @@ static void beat_event(struct fps_core *c, uint64_t now, bool from_obs, bool cle
 static void beat_on_frame(struct fps_core *c, bool unique, uint64_t now)
 {
     auto &b = c->beat;
-    beat_advance(c, now);
+    beat_advance(c, now, true);
     if (unique) {
         b.clean_frames++;
         b.run_dup = 0;
@@ -259,7 +283,7 @@ void fps_core_obs_tick(struct fps_core *c, uint64_t now_ns, int frames)
     if (!c)
         return;
     auto &b = c->beat;
-    beat_advance(c, now_ns);
+    beat_advance(c, now_ns, frames > 0);
     if (frames == 1) {
         b.clean_ticks++;
         b.run_empty = 0;
@@ -288,15 +312,11 @@ static int beat_find(const struct fps_core::beat_state &b, bool obs, double t, d
     return -1;
 }
 
-void fps_core_get_beat(const struct fps_core *c, uint64_t now_ns, double delivery_hz, struct fps_beat *out)
+// The confirmed-beat search: fills the beat fields of `out` and sets
+// out->detected when a chain qualifies.
+static void beat_detect(const struct fps_core *c, uint64_t now_ns, double delivery_hz, struct fps_beat *out)
 {
-    if (!out)
-        return;
-    memset(out, 0, sizeof(*out));
-    if (!c)
-        return;
     const auto &b = c->beat;
-    out->clusters = b.clusters;
     if (b.n < 2)
         return;
 
@@ -351,6 +371,78 @@ void fps_core_get_beat(const struct fps_core *c, uint64_t now_ns, double deliver
             return;
         }
     }
+}
+
+// CHECKING vs CLEAR when no beat is confirmed: has the detector watched long
+// enough, and has every repeat seen had two periods to show it is not part of
+// a beat? A repeat inside the last 2 * 1001/D (plus tolerance) holds the check
+// back: if it belongs to a beat, its successor arrives within that time (a
+// missed one included), so the hold extends until the beat is confirmed.
+static void beat_verify(const struct fps_core *c, uint64_t now_ns, double delivery_hz, struct fps_beat *out)
+{
+    const auto &b = c->beat;
+    out->observed_s = b.obs_start && now_ns > b.obs_start ? (double)(now_ns - b.obs_start) / 1e9 : 0.0;
+    out->status = FPS_BEAT_CHECKING;
+    if (delivery_hz <= 0.0)
+        return; // no rate to derive the period from
+    const double p = 1001.0 / delivery_hz;
+    out->verify_s = p * FPS_BEAT_VERIFY_PERIODS > FPS_BEAT_VERIFY_MIN_S ? p * FPS_BEAT_VERIFY_PERIODS
+                                                                       : FPS_BEAT_VERIFY_MIN_S;
+
+    // clusters within the window, the still open one included
+    double t[FPS_BEAT_HISTORY + 1];
+    bool k[FPS_BEAT_HISTORY + 1];
+    int m = 0;
+    const double now_s = (double)now_ns / 1e9;
+    for (int i = 0; i < b.n; i++) {
+        double ti = (double)b.times[i] / 1e9;
+        if (now_s - ti <= out->verify_s) {
+            t[m] = ti;
+            k[m++] = b.obs[i];
+        }
+    }
+    if (b.in_cluster && !b.cluster_stall) {
+        t[m] = (double)b.cluster_start / 1e9 + b.cluster_sum_s / b.cluster_events;
+        k[m++] = b.cluster_obs;
+    }
+    // uneven: repeats the capture beat does not explain. A repeat 1 or 2 periods
+    // from another of the same kind is the card's own (not yet confirmed) beat,
+    // not the game, so it does not count.
+    int irregular = 0;
+    for (int i = 0; i < m; i++) {
+        const double tol = 2.0 * (k[i] ? FPS_BEAT_TOL_OBS_S : FPS_BEAT_TOL_CAPTURE_S);
+        bool regular = false;
+        for (int j = 0; j < m && !regular; j++) {
+            if (j == i || k[j] != k[i])
+                continue;
+            const double d = fabs(t[j] - t[i]);
+            regular = fabs(d - p) <= tol || fabs(d - 2.0 * p) <= tol;
+        }
+        irregular += regular ? 0 : 1;
+    }
+    out->uneven = irregular >= FPS_BEAT_UNEVEN_CLUSTERS;
+
+    bool held = false;
+    for (int i = 0; i < m && !held; i++) {
+        double tol = k[i] ? FPS_BEAT_TOL_OBS_S : FPS_BEAT_TOL_CAPTURE_S;
+        held = now_s - t[i] < 2.0 * p + tol;
+    }
+    if (!held && out->observed_s >= out->verify_s)
+        out->status = FPS_BEAT_CLEAR;
+}
+
+void fps_core_get_beat(const struct fps_core *c, uint64_t now_ns, double delivery_hz, struct fps_beat *out)
+{
+    if (!out)
+        return;
+    memset(out, 0, sizeof(*out));
+    if (!c)
+        return;
+    out->clusters = c->beat.clusters;
+    beat_detect(c, now_ns, delivery_hz, out);
+    beat_verify(c, now_ns, delivery_hz, out);
+    if (out->detected)
+        out->status = FPS_BEAT_DETECTED;
 }
 
 // --- Unique-frame bookkeeping ---
