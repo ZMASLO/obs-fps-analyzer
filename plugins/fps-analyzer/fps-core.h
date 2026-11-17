@@ -39,12 +39,35 @@ enum fps_pixfmt {
     FPS_PIXFMT_RGBA
 };
 
+// Sizes of luma differences between consecutive frames, in buckets:
+// |d| = 0, 1, 2, 3-4, 5-8, 9-16, 17-32, >32. A capture card that alters
+// every frame (dithering, re-encoding) shows up as differences that are all
+// tiny; real new content always has large ones somewhere.
+#define FPS_CORE_DELTA_BUCKETS 8
+
+// --- Altered-frame check (needs params.measure_deltas) ---
+//
+// A capture device that dithers or re-encodes the picture never delivers two
+// identical frames: a frame the game repeated arrives with a sprinkle of
+// +-1..2 luma differences and is counted as new, so a 30 FPS game reads 60
+// (Elgato 4K X, every mode). Real new content always has larger differences
+// somewhere. The check counts frames that were counted as new although every
+// difference is at most FPS_ALTERED_MAX_DELTA; FPS_ALTERED_TRIGGER of them
+// with no identical frame in between mean the FPS cannot be measured exactly.
+// FPS_ALTERED_CLEAR identical frames since then prove the device passes
+// frames untouched (a slow fade at 60 FPS on a good card) and clear it.
+#define FPS_ALTERED_MAX_DELTA_BUCKET 2  // |d| <= 2 (buckets 0..2)
+#define FPS_ALTERED_TRIGGER 90          // ~3 s of a 30 FPS game, 1.5 s of tiny changes at 60
+#define FPS_ALTERED_CLEAR 5
+
 struct fps_core_params {
     int analyze_method;            // fps_analyze_method
     double sensitivity;            // % of differing bytes for a frame to count as new (>=)
     bool enable_tearing_detection;
     double tearing_sensitivity;    // % per line (>=)
     double update_interval;        // seconds between publishes; <= 0 falls back to 1.0
+    bool measure_deltas;           // fill the per-frame |d| histogram (frame debug, trace v4)
+    bool beat_enabled;             // run the capture-path beat detector (fps_core_obs_tick et al.)
 };
 
 static inline struct fps_core_params fps_core_params_defaults(void)
@@ -55,6 +78,8 @@ static inline struct fps_core_params fps_core_params_defaults(void)
     p.enable_tearing_detection = true;
     p.tearing_sensitivity = 1.0;
     p.update_interval = 1.0 / 30.0;
+    p.measure_deltas = false;
+    p.beat_enabled = true;
     return p;
 }
 
@@ -241,6 +266,8 @@ struct fps_core_frame_debug {
     bool sample_written;           // a frametime sample was recorded
     double ft_ms, ema, fps_pf;     // valid when sample_written
     int pos, count;
+    bool deltas_valid;             // compared and params.measure_deltas
+    uint32_t deltas[FPS_CORE_DELTA_BUCKETS]; // bytes per |d| bucket; deltas[0] = luma_size - diff
 };
 void fps_core_debug_last_frame(const struct fps_core *c, struct fps_core_frame_debug *out);
 
@@ -251,3 +278,12 @@ void fps_core_debug_feed_decision(struct fps_core *c, bool unique, bool tearing,
 
 // The FPS value the last publish reported (feeds back into the next window).
 int fps_core_debug_last_published_fps(const struct fps_core *c);
+
+// True while the altered-frame check holds (see FPS_ALTERED_TRIGGER).
+bool fps_core_frames_altered(const struct fps_core *c);
+
+// Replay of a v4 trace row's difference histogram into the altered-frame
+// check, without pixels. Call before fps_core_debug_feed_decision for the
+// same frame; `unique` is the recorded decision.
+void fps_core_debug_feed_deltas(struct fps_core *c, size_t diff, bool unique,
+                                const uint32_t deltas[FPS_CORE_DELTA_BUCKETS]);

@@ -6,6 +6,16 @@
 
 #define FPS_GRAPH_HISTORY 960
 
+// Why the FPS cannot be measured exactly right now. While it is not NONE the
+// overlay shows the reason instead of any number, and nothing is logged to
+// the CSV: a wrong reading is worse than none.
+enum fps_block_reason {
+    FPS_BLOCK_NONE = 0,
+    FPS_BLOCK_PIXFMT = 1,     // the frames' pixel format is not supported
+    FPS_BLOCK_COMPRESSED = 2, // the capture device sends a compressed format (MJPEG, H.264)
+    FPS_BLOCK_ALTERED = 3     // the capture device alters every frame: repeats are never identical
+};
+
 // Shared data between FPS Analyzer filter and source.
 // Both run on OBS's video thread (video_tick), so no mutex needed.
 struct fps_shared_data {
@@ -14,7 +24,11 @@ struct fps_shared_data {
     bool tearing_detected;
     uint64_t last_update_ns;
     int active_filter_count;
-    int unsupported_format; // -1 = ok, otherwise video_format enum value
+    int blocked_reason;      // FPS_BLOCK_*
+    char blocked_detail[32]; // format name for PIXFMT / COMPRESSED ("P010", "MJPEG")
+    bool reliability_off;    // the filter's "Block FPS when the capture is unreliable" is off
+    uint64_t srate_wanted_ns; // last tick an overlay showed the Source refresh rate line:
+                              // the filter computes source rate and beat only while it is fresh
     // Graph data — linearized (oldest to newest), ready for rendering
     double graph_frametimes[FPS_GRAPH_HISTORY];     // smoothed
     double graph_frametimes_raw[FPS_GRAPH_HISTORY]; // raw (for future use)

@@ -28,6 +28,9 @@
 #                                and the signal check never said CLEAR
 #                                before that warning
 #                 nobeat         traces only: no beat reported
+#                 blocked=altered  traces only (v4): the altered-frame check hid
+#                                the FPS (the capture device alters every frame)
+#                 notblocked     traces only (v4): it never did
 #                 clear<=S       traces only (v3): the signal check said CLEAR
 #                                within S seconds of the start
 #                 prefix "xfail:" marks a known limitation: reported, but not
@@ -68,3 +71,13 @@ trace:traces/diff_mode.csv   ; ; self ; as fps60 but with the full frame diff an
 trace:traces/gamecap60.csv   ; ; self, fps@3-21=60+-1, nobeat ; game capture of a 60 fps game, 2560x1440 BGRA through the sync render path; 22 s, 1316 unique frames, 60.01 per second
 trace:traces/4kx_dev60_obs60_ps5.csv   ; ; self, beat=59.94+-0.01   ; Elgato 4K X, device 60 / OBS 60, PS5 at 59.94 Hz (GTA V, locked 60): the card repeats a frame every 16.68 s while its timestamps claim a perfect 60.000 Hz
 trace:traces/4kx_dev5994_obs60_ps5.csv ; ; self, beat=59.94+-0.01   ; Elgato 4K X, device 59.94 / OBS 60, PS5 at 59.94 Hz: OBS repeats (and drops) frames in bursts every ~16.7 s
+# Altered-frame check (fpstrace v4, PS5 + GTA V, same console on both cards):
+# the Elgato 4K X dithers every frame in every mode, so a repeated frame is never
+# identical and a 30 FPS game read 60; the 4K Mk2 passes frames untouched.
+trace:traces/4kx_nv12_game30_v4.csv    ; ; self, blocked=altered ; Elgato 4K X, NV12 4K, game at 30 FPS: repeats differ by |d|<=2 only (every frame), FPS hidden after ~3 s
+trace:traces/4kx_i420_game30_v4.csv    ; ; self, blocked=altered ; Elgato 4K X, I420 4K, game at 30 FPS: the same in the other 4:2:0 mode
+trace:traces/4kx_i420_ps5menu_v4.csv   ; ; self, blocked=altered ; Elgato 4K X, I420 4K, PS5 home menu: the bottom line is still, only card noise changes
+trace:traces/4kx_i420_paused_v4.csv    ; ; self, blocked=altered ; Elgato 4K X, I420 4K, game paused: nothing moves, yet every frame differs
+trace:traces/mk2_yuy2_game30_v4.csv    ; ; self, notblocked, fps@3-20=30+-1 ; Elgato 4K Mk2, YUY2 4K, game at 30 FPS: every repeat identical, reads 30
+trace:traces/mk2_yuy2_ps5menu_v4.csv   ; ; self, notblocked, fps@3-20=60+-1 ; Elgato 4K Mk2, YUY2 4K, PS5 home menu (animated, 60)
+trace:traces/mk2_yuy2_pausemenu_v4.csv ; ; self, notblocked, fps@3-20=60+-1 ; Elgato 4K Mk2, YUY2 4K, GTA V pause menu (animated grain background, 60)

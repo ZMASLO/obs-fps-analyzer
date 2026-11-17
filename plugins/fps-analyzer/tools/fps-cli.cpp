@@ -148,6 +148,8 @@ struct ReplayResult {
     struct fps_beat beat = {};   // verdict at the end of the trace (beat= / nobeat)
     double first_clear_s = -1;   // first second the signal check said CLEAR (clear<=)
     double first_detect_s = -1;  // first second a beat was confirmed
+    int delta_frames = 0;        // v4 F rows with a difference histogram (altered-frame check)
+    double first_altered_s = -1; // when the altered-frame check first held (blocked=altered)
     TraceHeader header;
     std::vector<Mismatch> mismatches;
 };
@@ -235,6 +237,17 @@ static ReplayResult replay_trace(const fs::path &path, double tol, bool verbose)
             bool want_sample = has(f, 7);
             double want_ft = dbl(f, 7), want_ema = dbl(f, 8), want_pf = dbl(f, 9);
             int want_pos = ival(f, 10), want_count = ival(f, 11);
+
+            // v4: the difference histogram drives the altered-frame check
+            if (f.size() >= 21 && has(f, 3) && has(f, 13)) {
+                uint32_t deltas[FPS_CORE_DELTA_BUCKETS];
+                for (int i = 0; i < FPS_CORE_DELTA_BUCKETS; i++)
+                    deltas[i] = (uint32_t)ll(f, 13 + i);
+                fps_core_debug_feed_deltas(core, (size_t)ll(f, 3), unique, deltas);
+                r.delta_frames++;
+                if (r.first_altered_s < 0 && fps_core_frames_altered(core))
+                    r.first_altered_s = first_ns ? (double)(now - first_ns) / 1e9 : 0.0;
+            }
 
             fps_core_debug_feed_decision(core, unique, tear, now);
             struct fps_core_frame_debug d;
@@ -890,6 +903,20 @@ static int run_manifest(const fs::path &manifest, double tol, bool verbose, bool
                     bool honest = !(r.first_clear_s >= 0 && (r.first_detect_s < 0 || r.first_clear_s < r.first_detect_s));
                     printf("  %s never CLEAR before the warning\n", honest ? "[ok]" : "[FAIL]");
                     ok = ok && good && honest;
+                    continue;
+                }
+                // Altered-frame check (v4 traces): "blocked=altered" - the
+                // capture device alters every frame and the FPS is hidden;
+                // "notblocked" - it never was
+                if (spec == "blocked=altered" || spec == "notblocked") {
+                    bool have = r.delta_frames > 0;
+                    bool blocked = r.first_altered_s >= 0;
+                    bool good = have && (spec == "notblocked" ? !blocked : blocked);
+                    std::string what = !have ? "no v4 difference histogram in this trace"
+                                       : blocked ? "altered after " + num(r.first_altered_s) + " s"
+                                                 : "never altered";
+                    printf("  %s %s: %s\n", good ? "[ok]" : "[FAIL]", spec.c_str(), what.c_str());
+                    ok = ok && good;
                     continue;
                 }
                 // "clear<=45": the signal check ended CLEAR within 45 s

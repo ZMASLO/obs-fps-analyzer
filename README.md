@@ -16,12 +16,32 @@ Don't get me wrong, trdrop is a good tool and I have great respect for the autho
 - **Works only with V-SYNC enabled**
 - **Some OBS limitations**
 
-## Tested Hardware:
-- **Elgato HD60 X** (Works OK)
-- **Elgato 4K Mk2** (doesn't work properly due to laggy OBS preview)
-- **Avermedia Livegamer 4K** (Works OK)
+## Supported capture devices:
 
-If you have different capture card please report if it works correctly.
+The FPS is counted from frames that differ from the previous one, so it is only exact when the capture card passes every frame through **untouched**: a frame the game repeated must arrive byte for byte identical. When a reading cannot be exact, the plugin does not show a number at all, it shows the reason instead (see **Reliability check** below). A wrong FPS is worse than none.
+
+- **Elgato 4K Mk2** (PCI-E) — **works**. Tested with v0.5.2 (YUY2 4K, PS5): repeated frames are identical, a 30 FPS game reads 30
+- **Elgato HD60 X** — works (reported earlier)
+- **Avermedia Livegamer 4K** — works (reported earlier)
+- **Elgato 4K X** (USB) — **not supported, the FPS is hidden**. The card alters every frame (dithering): a frame the game repeated arrives with ±1 luma differences on 6–34 % of its pixels, so it counts as new and a 30 FPS game reads 60. Tested with a PS5 in every mode the card offers in OBS, none of them passes frames untouched:
+
+  | 4K X capture mode | PS5 signal | Repeated frame differs on | Reading (game at 30) |
+  |---|---|---|---|
+  | NV12 4K60 | 4K YUV 10-bit HDR | 15–20 % of pixels | 60 |
+  | NV12 4K60 | 4K RGB 8-bit SDR | 27–30 % | 60 |
+  | I420 4K60 | 4K RGB 8-bit SDR | 8–10 % | 60 |
+  | YUY2 1080p60 | 4K RGB 8-bit SDR | 6–7 % | 60 |
+  | XRGB 1080p60 | 4K RGB 8-bit SDR | 6–8 % | 60 |
+  | XRGB 1080p60 | 1080p RGB, limited or full range | 31–34 % | 60 |
+  | MJPEG (any) | any | compressed, see below | 60 |
+
+  Even a paused game, where nothing on screen moves, arrives as a different picture on every frame. The same console on a 4K Mk2 gives identical repeats
+
+If you have a different capture card, please report whether it works: record an FPS trace (Debug options) with a game capped at 30 FPS and open an issue with the file.
+
+## Supported formats:
+- **Pixel formats** the analysis reads: NV12, I420, I422, I444, YUY2, UYVY, BGRA, **BGRX** (XRGB capture, newly supported), RGBA. Any other format (P010, I010, YVYU, Y800, AYUV, …) shows `FPS not measured: unsupported video format (P010)` and no number
+- **Compressed capture formats** (MJPEG, H.264, HEVC) in Video Capture Device → Video Format are **not supported**: every frame is compressed on its own, so a frame the game repeated decodes to a slightly different picture and counts as new. The plugin shows `FPS not measured: the capture device sends MJPEG…` instead of a number. Set Video Format to an uncompressed one (NV12, YUY2, I420). Leave it on an explicit format rather than "Any": with "Any" OBS may pick MJPEG without saying so (the altered-frame check below still catches it)
 
 ## Installation:
 Copy `fps-analyzer.dll` to `C:\Program Files\obs-studio\obs-plugins\64bit`
@@ -54,6 +74,15 @@ The plugin offers two different image analysis methods:
 - **Settings**: "Sensitivity threshold" slider (0.0-5.0%)
 
 
+### Reliability check (FPS hidden when it cannot be exact):
+- **Setting**: "Block FPS when the capture is unreliable (recommended)" in the filter, **on** by default. Turn it off only for testing: the readings are then shown, but they can be wrong, and the overlay says `(reliability check off)`
+- **What it blocks**: a compressed capture format (above) and a capture device that **alters every frame**. Instead of FPS, frametime and the graphs the overlay shows the reason, e.g. `FPS not measured: the capture device alters every frame (repeated frames are never identical)…`. Nothing is written to the CSV/TXT output while blocked, and the OBS log gets one line when it starts and one when it ends
+- **How a frame-altering device is recognised**: the filter sorts every difference between consecutive frames by size. A dithering card makes a repeated frame differ only by 1–2 luma levels, while new game content always has larger differences somewhere. 90 frames in a row that were counted as new although every difference was at most 2 levels, with no identical frame in between (~3 s of a 30 FPS game, ~1.5 s on a still picture), hide the FPS. 5 identical frames, which only a device that passes frames untouched can deliver, bring it back
+- **Limitations**:
+  - a game at a locked 60 FPS has no repeated frames, so a frame-altering device cannot be told apart until the picture stands still or the game drops a frame; the reading is then 60, which is right until the first repeat
+  - on a good card, a fade lasting more than ~1.5 s in which every frame changes by at most 2 levels, with no repeated frame, can hide the FPS until the next repeated frame
+- **Cost**: the size sort runs in the same loop as the frame comparison, on the same pixels (one line with "Last line diff")
+
 ### Upscale Source Resolution Detection:
 - **Independent feature**: Works with any analysis method
 - **Description**: Estimates the internal render resolution the image was upscaled from (e.g. a console game rendering at 1280x720 output as 1920x1080)
@@ -80,7 +109,7 @@ The plugin offers two different image analysis methods:
 - **Settings** (filter, under the "Debug options" checkbox): "Frame dump folder", "Dump label (case name)", "Frames per dump" (default 16), "Start delay after button" (default 5 s — time to Alt+Tab back into the game) and a "Dump frames now" button
 - **Status**: a "Dump status" label under the button counts down the delay, shows the frame being written and reports completion with the output folder
 - **Hotkey**: "FPS Analyzer: dump frames (debug)" in Settings → Hotkeys (top, global section) starts a dump immediately, without leaving the game
-- **FPS trace** ("Record FPS trace (per-frame CSV)"): while enabled, writes `fpstrace_<label>_<timestamp>.csv` into the dump folder — one row per analysed frame (analysis timestamp, diff %, unique/tearing decision, frametime, EMA, per-frame FPS) and one per published tick (window, FPS, frametime). Since v3 each frame row also carries the source frame timestamp, and a K row per OBS video tick records how many source frames reached the filter on that tick (0 = OBS repeated the previous frame); the header records the OBS FPS and the capture device's frame interval. These are what tells a repeat made by the capture card apart from one made by OBS. A few KB per second. Recording starts after "Start delay" so you can Alt+Tab into the game first, and the status line below the checkbox counts down and then shows the frame count. The hotkey "FPS Analyzer: start/stop FPS trace (debug)" skips the countdown and also stops the recording, so a session can be started and ended from inside the game. These traces are the fixtures the offline test tools replay to pin the FPS algorithm's behaviour across versions.
+- **FPS trace** ("Record FPS trace (per-frame CSV)"): while enabled, writes `fpstrace_<label>_<timestamp>.csv` into the dump folder — one row per analysed frame (analysis timestamp, diff %, unique/tearing decision, frametime, EMA, per-frame FPS) and one per published tick (window, FPS, frametime). Since v3 each frame row also carries the source frame timestamp, and a K row per OBS video tick records how many source frames reached the filter on that tick (0 = OBS repeated the previous frame); the header records the OBS FPS and the capture device's frame interval. These are what tells a repeat made by the capture card apart from one made by OBS. Since v4 each frame row also counts the compared bytes by the size of their difference (|d| = 0, 1, 2, 3–4, 5–8, 9–16, 17–32, >32) and the header records the device's Video Format, which is what the reliability check reads and replays. A few KB per second. Recording starts after "Start delay" so you can Alt+Tab into the game first, and the status line below the checkbox counts down and then shows the frame count. The hotkey "FPS Analyzer: start/stop FPS trace (debug)" skips the countdown and also stops the recording, so a session can be started and ended from inside the game. These traces are the fixtures the offline test tools replay to pin the FPS algorithm's behaviour across versions.
 - **What it writes**: the next N full-frame luma planes fed to the resolution detector (one every 0.5 s) as `frame_NNNN.pgm` (binary PGM, 8-bit) into `<folder>/<label>_<timestamp>/`, plus `frames.csv` with time, frame size, video format and the detection result at each frame
 - **Purpose**: build a test corpus of real captured frames for the offline detector harness — the dumps are byte-for-byte what the detector sees in OBS (unlike screenshots, which miss capture-card processing; never use JPG — its 8x8 block compression creates fake cutoffs)
 
@@ -94,6 +123,7 @@ Both tools build with the plugin (CMake option `FPS_ANALYZER_BUILD_TOOLS`, on by
 - **Independent feature**: Works with any analysis method, capture cards and cameras only (Video Capture Device and other async sources)
 - **Description**: Measures the real refresh rate of the incoming signal from the timestamps the capture card driver puts on every frame, and compares it with the OBS FPS (Settings → Video)
 - **Why it matters**: A capture card is locked to the HDMI signal. **"Match output FPS"** in Video Capture Device only picks the card's advertised format; it does not change the rate the card delivers. A PS5 sends **59.94 Hz** (Elgato Studio shows it as `2160p59`), so with OBS at 60 FPS the two clocks beat and OBS repeats a frame every `1 / |f_source − f_OBS|` seconds (~17 s). The FPS graph then shows a dip at that interval even though the game runs at a locked 60
+- **Computed only when shown**: the timestamp check and the cadence check below run only while an active overlay has "Show Source refresh rate" ticked. Untick it in every overlay and the filter stops both (the log says `Source refresh rate check off`); tick it again and the check starts over. Without such an overlay there are no `Capture beat` lines in the log either
 - **Overlay**: "Show Source refresh rate" (default: on) adds a line under the FPS text:
   - `Source: 59.94 Hz | OBS: 59.94 FPS - OK`
   - `Source: 59.94 Hz | OBS: 60 FPS - duplicate every ~17 s` + the OBS FPS to set
@@ -111,6 +141,7 @@ Both tools build with the plugin (CMake option `FPS_ANALYZER_BUILD_TOOLS`, on by
 - **Limitation**: OBS only passes the frames it picks for its own clock, so a source running at 2× the OBS FPS or more is measured at its effective rate (119.88 Hz at OBS 60 reads as 59.94), which is also the rate that beats against OBS
 - **Log**: each verdict change writes one line, e.g. `[FPS Analyzer] Source 59.944 Hz vs OBS 60.000 FPS: mismatch, duplicate/skip every 18.0 s`
 - **Offline test**: `srate-selftest` (built with the tools) simulates the OBS frame pick for 59.94/60/119.88/29.97 sources, signal loss and variable rate; `fps-selftest` (scenario `s23_capture_beat`) simulates card and OBS repeats, clock drift, random game drops and a 30 fps game; `tests/cases.txt` replays two recordings from a 4K X with a PS5. `ctest` runs all of them
+- **Offline test of the reliability check**: `fps-selftest` scenario `s24_altered_frames` simulates a dithering card (game at 30 and 60, still picture), a good card with fades and noise below the sensitivity threshold, and a card that stops dithering; `tests/cases.txt` replays seven v4 recordings with a PS5: the 4K X in NV12/I420 with a game at 30, the home menu and a paused game (`blocked=altered`), and the 4K Mk2 with a game at 30, the home menu and the pause menu (`notblocked` and the right FPS)
 
 ### Regression tests for the FPS analysis (`fps-selftest`):
 The FPS numbers the overlay shows come from unique-frame detection, frametime history, EMA smoothing and a per-tick averaging window. `fps-selftest` freezes that behaviour so a later change cannot alter the readings unnoticed.

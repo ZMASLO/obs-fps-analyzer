@@ -39,6 +39,7 @@ void fps_analyzer_unregister_hotkeys(void);
 
 struct fps_overlay_source
 {
+    obs_source_t *self;
     obs_source_t *text_source;
     obs_source_t *label_frametime;
     obs_source_t *label_fps;
@@ -157,6 +158,14 @@ static void set_label_text(obs_source_t *label, const char *text)
     obs_data_set_string(settings, "text", text);
     obs_source_update(label, settings);
     obs_data_release(settings);
+}
+
+// Is there a text block at the top? A blocked reading always shows its
+// reason, whatever is ticked.
+static bool overlay_any_text(const struct fps_overlay_source *ctx)
+{
+    return ctx->show_fps_text || ctx->show_frametime_text || ctx->show_tearing_text ||
+           ctx->show_resolution_text || g_fps_shared.blocked_reason != FPS_BLOCK_NONE;
 }
 
 // --- Source refresh rate line ---
@@ -734,8 +743,8 @@ static void rebuild_grid_labels(struct fps_overlay_source *ctx)
 
 static void *fps_overlay_create(obs_data_t *settings, obs_source_t *source)
 {
-    UNUSED_PARAMETER(source);
     struct fps_overlay_source *ctx = (fps_overlay_source *)bzalloc(sizeof(struct fps_overlay_source));
+    ctx->self = source;
 
     ctx->font_size = (int)obs_data_get_int(settings, "font_size");
     if (ctx->font_size <= 0)
@@ -986,18 +995,36 @@ static void fps_overlay_tick(void *data, float seconds)
                  "for accurate results.",
                  g_fps_shared.active_filter_count);
     }
-    else if (g_fps_shared.unsupported_format >= 0)
+    else if (g_fps_shared.blocked_reason == FPS_BLOCK_PIXFMT)
+    {
+        // No number at all: a reading that cannot be exact is not shown
+        snprintf(text, sizeof(text),
+                 "FPS not measured: unsupported video format (%s).\n"
+                 "Supported: NV12, I420, I422, I444, YUY2, UYVY,\n"
+                 "BGRA, BGRX (XRGB), RGBA. See README: Supported formats.",
+                 g_fps_shared.blocked_detail);
+    }
+    else if (g_fps_shared.blocked_reason == FPS_BLOCK_COMPRESSED)
     {
         snprintf(text, sizeof(text),
-                 "Unsupported video format (id: %d).\n"
-                 "Supported: NV12, I420, I422, I444,\n"
-                 "YUY2, UYVY, BGRA, RGBA.",
-                 g_fps_shared.unsupported_format);
+                 "FPS not measured: the capture device sends %s,\n"
+                 "a compressed format - repeated frames are not identical.\n"
+                 "Set its Video Format to NV12 or YUY2. See README.",
+                 g_fps_shared.blocked_detail);
+    }
+    else if (g_fps_shared.blocked_reason == FPS_BLOCK_ALTERED)
+    {
+        snprintf(text, sizeof(text),
+                 "FPS not measured: the capture device alters every frame\n"
+                 "(repeated frames are never identical), so the FPS\n"
+                 "cannot be measured exactly. See README: Supported capture devices.");
     }
     else
     {
         text[0] = '\0';
         int pos = 0;
+        if (g_fps_shared.reliability_off)
+            pos += snprintf(text + pos, sizeof(text) - pos, "(reliability check off)\n");
         if (ctx->show_fps_text)
             pos += snprintf(text + pos, sizeof(text) - pos, "FPS: %d", g_fps_shared.fps);
         if (ctx->show_frametime_text)
@@ -1079,7 +1106,10 @@ static void fps_overlay_tick(void *data, float seconds)
         }
     }
 
-    // Source refresh rate line — relabel only on change
+    // Source refresh rate line — relabel only on change. Showing it is what
+    // makes the filter compute it (srate_wanted_ns): hidden, it costs nothing.
+    if (ctx->show_source_rate && obs_source_active(ctx->self))
+        g_fps_shared.srate_wanted_ns = os_gettime_ns();
     if (ctx->show_source_rate)
     {
         char srate_text[sizeof(ctx->srate_text)];
@@ -1121,8 +1151,7 @@ static void fps_overlay_render(void *data, gs_effect_t *effect)
     bool show_spec = spectrum_visible(ctx);
 
     // 1. Render text at top with margin
-    bool any_text = ctx->show_fps_text || ctx->show_frametime_text ||
-                    ctx->show_tearing_text || ctx->show_resolution_text;
+    bool any_text = overlay_any_text(ctx);
     uint32_t y_offset = 0;
     if (any_text && ctx->text_source)
     {
@@ -1231,8 +1260,7 @@ static void fps_overlay_render(void *data, gs_effect_t *effect)
 static uint32_t fps_overlay_get_width(void *data)
 {
     struct fps_overlay_source *ctx = (struct fps_overlay_source *)data;
-    bool any_text = ctx->show_fps_text || ctx->show_frametime_text ||
-                    ctx->show_tearing_text || ctx->show_resolution_text;
+    bool any_text = overlay_any_text(ctx);
     uint32_t max_w = 0;
     if (any_text && ctx->text_source)
         max_w = obs_source_get_width(ctx->text_source) + GRAPH_MARGIN * 2;
@@ -1268,8 +1296,7 @@ static uint32_t fps_overlay_get_width(void *data)
 static uint32_t fps_overlay_get_height(void *data)
 {
     struct fps_overlay_source *ctx = (struct fps_overlay_source *)data;
-    bool any_text = ctx->show_fps_text || ctx->show_frametime_text ||
-                    ctx->show_tearing_text || ctx->show_resolution_text;
+    bool any_text = overlay_any_text(ctx);
     uint32_t text_h = 0;
     if (any_text && ctx->text_source)
         text_h = obs_source_get_height(ctx->text_source) + GRAPH_MARGIN * 2;

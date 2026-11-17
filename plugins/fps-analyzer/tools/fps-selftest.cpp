@@ -784,6 +784,13 @@ static void s14_luma(Runner &r)
         memcpy(g.buf.data(), qx, sizeof(qx));
         r.check(impl.extract(g.view(), luma, 0, 1) && memcmp(luma, expect, 5) == 0, "RGBA luma matches");
         logv("RGBA", luma, 5);
+        // BGRX (XRGB capture) goes through the BGRA path: the 4th byte is
+        // padding, often garbage, and must not change the luma
+        Frame x = make_frame(FPS_PIXFMT_BGRA, 5, 1);
+        uint8_t xx[5][4] = {{255, 255, 255, 0}, {0, 0, 0, 17}, {0, 0, 255, 128}, {0, 255, 0, 200}, {255, 0, 0, 77}};
+        memcpy(x.buf.data(), xx, sizeof(xx));
+        r.check(impl.extract(x.view(), luma, 0, 1) && memcmp(luma, expect, 5) == 0,
+                "BGRX luma ignores the 4th byte (got %u %u %u %u %u)", luma[0], luma[1], luma[2], luma[3], luma[4]);
     }
     // grey ramp through BGRA: ((i*220+128)>>8)+16, range [16,235], no wrap
     {
@@ -1452,6 +1459,193 @@ static void b_report(Runner &r, const char *name, const BeatRun &br)
                br.beat.chain, br.beat.clusters, br.first_detect_s);
 }
 
+// --- s24: altered-frame check (capture devices that dither every frame) ---
+struct AltSim {
+    int game_div = 2;          // new content every game_div source frames (60 Hz source)
+    bool still = false;        // content never changes after the first frame
+    int fade_frames = 0;       // the first N new-content frames are a +1 brightness step (tiny change)
+    double noise_p = 0.0;      // the card: fraction of pixels moved by 1..noise_max on every frame
+    int noise_max = 1;
+    double clean_after_s = -1; // the card stops adding noise from this second on
+    bool measure = true;       // params.measure_deltas
+    double sensitivity = -1;   // params.sensitivity, -1 = default
+    uint64_t seed = 3;
+};
+struct AltRun {
+    double first_altered_s = -1;
+    double cleared_s = -1;     // first second it was not altered after having been
+    bool altered_end = false;
+    int fps_end = 0;
+    bool hist_ok = true;       // every compared frame: sum(deltas) == size, diff == size - d0
+};
+
+static AltRun run_altered(const AltSim &s, double seconds)
+{
+    AltRun ar;
+    fps_core_params p = fps_core_params_defaults();
+    p.measure_deltas = s.measure;
+    if (s.sensitivity >= 0)
+        p.sensitivity = s.sensitivity;
+    fps_core *c = fps_core_create(&p);
+    const uint32_t W = 512, H = 4;
+    Frame content = make_frame(FPS_PIXFMT_NV12, W, H);
+    Frame out = make_frame(FPS_PIXFMT_NV12, W, H);
+    uint64_t rng = s.seed * 0x9E3779B97F4A7C15ull + 7;
+    auto rnd = [&rng]() {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        return rng;
+    };
+    int new_frames = 0;
+    fps_core_output o{};
+    const uint64_t n = (uint64_t)(seconds * 60);
+    for (uint64_t k = 0; k < n; k++) {
+        uint64_t now = at(k, 60);
+        double t = secs(now);
+        bool fresh = k == 0 || (!s.still && k % (uint64_t)s.game_div == 0);
+        if (fresh) {
+            if (k > 0 && new_frames <= s.fade_frames) {
+                for (auto &v : content.buf)
+                    v = (uint8_t)(v < 235 ? v + 1 : v); // a slow fade: one level per new frame
+            } else {
+                for (auto &v : content.buf)
+                    v = (uint8_t)(32 + rnd() % 160);
+            }
+            new_frames++;
+        }
+        out.buf = content.buf;
+        bool noisy = s.noise_p > 0.0 && !(s.clean_after_s >= 0 && t >= s.clean_after_s);
+        if (noisy) {
+            for (auto &v : out.buf) {
+                if ((double)(rnd() % 10000) / 10000.0 < s.noise_p) {
+                    int d = 1 + (int)(rnd() % (uint64_t)s.noise_max);
+                    v = (uint8_t)((rnd() & 1) ? v + d : v - d);
+                }
+            }
+        }
+        fps_frame_view view = out.view();
+        fps_core_feed(c, &view, now);
+        fps_core_frame_debug d;
+        fps_core_debug_last_frame(c, &d);
+        if (d.deltas_valid) {
+            uint64_t sum = 0;
+            for (int i = 0; i < FPS_CORE_DELTA_BUCKETS; i++)
+                sum += d.deltas[i];
+            ar.hist_ok = ar.hist_ok && sum == d.luma_size && d.diff == d.luma_size - d.deltas[0];
+        }
+        fps_core_tick(c, now, &o);
+        bool alt = fps_core_frames_altered(c);
+        if (alt && ar.first_altered_s < 0)
+            ar.first_altered_s = t;
+        if (!alt && ar.first_altered_s >= 0 && ar.cleared_s < 0)
+            ar.cleared_s = t;
+    }
+    ar.altered_end = fps_core_frames_altered(c);
+    ar.fps_end = o.fps;
+    fps_core_destroy(c);
+    return ar;
+}
+
+static void s24_altered_frames(Runner &r)
+{
+    r.begin("s24_altered_frames", fps_core_params_defaults());
+    {   // a good card, game at 30: repeats are identical, never altered, reads 30
+        AltSim s;
+        AltRun a = run_altered(s, 20);
+        r.check(a.first_altered_s < 0 && a.fps_end == 30, "good card, game 30: not altered, %d FPS", a.fps_end);
+        r.check(a.hist_ok, "difference histogram adds up to the compared bytes and matches diff");
+    }
+    {   // a dithering card (4K X): +-1 on 28% of pixels, game at 30 -> altered in ~3 s
+        AltSim s;
+        s.noise_p = 0.28;
+        AltRun a = run_altered(s, 20);
+        r.check(a.first_altered_s > 0 && a.first_altered_s <= 3.5 && a.altered_end,
+                "dithering card, game 30: altered after %.2f s (<= 3.5), still at the end", a.first_altered_s);
+    }
+    {   // the same card on a still picture: every frame is a tiny-only "new" frame
+        // (+-1 on both frames compared: differences up to 2, as on the 4K X)
+        AltSim s;
+        s.noise_p = 0.10;
+        s.still = true;
+        AltRun a = run_altered(s, 10);
+        r.check(a.first_altered_s > 0 && a.first_altered_s <= 2.0,
+                "dithering card, still picture: altered after %.2f s (<= 2)", a.first_altered_s);
+    }
+    {   // a dithering card with a game at a locked 60: no repeats, nothing to tell (README limitation)
+        AltSim s;
+        s.noise_p = 0.28;
+        s.game_div = 1;
+        AltRun a = run_altered(s, 20);
+        r.check(a.first_altered_s < 0, "dithering card, game 60: not decidable, not altered");
+    }
+    {   // differences above 2 levels are content, not dither: the rule stops at |d| <= 2
+        // (+-2 on both frames compared reaches 3 and 4)
+        AltSim s;
+        s.noise_p = 0.5;
+        s.noise_max = 2;
+        s.still = true;
+        AltRun a = run_altered(s, 10);
+        r.check(a.first_altered_s < 0, "changes of up to 3 levels count as content: not altered");
+    }
+    {   // a good card, a 1 s fade at 60 (tiny changes only): below the trigger, not altered
+        AltSim s;
+        s.game_div = 1;
+        s.fade_frames = 60;
+        AltRun a = run_altered(s, 1.2);
+        r.check(a.first_altered_s < 0, "good card, 1 s fade at 60: not altered");
+    }
+    {   // a good card, a 3 s fade in a 30 FPS game: the repeats are identical and keep it clear
+        AltSim s;
+        s.fade_frames = 90;
+        AltRun a = run_altered(s, 10);
+        r.check(a.first_altered_s < 0, "good card, 3 s fade in a 30 FPS game: identical repeats keep it clear");
+    }
+    {   // a good card, a 3 s fade at 60 followed by a 30 FPS game: the fade can trip the
+        // check (no repeat to prove the card), the first identical repeats clear it
+        AltSim s;
+        s.game_div = 1;
+        s.fade_frames = 180;
+        AltRun a = run_altered(s, 3.0);
+        r.check(a.first_altered_s > 0, "good card, 3 s fade at 60: trips the check (documented limitation)");
+    }
+    {   // the card stops dithering (format switched): identical frames clear it quickly
+        AltSim s;
+        s.noise_p = 0.28;
+        s.clean_after_s = 6.0;
+        AltRun a = run_altered(s, 12);
+        r.check(a.first_altered_s > 0 && a.cleared_s > 6.0 && a.cleared_s < 6.5 && !a.altered_end,
+                "dithering stops at 6 s: altered at %.2f s, cleared at %.2f s", a.first_altered_s, a.cleared_s);
+    }
+    {   // noise below the sensitivity threshold: the repeats are not counted as new, the
+        // reading is right (30), so there is nothing to hide
+        AltSim s;
+        s.noise_p = 0.01;
+        s.sensitivity = 5.0;
+        AltRun a = run_altered(s, 20);
+        r.check(a.first_altered_s < 0 && a.fps_end == 30,
+                "noise below the sensitivity threshold: reads %d, not altered", a.fps_end);
+    }
+    {   // the check needs the histogram: with measure_deltas off it never runs
+        AltSim s;
+        s.noise_p = 0.28;
+        s.measure = false;
+        AltRun a = run_altered(s, 10);
+        r.check(a.first_altered_s < 0, "measure_deltas off: the check does not run");
+    }
+    {   // the beat detector can be switched off: no clusters, no verdict
+        fps_core_params p = fps_core_params_defaults();
+        p.beat_enabled = false;
+        fps_core *c = fps_core_create(&p);
+        for (int k = 0; k < 60 * 120; k++)
+            fps_core_obs_tick(c, at((uint64_t)k, 60), (k % 1000 == 999) ? 0 : 1); // an OBS repeat every ~16.7 s
+        fps_beat b;
+        fps_core_get_beat(c, at(60 * 120, 60), 60.0, &b);
+        r.check(b.clusters == 0 && !b.detected, "beat_enabled off: no clusters (%d), no verdict", b.clusters);
+        fps_core_destroy(c);
+    }
+}
+
 static void s23_capture_beat(Runner &r)
 {
     r.begin("s23_capture_beat", fps_core_params_defaults());
@@ -1784,6 +1978,7 @@ int main(int argc, char **argv)
     s22_above_clamp(r);
 #ifdef FPS_SELFTEST_HAVE_CORE
     s23_capture_beat(r);
+    s24_altered_frames(r);
 #endif
 
     printf(r.fails ? "RESULT: %d FAILURES\n" : "RESULT: ALL OK\n", r.fails);

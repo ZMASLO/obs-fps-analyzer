@@ -18,7 +18,7 @@
 #include "source-rate.h"
 
 // Global shared data — read by fps-analyzer-overlay.cpp
-struct fps_shared_data g_fps_shared = {0, 0.0, false, 0, 0, -1, {}, 0};
+struct fps_shared_data g_fps_shared = {};
 
 // Declare overlay info for registration in overlay file
 extern struct obs_source_info fps_overlay_source_info;
@@ -110,6 +110,14 @@ struct fps_analyzer_filter {
     bool beat_seen_rates;         // beat_obs_hz / beat_device_hz are set
     double beat_obs_hz;           // rates the current signal check runs under
     double beat_device_hz;
+    // Reliability: no FPS where it cannot be measured exactly
+    bool block_unreliable;        // "block_unreliable" setting (default on)
+    int unsupported_fmt;          // VIDEO_FORMAT_* of the last async frame the core cannot read, -1 = ok
+    int blocked_reason;           // FPS_BLOCK_* last published (for the log)
+    // What the core is asked to compute, kept in step with the settings and
+    // with the overlay's demand (core_sync)
+    bool core_measure_deltas;
+    bool core_beat_enabled;
 };
 
 // --- Utility functions ---
@@ -154,7 +162,9 @@ static int core_pixfmt(enum video_format f) {
     case VIDEO_FORMAT_I422: return FPS_PIXFMT_I422;
     case VIDEO_FORMAT_YUY2: return FPS_PIXFMT_YUY2;
     case VIDEO_FORMAT_UYVY: return FPS_PIXFMT_UYVY;
-    case VIDEO_FORMAT_BGRA: return FPS_PIXFMT_BGRA;
+    case VIDEO_FORMAT_BGRA:
+    case VIDEO_FORMAT_BGRX: // XRGB capture: same bytes as BGRA, the 4th one is ignored
+        return FPS_PIXFMT_BGRA;
     case VIDEO_FORMAT_RGBA: return FPS_PIXFMT_RGBA;
     default: return FPS_PIXFMT_UNSUPPORTED;
     }
@@ -167,6 +177,8 @@ static struct fps_core_params core_params(const struct fps_analyzer_filter *filt
     p.enable_tearing_detection = filter->enable_tearing_detection;
     p.tearing_sensitivity = filter->tearing_sensitivity;
     p.update_interval = filter->update_interval;
+    p.measure_deltas = filter->core_measure_deltas;
+    p.beat_enabled = filter->core_beat_enabled;
     return p;
 }
 
@@ -240,6 +252,7 @@ static bool extract_full_luma_async(struct obs_source_frame *frame, uint8_t *lum
         }
         return true;
     case VIDEO_FORMAT_BGRA:
+    case VIDEO_FORMAT_BGRX:
         bgra_to_luma(frame->data[0], frame->linesize[0], luma, width, height);
         return true;
     case VIDEO_FORMAT_RGBA:
@@ -278,6 +291,7 @@ static bool extract_crop_luma_async(struct obs_source_frame *frame, uint8_t *lum
         }
         return true;
     case VIDEO_FORMAT_BGRA:
+    case VIDEO_FORMAT_BGRX:
         bgra_to_luma(frame->data[0] + y0 * ls + x0 * 4, ls, luma, cw, ch);
         return true;
     case VIDEO_FORMAT_RGBA:
@@ -498,10 +512,11 @@ static void debug_dump_frame(struct fps_analyzer_filter *filter, const uint8_t *
 }
 
 // --- Debug: FPS trace recorder ---
-// Format (fpstrace v3):
-//   # fpstrace v3 ; plugin=... ; path=async|sync ; method=.. ; sens=.. ; tear=.. ; tsens=.. ; interval=.. ; w=.. ; h=.. ; fmt=..
+// Format (fpstrace v4):
+//   # fpstrace v4 ; plugin=... ; path=async|sync ; method=.. ; sens=.. ; tear=.. ; tsens=.. ; interval=.. ; w=.. ; h=.. ; fmt=..
 //     ; obs_fps=num/den ; dev_interval=.. (the parent's "frame_interval" setting, 100 ns units; empty if none)
-//   F,now_ns,luma_size,diff,percent,unique,tear,ft_ms,ema,fps_pf,pos,count,src_ts
+//     ; dev_format=.. (the parent's "video_format" setting, win-dshow VideoFormat; empty if none)
+//   F,now_ns,luma_size,diff,percent,unique,tear,ft_ms,ema,fps_pf,pos,count,src_ts,d0,d1,d2,d3,d4,d5,d6,d7
 //   T,now_ns,window,avg_ft,fps,frametime_ms,tearing,graph_count
 //   K,now_ns,video_time_ns,frames
 // diff/percent are empty when no comparison happened (first frame / size
@@ -511,6 +526,10 @@ static void debug_dump_frame(struct fps_analyzer_filter *filter, const uint8_t *
 // filter_video since the previous tick. OBS calls an async filter only on a
 // tick where it picked a new source frame, so frames=0 is a tick on which OBS
 // repeated the previous frame. v2 lacked src_ts and K; replay ignores both.
+// d0..d7 (v4) count the compared bytes by the size of their difference:
+// |d| = 0, 1, 2, 3-4, 5-8, 9-16, 17-32, >32 (empty when nothing was compared).
+// They tell a card that alters every frame (only tiny differences) from
+// real new content.
 // Doubles use %.17g so they round-trip exactly. All row kinds are written
 // from the OBS video thread (async filters run inside the video tick).
 
@@ -524,6 +543,14 @@ static const char *trace_format_name(int fmt) {
     case VIDEO_FORMAT_YUY2: return "YUY2";
     case VIDEO_FORMAT_UYVY: return "UYVY";
     case VIDEO_FORMAT_BGRA: return "BGRA";
+    case VIDEO_FORMAT_BGRX: return "BGRX";
+    // not analysable, named for the "unsupported format" message
+    case VIDEO_FORMAT_YVYU: return "YVYU";
+    case VIDEO_FORMAT_Y800: return "Y800";
+    case VIDEO_FORMAT_BGR3: return "BGR3";
+    case VIDEO_FORMAT_AYUV: return "AYUV";
+    case VIDEO_FORMAT_I010: return "I010";
+    case VIDEO_FORMAT_P010: return "P010";
     case VIDEO_FORMAT_RGBA: return "RGBA";
     default:
         snprintf(buf, sizeof(buf), "%d", fmt);
@@ -623,24 +650,28 @@ static void trace_note_frame(struct fps_analyzer_filter *filter, int path_kind,
         struct obs_video_info ovi = {};
         bool have_ovi = obs_get_video_info(&ovi);
         char dev_interval[32] = "";
+        char dev_format[16] = "";
         obs_source_t *parent = obs_filter_get_parent(filter->context);
         obs_data_t *ps = parent ? obs_source_get_settings(parent) : NULL;
         if (ps) {
             if (obs_data_has_user_value(ps, "frame_interval") || obs_data_has_default_value(ps, "frame_interval"))
                 snprintf(dev_interval, sizeof(dev_interval), "%lld",
                          (long long)obs_data_get_int(ps, "frame_interval"));
+            if (obs_data_has_user_value(ps, "video_format") || obs_data_has_default_value(ps, "video_format"))
+                snprintf(dev_format, sizeof(dev_format), "%lld", (long long)obs_data_get_int(ps, "video_format"));
             obs_data_release(ps);
         }
 
         fprintf(filter->trace_file,
-                "# fpstrace v3 ; plugin=" FPS_TRACE_PLUGIN_VERSION " ; path=%s ; method=%d ; sens=%.17g ; "
+                "# fpstrace v4 ; plugin=" FPS_TRACE_PLUGIN_VERSION " ; path=%s ; method=%d ; sens=%.17g ; "
                 "tear=%d ; tsens=%.17g ; interval=%.17g ; w=%u ; h=%u ; fmt=%s ; obs_fps=%u/%u ; "
-                "dev_interval=%s\n",
+                "dev_interval=%s ; dev_format=%s\n",
                 path_kind == 2 ? "sync" : "async", (int)filter->analyze_method, filter->sensitivity,
                 filter->enable_tearing_detection ? 1 : 0, filter->tearing_sensitivity,
                 filter->update_interval, width, height, trace_format_name(format),
-                have_ovi ? ovi.fps_num : 0, have_ovi ? ovi.fps_den : 0, dev_interval);
-        fputs("# F,now_ns,luma_size,diff,percent,unique,tear,ft_ms,ema,fps_pf,pos,count,src_ts\n"
+                have_ovi ? ovi.fps_num : 0, have_ovi ? ovi.fps_den : 0, dev_interval, dev_format);
+        fputs("# F,now_ns,luma_size,diff,percent,unique,tear,ft_ms,ema,fps_pf,pos,count,src_ts,"
+              "d0,d1,d2,d3,d4,d5,d6,d7\n"
               "# T,now_ns,window,avg_ft,fps,frametime_ms,tearing,graph_count\n"
               "# K,now_ns,video_time_ns,frames\n",
               filter->trace_file);
@@ -664,9 +695,12 @@ static void trace_write_frame(struct fps_analyzer_filter *filter, uint64_t now) 
         fputs(",,,", t);
     fprintf(t, "%d,%d,", d.pos, d.count);
     if (filter->trace_src_ts)
-        fprintf(t, "%llu\n", (unsigned long long)filter->trace_src_ts);
+        fprintf(t, "%llu", (unsigned long long)filter->trace_src_ts);
+    if (d.deltas_valid)
+        fprintf(t, ",%u,%u,%u,%u,%u,%u,%u,%u\n", d.deltas[0], d.deltas[1], d.deltas[2], d.deltas[3],
+                d.deltas[4], d.deltas[5], d.deltas[6], d.deltas[7]);
     else
-        fputc('\n', t);
+        fputs(",,,,,,,,\n", t);
     filter->trace_rows++;
 }
 
@@ -700,7 +734,9 @@ static struct obs_source_frame *fps_analyzer_filter_video(void *data,
 
     // Faktyczna częstotliwość źródła — znacznik czasu nadany przez sterownik
     // karty, niezależny od formatu pikseli (liczone także dla nieobsługiwanych)
-    srate_push(filter->srate, frame->timestamp, os_gettime_ns());
+    // (only while an overlay shows the Source refresh rate line)
+    if (filter->core_beat_enabled)
+        srate_push(filter->srate, frame->timestamp, os_gettime_ns());
     filter->frames_since_tick++;
     filter->trace_src_ts = frame->timestamp;
 
@@ -721,10 +757,10 @@ static struct obs_source_frame *fps_analyzer_filter_video(void *data,
     view.data = frame->data[0];
     view.linesize = frame->linesize[0];
     if (view.format == FPS_PIXFMT_UNSUPPORTED) {
-        g_fps_shared.unsupported_format = (int)frame->format;
+        filter->unsupported_fmt = (int)frame->format;
         return frame;
     }
-    g_fps_shared.unsupported_format = -1;
+    filter->unsupported_fmt = -1;
 
     trace_note_frame(filter, 1, width, height, (int)frame->format);
     analyze_frame(filter, &view);
@@ -841,7 +877,7 @@ static void fps_analyzer_video_render(void *data, gs_effect_t *effect)
         view.data = video_data;
         view.linesize = video_linesize;
         analyze_frame(filter, &view);
-        g_fps_shared.unsupported_format = -1;
+        filter->unsupported_fmt = -1;
 
         // Detekcja rozdzielczości źródłowej (upscale) — pełna klatka co ~0.5s;
         // tym samym torem idzie debugowy zrzut klatek
@@ -914,6 +950,99 @@ static void read_device_rate(obs_source_t *parent, double obs_hz, double *hz, bo
     obs_data_release(ps);
 }
 
+// The capture device's "video_format" setting (win-dshow VideoFormat: 0 = any,
+// 100s RGB, 200s planar YUV, 300s packed YUV, 400+ compressed). -1 = the
+// source has no such setting.
+static int read_device_format(obs_source_t *parent)
+{
+    int vf = -1;
+    obs_data_t *ps = parent ? obs_source_get_settings(parent) : NULL;
+    if (!ps)
+        return vf;
+    if (obs_data_has_user_value(ps, "video_format") || obs_data_has_default_value(ps, "video_format"))
+        vf = (int)obs_data_get_int(ps, "video_format");
+    obs_data_release(ps);
+    return vf;
+}
+
+#define DSHOW_FORMAT_COMPRESSED 400 // MJPEG = 400, H264, HEVC
+
+static const char *compressed_format_name(int vf)
+{
+    switch (vf) {
+    case 400: return "MJPEG";
+    case 401: return "H.264";
+    case 402: return "HEVC";
+    default: return "compressed";
+    }
+}
+
+// An overlay showing the Source refresh rate line asks for it every tick;
+// the timestamp check and the beat detector run only while it does.
+static bool source_check_wanted(uint64_t now)
+{
+    uint64_t t = g_fps_shared.srate_wanted_ns;
+    return t && now >= t && now - t < 1000000000ULL;
+}
+
+// Keeps the core's optional work in step with what is needed: the |d|
+// histogram for the trace and the reliability check, the beat detector for
+// the overlay. Turning the beat back on starts its signal check over.
+static void core_sync(struct fps_analyzer_filter *filter, uint64_t now)
+{
+    bool measure = filter->trace_file != NULL || filter->block_unreliable;
+    bool beat = source_check_wanted(now);
+    if (measure == filter->core_measure_deltas && beat == filter->core_beat_enabled)
+        return;
+    bool beat_changed = beat != filter->core_beat_enabled;
+    filter->core_measure_deltas = measure;
+    filter->core_beat_enabled = beat;
+    struct fps_core_params p = core_params(filter);
+    fps_core_set_params(filter->core, &p);
+    if (beat_changed) {
+        if (beat)
+            fps_core_beat_reset(filter->core, now);
+        blog(LOG_INFO, "[FPS Analyzer] Source refresh rate check %s",
+             beat ? "on (shown in the overlay)" : "off (not shown in any overlay)");
+    }
+}
+
+// Can the FPS be measured exactly? Publishes the reason when it cannot.
+static void update_block(struct fps_analyzer_filter *filter, obs_source_t *parent)
+{
+    int reason = FPS_BLOCK_NONE;
+    const char *detail = "";
+    if (filter->unsupported_fmt >= 0) {
+        reason = FPS_BLOCK_PIXFMT;
+        detail = trace_format_name(filter->unsupported_fmt);
+    } else if (filter->block_unreliable) {
+        int vf = read_device_format(parent);
+        if (vf >= DSHOW_FORMAT_COMPRESSED) {
+            reason = FPS_BLOCK_COMPRESSED;
+            detail = compressed_format_name(vf);
+        } else if (fps_core_frames_altered(filter->core)) {
+            reason = FPS_BLOCK_ALTERED;
+        }
+    }
+    g_fps_shared.blocked_reason = reason;
+    snprintf(g_fps_shared.blocked_detail, sizeof(g_fps_shared.blocked_detail), "%s", detail);
+    g_fps_shared.reliability_off = !filter->block_unreliable;
+
+    if (reason != filter->blocked_reason) {
+        if (reason == FPS_BLOCK_PIXFMT)
+            blog(LOG_WARNING, "[FPS Analyzer] FPS hidden: unsupported video format %s", detail);
+        else if (reason == FPS_BLOCK_COMPRESSED)
+            blog(LOG_WARNING, "[FPS Analyzer] FPS hidden: the capture device sends %s, a compressed format "
+                 "whose repeated frames are not identical; set its Video Format to NV12 or YUY2", detail);
+        else if (reason == FPS_BLOCK_ALTERED)
+            blog(LOG_WARNING, "[FPS Analyzer] FPS hidden: the capture device alters every frame "
+                 "(repeated frames are never identical)");
+        else
+            blog(LOG_INFO, "[FPS Analyzer] FPS measurement possible again");
+        filter->blocked_reason = reason;
+    }
+}
+
 // Beat verdict from the frame cadence (fps-core). Works on both paths; on a
 // capture card it is the one that survives a device whose timestamps only
 // echo its configured rate.
@@ -977,6 +1106,11 @@ static void publish_source_rate(struct fps_analyzer_filter *filter, uint64_t now
     if (obs_get_video_info(&ovi) && ovi.fps_den > 0)
         obs_hz = (double)ovi.fps_num / ovi.fps_den;
     g_fps_shared.srate_obs_hz = obs_hz;
+    if (!filter->core_beat_enabled) {
+        // Nobody shows the line: neither check runs (core_sync)
+        g_fps_shared.srate_available = false;
+        return;
+    }
     publish_beat(filter, parent, now, obs_hz);
 
     g_fps_shared.srate_available = async && filter->srate;
@@ -1026,11 +1160,13 @@ static void fps_analyzer_video_tick(void *data, float seconds)
     UNUSED_PARAMETER(seconds);
     struct fps_analyzer_filter *filter = (struct fps_analyzer_filter *)data;
     uint64_t now = os_gettime_ns();
+    core_sync(filter, now);
 
     // Per OBS tick on an async source: how many source frames OBS handed to
     // the filter since the previous tick (0 = OBS repeated the previous
     // frame). Feeds the beat detector and the trace's K rows.
     obs_source_t *parent = obs_filter_get_parent(filter->context);
+    update_block(filter, parent);
     if (parent && (obs_source_get_output_flags(parent) & OBS_SOURCE_ASYNC)) {
         fps_core_obs_tick(filter->core, now, filter->frames_since_tick);
         if (filter->trace_file)
@@ -1085,6 +1221,21 @@ static void fps_analyzer_video_tick(void *data, float seconds)
         return;
     const int fps_smooth = out->fps;
     const double frametime_ms = out->frametime_ms;
+    if (filter->trace_file)
+        trace_write_tick(filter, now, out);
+
+    // FPS that cannot be measured exactly is not published at all: the
+    // overlay shows the reason (update_block) and the CSV gets nothing.
+    const bool blocked = g_fps_shared.blocked_reason != FPS_BLOCK_NONE;
+    if (blocked) {
+        g_fps_shared.fps = 0;
+        g_fps_shared.frametime_ms = 0.0;
+        g_fps_shared.tearing_detected = false;
+        g_fps_shared.graph_count = 0;
+        g_fps_shared.last_update_ns = now;
+        publish_source_rate(filter, now);
+        return;
+    }
 
     // Update shared data for overlay source
     g_fps_shared.fps = fps_smooth;
@@ -1101,8 +1252,6 @@ static void fps_analyzer_video_tick(void *data, float seconds)
     memcpy(g_fps_shared.graph_tearing, out->graph_tearing, sizeof(bool) * (size_t)count);
     g_fps_shared.graph_count = count;
 
-    if (filter->trace_file)
-        trace_write_tick(filter, now, out);
     publish_source_rate(filter, now);
 
     // Upscale resolution detection — publish latest result
@@ -1182,6 +1331,10 @@ static void *fps_analyzer_create(obs_data_t *settings, obs_source_t *context)
     filter->sensitivity = obs_data_get_double(settings, "sensitivity");
     filter->enable_tearing_detection = obs_data_get_bool(settings, "enable_tearing_detection");
     filter->tearing_sensitivity = obs_data_get_double(settings, "tearing_sensitivity");
+    filter->block_unreliable = obs_data_get_bool(settings, "block_unreliable");
+    filter->unsupported_fmt = -1;
+    filter->core_measure_deltas = filter->block_unreliable;
+    filter->core_beat_enabled = false; // until an overlay asks for it (core_sync)
     filter->core = NULL;
     core_recreate(filter);
     // Dynamic luma buffer
@@ -1316,6 +1469,15 @@ static obs_properties_t *fps_analyzer_properties(void *data)
     obs_property_list_add_float(interval, "1s", 1.0);
     obs_property_list_add_float(interval, "2s", 2.0);
 
+    // Reliability check
+    obs_property_t *block = obs_properties_add_bool(props, "block_unreliable",
+                                                    "Block FPS when the capture is unreliable (recommended)");
+    obs_property_set_long_description(block,
+        "Hides the FPS and shows the reason instead when it cannot be measured exactly: "
+        "a compressed capture format (MJPEG, H.264) or a capture device that alters every frame, "
+        "so repeated frames are never identical. Turn off only for testing: the readings are then "
+        "shown, but they can be wrong. See README: Supported capture devices.");
+
     // Tearing detection
     obs_properties_add_bool(props, "enable_tearing_detection", "Tearing detection");
     obs_properties_add_float_slider(props, "tearing_sensitivity", "Tearing sensitivity threshold (%)", 0.1, 10.0, 0.1);
@@ -1427,6 +1589,7 @@ static void fps_analyzer_update(void *data, obs_data_t *settings)
     filter->tearing_sensitivity = obs_data_get_double(settings, "tearing_sensitivity");
     filter->analyze_method = (analyze_method_t)obs_data_get_int(settings, "analyze_method");
     filter->sensitivity = obs_data_get_double(settings, "sensitivity");
+    filter->block_unreliable = obs_data_get_bool(settings, "block_unreliable");
     {
         struct fps_core_params p = core_params(filter);
         fps_core_set_params(filter->core, &p); // keeps the analysis state, as before
@@ -1478,6 +1641,7 @@ static void fps_analyzer_get_defaults(obs_data_t *settings)
     obs_data_set_default_bool(settings, "enable_csv", false);
     obs_data_set_default_bool(settings, "clear_csv_on_start", true);
     obs_data_set_default_bool(settings, "enable_tearing_detection", true);
+    obs_data_set_default_bool(settings, "block_unreliable", true);
     obs_data_set_default_double(settings, "tearing_sensitivity", 1.0);
     obs_data_set_default_int(settings, "analyze_method", ANALYZE_LAST_LINE);
     obs_data_set_default_double(settings, "sensitivity", 0.1);

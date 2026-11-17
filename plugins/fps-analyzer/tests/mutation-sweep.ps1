@@ -74,7 +74,15 @@ $mutations = @(
     @{ name = "sprawdzanie: brak resetu po utracie sygnalu"; find = 'now - b.last_activity > FPS_BEAT_RESET_GAP_NS'; repl = 'now - b.last_activity > 10 * FPS_BEAT_RESET_GAP_NS' },
     @{ name = "sprawdzanie: uneven nigdy";           find = 'out->uneven = irregular >= FPS_BEAT_UNEVEN_CLUSTERS;'; repl = 'out->uneven = false;' },
     @{ name = "sprawdzanie: uneven liczy dudnienie";  find = 'irregular += regular ? 0 : 1;'; repl = 'irregular += 1;' },
-    @{ name = "sprawdzanie: otwarty klaster pominiety"; find = 'if (b.in_cluster && !b.cluster_stall) {'; repl = 'if (false) {' }
+    @{ name = "sprawdzanie: otwarty klaster pominiety"; find = 'if (b.in_cluster && !b.cluster_stall) {'; repl = 'if (false) {' },
+    # Karta zmieniajaca klatki (dithering): FPS ukryty, gdy powtorki nigdy nie sa identyczne
+    @{ name = "zmienione klatki: drobne do |d|<=4";     find = 'for (int i = FPS_ALTERED_MAX_DELTA_BUCKET + 1; i < FPS_CORE_DELTA_BUCKETS; i++)'; repl = 'for (int i = FPS_ALTERED_MAX_DELTA_BUCKET + 2; i < FPS_CORE_DELTA_BUCKETS; i++)' },
+    @{ name = "zmienione klatki: kubelek |d|=2 jako 3-4"; find = 'if (d <= 2)'; repl = 'if (d <= 1)' },
+    @{ name = "zmienione klatki: identyczna nie zeruje";  find = "        if (!c->altered)`n            c->altered_noise_run = 0;"; repl = "        if (!c->altered)`n            (void)0;" },
+    @{ name = "zmienione klatki: nigdy nie zwalnia";      find = '++c->altered_exact >= FPS_ALTERED_CLEAR'; repl = '++c->altered_exact >= 1000000' },
+    @{ name = "zmienione klatki: liczy tez powtorki";     find = 'if (!unique || !tiny)'; repl = 'if (!tiny)' },
+    @{ name = "zmienione klatki: prog 1/3";              find = '++c->altered_noise_run >= FPS_ALTERED_TRIGGER'; repl = '++c->altered_noise_run >= FPS_ALTERED_TRIGGER / 3' },
+    @{ name = "dudnienie: wylaczenie ignorowane";         find = 'if (!c || !c->params.beat_enabled)'; repl = 'if (!c)' }
 )
 
 function Run-Layer([string]$exe, [string[]]$argv) {
@@ -120,6 +128,10 @@ try {
         if (-not $found) {
             $lf = $find.Replace("`r`n", "`n"); $rl = $repl.Replace("`r`n", "`n")
             if ($text.Contains($lf)) { $find = $lf; $repl = $rl; $found = $true }
+        }
+        if (-not $found) {
+            $crlf = $find.Replace("`r`n", "`n").Replace("`n", "`r`n"); $rcrlf = $repl.Replace("`r`n", "`n").Replace("`n", "`r`n")
+            if ($text.Contains($crlf)) { $find = $crlf; $repl = $rcrlf; $found = $true }
         }
         if (-not $found) {
             Write-Host ("{0,2}. {1,-42} POMINIETA (nie znaleziono wzorca w kodzie)" -f $i, $name) -ForegroundColor DarkYellow

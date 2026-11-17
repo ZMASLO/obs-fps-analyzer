@@ -58,6 +58,11 @@ struct fps_core {
 
     struct fps_core_frame_debug dbg = {};
 
+    // Altered-frame check (see FPS_ALTERED_TRIGGER)
+    int altered_noise_run = 0;   // tiny-only "new" frames since the last identical one
+    int altered_exact = 0;       // identical frames since the check triggered
+    bool altered = false;
+
     // Capture-path beat detector (observes only; see fps-core.h)
     struct beat_state {
         int clean_frames = 0;          // consecutive unique frames
@@ -100,12 +105,79 @@ static size_t count_diff_bytes(const uint8_t *a, const uint8_t *b, size_t size)
     return diff;
 }
 
+// Bucket of |d| (see FPS_CORE_DELTA_BUCKETS): 0, 1, 2, 3-4, 5-8, 9-16, 17-32, >32
+static int delta_bucket(int d)
+{
+    if (d <= 2)
+        return d;
+    if (d <= 4)
+        return 3;
+    if (d <= 8)
+        return 4;
+    if (d <= 16)
+        return 5;
+    if (d <= 32)
+        return 6;
+    return 7;
+}
+
+// count_diff_bytes plus the |d| histogram, in one pass. Returns the same
+// count of differing bytes (everything outside bucket 0).
+static size_t count_diff_deltas(const uint8_t *a, const uint8_t *b, size_t size,
+                                uint32_t hist[FPS_CORE_DELTA_BUCKETS])
+{
+    static int8_t table[256];
+    static bool table_ready = false;
+    if (!table_ready) {
+        for (int d = 0; d < 256; d++)
+            table[d] = (int8_t)delta_bucket(d);
+        table_ready = true;
+    }
+    for (int i = 0; i < FPS_CORE_DELTA_BUCKETS; i++)
+        hist[i] = 0;
+    for (size_t i = 0; i < size; ++i) {
+        int d = (int)a[i] - (int)b[i];
+        hist[table[d < 0 ? -d : d]]++;
+    }
+    return size - hist[0];
+}
+
 static void init_prev_lines_buffers(struct fps_core *c, int roi_width)
 {
     for (int i = 0; i < 3; ++i)
         c->prev_lines[i].assign((size_t)roi_width, 0);
     c->prev_lines_size = (size_t)roi_width;
     c->prev_lines_allocated = true;
+}
+
+// One compared frame into the altered-frame check.
+static void altered_update(struct fps_core *c, size_t diff, bool unique, const uint32_t *deltas)
+{
+    if (diff == 0) {
+        if (!c->altered)
+            c->altered_noise_run = 0;
+        else if (++c->altered_exact >= FPS_ALTERED_CLEAR) {
+            c->altered = false;
+            c->altered_noise_run = 0;
+        }
+        return;
+    }
+    bool tiny = true;
+    for (int i = FPS_ALTERED_MAX_DELTA_BUCKET + 1; i < FPS_CORE_DELTA_BUCKETS; i++)
+        tiny = tiny && deltas[i] == 0;
+    if (!unique || !tiny)
+        return;
+    if (!c->altered && ++c->altered_noise_run >= FPS_ALTERED_TRIGGER) {
+        c->altered = true;
+        c->altered_exact = 0;
+    }
+}
+
+static void altered_reset(struct fps_core *c)
+{
+    c->altered = false;
+    c->altered_noise_run = 0;
+    c->altered_exact = 0;
 }
 
 static void init_prev_frame_buffer(struct fps_core *c, size_t roi_size, const uint8_t *roi_ptr)
@@ -266,6 +338,8 @@ static void beat_event(struct fps_core *c, uint64_t now, bool from_obs, bool cle
 
 static void beat_on_frame(struct fps_core *c, bool unique, uint64_t now)
 {
+    if (!c->params.beat_enabled)
+        return;
     auto &b = c->beat;
     beat_advance(c, now, true);
     if (unique) {
@@ -280,7 +354,7 @@ static void beat_on_frame(struct fps_core *c, bool unique, uint64_t now)
 
 void fps_core_obs_tick(struct fps_core *c, uint64_t now_ns, int frames)
 {
-    if (!c)
+    if (!c || !c->params.beat_enabled)
         return;
     auto &b = c->beat;
     beat_advance(c, now_ns, frames > 0);
@@ -504,14 +578,22 @@ static void analyze_luma_frame(struct fps_core *c, const uint8_t *luma_ptr, size
     c->dbg.percent = 0.0;
     c->dbg.sample_written = false;
     c->dbg.ft_ms = c->dbg.ema = c->dbg.fps_pf = 0.0;
+    c->dbg.deltas_valid = false;
 
     if (!c->prev_frame_allocated || c->prev_frame.size() != luma_size) {
         // First frame, or the analysed region changed size: nothing to compare
-        // against, so treat it as new.
+        // against, so treat it as new. A new picture size is a new check.
         init_prev_frame_buffer(c, luma_size, luma_ptr);
+        altered_reset(c);
         is_unique = true;
     } else {
-        size_t diff = count_diff_bytes(luma_ptr, c->prev_frame.data(), luma_size);
+        size_t diff;
+        if (c->params.measure_deltas) {
+            diff = count_diff_deltas(luma_ptr, c->prev_frame.data(), luma_size, c->dbg.deltas);
+            c->dbg.deltas_valid = true;
+        } else {
+            diff = count_diff_bytes(luma_ptr, c->prev_frame.data(), luma_size);
+        }
         double percent = (luma_size > 0) ? (100.0 * diff / luma_size) : 0.0;
         if (percent >= c->params.sensitivity)
             is_unique = true;
@@ -522,6 +604,8 @@ static void analyze_luma_frame(struct fps_core *c, const uint8_t *luma_ptr, size
     }
 
     c->dbg.unique = is_unique;
+    if (c->dbg.deltas_valid)
+        altered_update(c, c->dbg.diff, is_unique, c->dbg.deltas);
     if (is_unique)
         analyze_unique(c, now);
     beat_on_frame(c, is_unique, now);
@@ -821,6 +905,18 @@ void fps_core_debug_last_frame(const struct fps_core *c, struct fps_core_frame_d
 {
     if (c && out)
         *out = c->dbg;
+}
+
+bool fps_core_frames_altered(const struct fps_core *c)
+{
+    return c && c->altered;
+}
+
+void fps_core_debug_feed_deltas(struct fps_core *c, size_t diff, bool unique,
+                                const uint32_t deltas[FPS_CORE_DELTA_BUCKETS])
+{
+    if (c && deltas)
+        altered_update(c, diff, unique, deltas);
 }
 
 void fps_core_debug_feed_decision(struct fps_core *c, bool unique, bool tearing, uint64_t now_ns)
