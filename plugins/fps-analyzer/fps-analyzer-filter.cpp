@@ -118,6 +118,8 @@ struct fps_analyzer_filter {
     // with the overlay's demand (core_sync)
     bool core_measure_deltas;
     bool core_beat_enabled;
+    uint64_t core_pacing_period_ns; // OBS frame interval given to the core (frame pacing, sync path)
+    uint32_t history_gen_seen;      // last g_history_reset_gen this filter acted on
 };
 
 // --- Utility functions ---
@@ -179,6 +181,7 @@ static struct fps_core_params core_params(const struct fps_analyzer_filter *filt
     p.update_interval = filter->update_interval;
     p.measure_deltas = filter->core_measure_deltas;
     p.beat_enabled = filter->core_beat_enabled;
+    p.pacing_period_ns = filter->core_pacing_period_ns;
     return p;
 }
 
@@ -360,6 +363,28 @@ static void debug_dump_request(struct fps_analyzer_filter *filter, int delay_sec
     blog(LOG_INFO, "[FPS Analyzer] Frame dump requested: %ld frames, starting in %d s", n, delay_sec);
 }
 
+// "Reset graph history": the button and the hotkey bump a generation; every
+// filter's video_tick sees the change and clears its history on the video
+// thread, so nothing races with the analysis.
+static std::atomic<uint32_t> g_history_reset_gen{0};
+static obs_hotkey_id g_reset_hotkey = OBS_INVALID_HOTKEY_ID;
+
+static void history_reset_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed) {
+    UNUSED_PARAMETER(data);
+    UNUSED_PARAMETER(id);
+    UNUSED_PARAMETER(hotkey);
+    if (pressed)
+        g_history_reset_gen.fetch_add(1);
+}
+
+static bool history_reset_clicked(obs_properties_t *props, obs_property_t *property, void *data) {
+    UNUSED_PARAMETER(props);
+    UNUSED_PARAMETER(property);
+    UNUSED_PARAMETER(data);
+    g_history_reset_gen.fetch_add(1);
+    return false;
+}
+
 // Global (frontend) hotkey: OBS only lists hotkeys registered on regular
 // sources in its settings, not on filters, so the hotkey is registered once
 // per module and targets the most recently created filter instance.
@@ -393,6 +418,9 @@ void fps_analyzer_register_hotkeys(void) {
     g_trace_hotkey = obs_hotkey_register_frontend("fps_analyzer.debug_fps_trace",
                                                   "FPS Analyzer: start/stop FPS trace (debug)",
                                                   debug_trace_hotkey, NULL);
+    g_reset_hotkey = obs_hotkey_register_frontend("fps_analyzer.reset_history",
+                                                  "FPS Analyzer: reset graph history",
+                                                  history_reset_hotkey, NULL);
 }
 
 void fps_analyzer_unregister_hotkeys(void) {
@@ -403,6 +431,10 @@ void fps_analyzer_unregister_hotkeys(void) {
     if (g_trace_hotkey != OBS_INVALID_HOTKEY_ID) {
         obs_hotkey_unregister(g_trace_hotkey);
         g_trace_hotkey = OBS_INVALID_HOTKEY_ID;
+    }
+    if (g_reset_hotkey != OBS_INVALID_HOTKEY_ID) {
+        obs_hotkey_unregister(g_reset_hotkey);
+        g_reset_hotkey = OBS_INVALID_HOTKEY_ID;
     }
 }
 
@@ -756,6 +788,7 @@ static struct obs_source_frame *fps_analyzer_filter_video(void *data,
     view.height = height;
     view.data = frame->data[0];
     view.linesize = frame->linesize[0];
+    view.src_ts_ns = frame->timestamp; // the device's clock: exact refresh periods for frame pacing
     if (view.format == FPS_PIXFMT_UNSUPPORTED) {
         filter->unsupported_fmt = (int)frame->format;
         return frame;
@@ -876,6 +909,7 @@ static void fps_analyzer_video_render(void *data, gs_effect_t *effect)
         view.height = height;
         view.data = video_data;
         view.linesize = video_linesize;
+        view.src_ts_ns = 0; // no device timestamps: pacing from whole OBS frames
         analyze_frame(filter, &view);
         filter->unsupported_fmt = -1;
 
@@ -992,8 +1026,14 @@ static void core_sync(struct fps_analyzer_filter *filter, uint64_t now)
 {
     bool measure = filter->trace_file != NULL || filter->block_unreliable;
     bool beat = source_check_wanted(now);
-    if (measure == filter->core_measure_deltas && beat == filter->core_beat_enabled)
+    uint64_t period = 0;
+    struct obs_video_info ovi;
+    if (obs_get_video_info(&ovi) && ovi.fps_num > 0)
+        period = (uint64_t)ovi.fps_den * 1000000000ULL / ovi.fps_num;
+    if (measure == filter->core_measure_deltas && beat == filter->core_beat_enabled &&
+        period == filter->core_pacing_period_ns)
         return;
+    filter->core_pacing_period_ns = period;
     bool beat_changed = beat != filter->core_beat_enabled;
     filter->core_measure_deltas = measure;
     filter->core_beat_enabled = beat;
@@ -1162,6 +1202,17 @@ static void fps_analyzer_video_tick(void *data, float seconds)
     uint64_t now = os_gettime_ns();
     core_sync(filter, now);
 
+    // "Reset graph history" (button / hotkey)
+    uint32_t gen = g_history_reset_gen.load();
+    if (gen != filter->history_gen_seen) {
+        filter->history_gen_seen = gen;
+        fps_core_clear_history(filter->core);
+        g_fps_shared.graph_count = 0;
+        g_fps_shared.fps = 0;
+        g_fps_shared.frametime_ms = 0.0;
+        blog(LOG_INFO, "[FPS Analyzer] Graph history reset");
+    }
+
     // Per OBS tick on an async source: how many source frames OBS handed to
     // the filter since the previous tick (0 = OBS repeated the previous
     // frame). Feeds the beat detector and the trace's K rows.
@@ -1250,6 +1301,8 @@ static void fps_analyzer_video_tick(void *data, float seconds)
     memcpy(g_fps_shared.graph_frametimes_raw, out->graph_frametimes_raw, sizeof(double) * (size_t)count);
     memcpy(g_fps_shared.graph_fps, out->graph_fps, sizeof(double) * (size_t)count);
     memcpy(g_fps_shared.graph_tearing, out->graph_tearing, sizeof(bool) * (size_t)count);
+    memcpy(g_fps_shared.graph_pacing, out->graph_pacing, sizeof(double) * (size_t)count);
+    memcpy(g_fps_shared.graph_pacing_gap, out->graph_pacing_gap, sizeof(bool) * (size_t)count);
     g_fps_shared.graph_count = count;
 
     publish_source_rate(filter, now);
@@ -1333,6 +1386,7 @@ static void *fps_analyzer_create(obs_data_t *settings, obs_source_t *context)
     filter->tearing_sensitivity = obs_data_get_double(settings, "tearing_sensitivity");
     filter->block_unreliable = obs_data_get_bool(settings, "block_unreliable");
     filter->unsupported_fmt = -1;
+    filter->history_gen_seen = g_history_reset_gen.load(); // only resets from now on
     filter->core_measure_deltas = filter->block_unreliable;
     filter->core_beat_enabled = false; // until an overlay asks for it (core_sync)
     filter->core = NULL;
@@ -1446,6 +1500,14 @@ static bool resolution_detection_modified(obs_properties_t *props, obs_property_
 static obs_properties_t *fps_analyzer_properties(void *data)
 {
     obs_properties_t *props = obs_properties_create();
+
+    // Reset graph history (also a hotkey: Settings -> Hotkeys, top section)
+    obs_property_t *reset = obs_properties_add_button(props, "reset_history", "Reset graph history",
+                                                      history_reset_clicked);
+    obs_property_set_long_description(reset,
+        "Clears the frame pacing, frametime and framerate graphs and the averages, "
+        "e.g. before a new test run. The hotkey \"FPS Analyzer: reset graph history\" "
+        "(Settings -> Hotkeys) does the same from inside the game.");
 
     // Analysis method
     obs_property_t *method = obs_properties_add_list(props, "analyze_method", "Analysis method",

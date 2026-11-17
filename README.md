@@ -141,6 +141,7 @@ Both tools build with the plugin (CMake option `FPS_ANALYZER_BUILD_TOOLS`, on by
 - **Limitation**: OBS only passes the frames it picks for its own clock, so a source running at 2× the OBS FPS or more is measured at its effective rate (119.88 Hz at OBS 60 reads as 59.94), which is also the rate that beats against OBS
 - **Log**: each verdict change writes one line, e.g. `[FPS Analyzer] Source 59.944 Hz vs OBS 60.000 FPS: mismatch, duplicate/skip every 18.0 s`
 - **Offline test**: `srate-selftest` (built with the tools) simulates the OBS frame pick for 59.94/60/119.88/29.97 sources, signal loss and variable rate; `fps-selftest` (scenario `s23_capture_beat`) simulates card and OBS repeats, clock drift, random game drops and a 30 fps game; `tests/cases.txt` replays two recordings from a 4K X with a PS5. `ctest` runs all of them
+- **Offline test of the frame pacing graph**: `fps-selftest` scenario `s25_frame_pacing` (even and juddering 30 FPS, 60 FPS, frames lost by the card, Game Capture with clock jitter, the reset); `tests/cases.txt` checks the Mk2 recordings (`pacing@3-20=33.37+-0.05` for a game at 30, 16.68 for the menu) and one in which the Mk2 dropped 98 frames (`pacinggaps>0`, every other step still 33.37)
 - **Offline test of the reliability check**: `fps-selftest` scenario `s24_altered_frames` simulates a dithering card (game at 30 and 60, still picture), a good card with fades and noise below the sensitivity threshold, and a card that stops dithering; `tests/cases.txt` replays seven v4 recordings with a PS5: the 4K X in NV12/I420 with a game at 30, the home menu and a paused game (`blocked=altered`), and the 4K Mk2 with a game at 30, the home menu and the pause menu (`notblocked` and the right FPS)
 
 ### Regression tests for the FPS analysis (`fps-selftest`):
@@ -163,6 +164,18 @@ Run everything before pushing:
 ```
 
 If you change the algorithm on purpose, regenerate the goldens with `.\run-tests.ps1 -UpdateGoldens` and commit the golden diff together with the change, so the effect on the readings is visible in review.
+
+### Frame pacing graph:
+- **Overlay**: "Show frame pacing graph" (default: off), with the same two styles as the other graphs (Big 1920x360 / Compact 300x80) and a scale (Auto / 33.33 / 50 / 66.67 / 100 ms). The graphs are drawn in the order **frame pacing, frametime, framerate**
+- **What it shows**: how long **each game frame** stayed on screen, one step per frame, unsmoothed, like Digital Foundry's frame-time graph. On a capture card the value comes from the card's own timestamps, so it is a whole number of refresh periods (16.68 / 33.37 / 50.05 ms at 59.94 Hz). A flat line is even pacing; a saw-tooth between 16.7 and 50 ms is judder, even though the FPS counter still reads 30
+- **How it differs from the frametime graph**: the frametime graph is smoothed (EMA) and timed by OBS's clock, which hides exactly this alternation; the frame pacing graph is neither
+- **Grey steps**: the capture device lost a frame there (its timestamps jump by two periods). The value is kept, but it is not the game's pacing; a lost frame marks the step it falls in and the next one, whose start is the late stand-in. With a healthy card there are none
+- **Game Capture / Display Capture** (no card timestamps): the time is taken from OBS's frames and rounded to whole OBS frames
+- **Requirements**: OBS FPS equal to the signal rate (59.94 for a PS5; 119.88 for a 120 Hz mode — at OBS 60 only every other frame reaches the filter); no VRR; cards that stamp their configured rate instead of the signal (Elgato 4K X) are blocked anyway (see Supported capture devices)
+
+### Reset graph history:
+- **Button**: "Reset graph history" at the top of the filter's properties clears the frame pacing, frametime and framerate graphs and the averages, e.g. before a new test run
+- **Hotkey**: "FPS Analyzer: reset graph history" in Settings → Hotkeys (top, global section) does the same from inside the game. It resets every FPS Analyzer filter; the capture-path checks (signal check, reliability check) are not reset, they are not graphs
 
 ### Tearing Detection:
 - **Independent feature**: Works with any analysis method

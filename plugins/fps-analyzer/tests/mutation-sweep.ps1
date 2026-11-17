@@ -82,7 +82,15 @@ $mutations = @(
     @{ name = "zmienione klatki: nigdy nie zwalnia";      find = '++c->altered_exact >= FPS_ALTERED_CLEAR'; repl = '++c->altered_exact >= 1000000' },
     @{ name = "zmienione klatki: liczy tez powtorki";     find = 'if (!unique || !tiny)'; repl = 'if (!tiny)' },
     @{ name = "zmienione klatki: prog 1/3";              find = '++c->altered_noise_run >= FPS_ALTERED_TRIGGER'; repl = '++c->altered_noise_run >= FPS_ALTERED_TRIGGER / 3' },
-    @{ name = "dudnienie: wylaczenie ignorowane";         find = 'if (!c || !c->params.beat_enabled)'; repl = 'if (!c)' }
+    @{ name = "dudnienie: wylaczenie ignorowane";         find = 'if (!c || !c->params.beat_enabled)'; repl = 'if (!c)' },
+    # Frame pacing: czas kazdej klatki gry ze znacznikow karty, utracone przez karte oznaczone
+    @{ name = "pacing: zegar analizy zamiast znacznika";  find = 'if (c->src_ts && c->last_unique_src_ts && c->src_ts > c->last_unique_src_ts)'; repl = 'if (false)' },
+    @{ name = "pacing: bez oznaczania utraconych";        find = 'if (iv * 2 > median * 3) {'; repl = 'if (false) {' },
+    @{ name = "pacing: prog utraty 1.5x na 2.5x";         find = 'if (iv * 2 > median * 3) {'; repl = 'if (iv * 2 > median * 5) {' },
+    @{ name = "pacing: bez przeniesienia na nastepna";    find = 'c->carry_gap = c->frame_after_gap;'; repl = 'c->carry_gap = false;' },
+    @{ name = "pacing: sync bez zaokraglenia";            find = 'return k * per;'; repl = 'return ft_ms;' },
+    @{ name = "reset historii: czysci tez werdykt";       find = "    c->carry_gap = false;`n    c->last_published_fps = 0;"; repl = "    c->carry_gap = false;`n    c->last_published_fps = 0;`n    altered_reset(c);" },
+    @{ name = "reset historii: zostawia probki";          find = "    c->frametime_count = 0;`n    c->ema_frametime = 0.0;"; repl = "    c->ema_frametime = 0.0;" }
 )
 
 function Run-Layer([string]$exe, [string[]]$argv) {

@@ -1646,6 +1646,167 @@ static void s24_altered_frames(Runner &r)
     }
 }
 
+// --- s25: frame pacing (per game frame, unsmoothed, from device timestamps) ---
+struct PacingSim {
+    std::vector<int> pattern = {2};  // game frame durations in refresh periods, repeated
+    std::vector<int> lost;           // source frame indices the capture device loses
+    bool sync = false;               // no device timestamps: analysis clock + OBS period
+    int jitter_us = 0;               // analysis clock jitter (+-), sync path
+    uint64_t period_ns = 16683333;   // 59.94 Hz
+};
+struct PacingRun {
+    std::vector<double> ms;
+    std::vector<bool> gap;
+    int fps = 0;
+};
+
+static PacingRun run_pacing(const PacingSim &s, int frames)
+{
+    PacingRun pr;
+    fps_core_params p = fps_core_params_defaults();
+    if (s.sync)
+        p.pacing_period_ns = s.period_ns;
+    fps_core *c = fps_core_create(&p);
+    Frame f = make_frame(FPS_PIXFMT_NV12, 512, 4);
+    uint64_t rng = 99;
+    auto rnd = [&rng]() {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        return rng;
+    };
+    size_t pi = 0;
+    int left = 0;
+    fps_core_output o{};
+    for (int k = 0; k < frames; k++) {
+        if (left == 0) { // a new game frame
+            for (auto &v : f.buf)
+                v = (uint8_t)(32 + rnd() % 160);
+            left = s.pattern[pi++ % s.pattern.size()];
+        }
+        left--;
+        bool lost = false;
+        for (int l : s.lost)
+            lost = lost || l == k;
+        uint64_t ts = T0 + (uint64_t)k * s.period_ns;
+        if (lost)
+            continue;
+        int64_t jit = s.jitter_us ? ((int64_t)(rnd() % (2 * s.jitter_us + 1)) - s.jitter_us) * 1000 : 0;
+        uint64_t now = ts + 3000000 + (uint64_t)(jit + 2000000); // the filter sees it a bit later
+        fps_frame_view v = f.view();
+        v.src_ts_ns = s.sync ? 0 : ts;
+        fps_core_feed(c, &v, now);
+        fps_core_tick(c, now, &o);
+    }
+    for (int i = 0; i < o.graph_count; i++) {
+        pr.ms.push_back(o.graph_pacing[i]);
+        pr.gap.push_back(o.graph_pacing_gap[i]);
+    }
+    pr.fps = o.fps;
+    fps_core_destroy(c);
+    return pr;
+}
+
+static bool all_near(const std::vector<double> &v, size_t from, double want, double tol)
+{
+    for (size_t i = from; i < v.size(); i++)
+        if (fabs(v[i] - want) > tol)
+            return false;
+    return from < v.size();
+}
+
+static void s25_frame_pacing(Runner &r)
+{
+    r.begin("s25_frame_pacing", fps_core_params_defaults());
+    const double P = 16.683333;
+    {   // a 30 FPS game at 59.94 Hz, even pacing: every frame 2 periods - exactly, although
+        // OBS's clock jitters by +-2 ms (the value comes from the device's timestamps)
+        PacingSim s;
+        s.jitter_us = 2000;
+        PacingRun pr = run_pacing(s, 600);
+        bool nogap = true;
+        for (bool g : pr.gap)
+            nogap = nogap && !g;
+        r.check(all_near(pr.ms, 0, 2 * P, 0.001) && nogap && pr.fps == 30,
+                "30 FPS, even pacing: all %zu samples 33.37 ms, no gaps, reads %d", pr.ms.size(), pr.fps);
+    }
+    {   // the same average with bad pacing: 1 and 3 periods alternate, the FPS still reads 30
+        PacingSim s;
+        s.pattern = {1, 3};
+        PacingRun pr = run_pacing(s, 600);
+        bool alt = pr.ms.size() > 10;
+        for (size_t i = 1; i < pr.ms.size(); i++) {
+            double want = (fabs(pr.ms[i - 1] - P) < 0.01) ? 3 * P : P;
+            alt = alt && fabs(pr.ms[i] - want) < 0.001;
+        }
+        r.check(alt && pr.fps == 30, "30 FPS, judder 16.7/50: the samples alternate exactly, FPS still %d", pr.fps);
+    }
+    {   // a 60 FPS game: one period each
+        PacingSim s;
+        s.pattern = {1};
+        PacingRun pr = run_pacing(s, 600);
+        r.check(all_near(pr.ms, 0, P, 0.001), "60 FPS: every sample 16.68 ms");
+    }
+    {   // the capture device loses a repeat (no effect on the game's frames) and a new frame
+        PacingSim s;
+        s.lost = {301, 400}; // 301: a repeat of the frame shown at 300; 400: a new frame
+        PacingRun pr = run_pacing(s, 600);
+        int gaps = 0;
+        bool others_even = true;
+        for (size_t i = 0; i < pr.ms.size(); i++) {
+            if (pr.gap[i])
+                gaps++;
+            else
+                others_even = others_even && fabs(pr.ms[i] - 2 * P) < 0.001;
+        }
+        // each loss flags the sample it falls in and the next one (its start is the late frame)
+        r.check(gaps == 4 && others_even,
+                "frames lost by the device: %d samples flagged (4), every other sample still 33.37 ms", gaps);
+    }
+    {   // sync path (Game Capture): analysis clock with +-2 ms jitter, rounded to OBS frames
+        PacingSim s;
+        s.sync = true;
+        s.jitter_us = 2000;
+        s.pattern = {2, 2, 3};
+        PacingRun pr = run_pacing(s, 600);
+        bool whole = pr.ms.size() > 10;
+        for (double v : pr.ms) {
+            double k = v / P;
+            whole = whole && fabs(k - round(k)) < 1e-6 && (round(k) == 2 || round(k) == 3);
+        }
+        r.check(whole, "sync path with clock jitter: every sample a whole 2 or 3 periods");
+    }
+    {   // reset: the graphs empty, the capture-path verdicts stay
+        fps_core_params p = fps_core_params_defaults();
+        p.measure_deltas = true;
+        fps_core *c = fps_core_create(&p);
+        Frame f = make_frame(FPS_PIXFMT_NV12, 512, 4);
+        fill_all(f, 5);
+        fps_core_output o{};
+        uint64_t rng = 7;
+        for (int k = 0; k < 300; k++) { // a dithering card on a still picture
+            uint64_t now = at((uint64_t)k, 60);
+            Frame g = f;
+            for (auto &v : g.buf) {
+                rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+                if ((rng >> 60) == 0)
+                    v = (uint8_t)(v + 1);
+            }
+            fps_frame_view view = g.view();
+            fps_core_feed(c, &view, now);
+            fps_core_tick(c, now, &o);
+        }
+        bool altered_before = fps_core_frames_altered(c);
+        int count_before = o.graph_count;
+        fps_core_clear_history(c);
+        fps_core_tick(c, at(400, 60), &o);
+        r.check(altered_before && count_before > 0 && o.graph_count == 0 && fps_core_frames_altered(c),
+                "clear history: graphs empty (%d -> %d), the altered-frame verdict stays", count_before,
+                o.graph_count);
+        fps_core_destroy(c);
+    }
+}
+
 static void s23_capture_beat(Runner &r)
 {
     r.begin("s23_capture_beat", fps_core_params_defaults());
@@ -1979,6 +2140,7 @@ int main(int argc, char **argv)
 #ifdef FPS_SELFTEST_HAVE_CORE
     s23_capture_beat(r);
     s24_altered_frames(r);
+    s25_frame_pacing(r);
 #endif
 
     printf(r.fails ? "RESULT: %d FAILURES\n" : "RESULT: ALL OK\n", r.fails);

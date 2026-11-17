@@ -115,6 +115,10 @@ static bool parse_header(const std::string &line, TraceHeader &out, std::string 
             size_t sl = val.find('/');
             double den = sl == std::string::npos ? 1.0 : strtod(val.c_str() + sl + 1, nullptr);
             out.obs_hz = den > 0.0 ? num / den : 0.0;
+            // frame pacing without device timestamps is rounded to whole OBS frames,
+            // as the filter does (v2 traces lack obs_fps: not rounded)
+            if (num > 0.0 && den > 0.0)
+                out.params.pacing_period_ns = (uint64_t)(den * 1e9 / num);
         } else if (k == "dev_interval") out.dev_interval = strtoll(val.c_str(), nullptr, 10);
     }
     return true;
@@ -148,6 +152,8 @@ struct ReplayResult {
     struct fps_beat beat = {};   // verdict at the end of the trace (beat= / nobeat)
     double first_clear_s = -1;   // first second the signal check said CLEAR (clear<=)
     double first_detect_s = -1;  // first second a beat was confirmed
+    struct PacingSample { double t; double ms; bool gap; };
+    std::vector<PacingSample> pacing; // frame pacing samples (pacing@ / pacinggaps)
     int delta_frames = 0;        // v4 F rows with a difference histogram (altered-frame check)
     double first_altered_s = -1; // when the altered-frame check first held (blocked=altered)
     TraceHeader header;
@@ -249,9 +255,13 @@ static ReplayResult replay_trace(const fs::path &path, double tol, bool verbose)
                     r.first_altered_s = first_ns ? (double)(now - first_ns) / 1e9 : 0.0;
             }
 
+            // v3+: the device timestamp drives the frame-pacing samples
+            fps_core_debug_set_source_ts(core, has(f, 12) ? (uint64_t)ll(f, 12) : 0);
             fps_core_debug_feed_decision(core, unique, tear, now);
             struct fps_core_frame_debug d;
             fps_core_debug_last_frame(core, &d);
+            if (d.sample_written)
+                r.pacing.push_back({first_ns ? (double)(now - first_ns) / 1e9 : 0.0, d.pacing_ms, d.pacing_gap});
 
             r.frames++;
             if (unique)
@@ -916,6 +926,55 @@ static int run_manifest(const fs::path &manifest, double tol, bool verbose, bool
                                        : blocked ? "altered after " + num(r.first_altered_s) + " s"
                                                  : "never altered";
                     printf("  %s %s: %s\n", good ? "[ok]" : "[FAIL]", spec.c_str(), what.c_str());
+                    ok = ok && good;
+                    continue;
+                }
+                // Frame pacing: "pacing@3-20=33.37+-0.05" - every sample in the
+                // window (none lost by the device) within the tolerance;
+                // "pacinggaps=0" / "pacinggaps>0" - samples with a frame lost
+                // by the capture device
+                if (spec.rfind("pacing@", 0) == 0) {
+                    // V may be a set of allowed values, "16.68|33.37|50.05": every
+                    // sample must be one of them (a juddering game: whole periods only)
+                    double a = 0, bnd = 0, tolp = 0;
+                    std::vector<double> wants;
+                    bool parsed = sscanf(spec.c_str(), "pacing@%lf-%lf=", &a, &bnd) == 2;
+                    size_t eq = spec.find('='), pm = spec.rfind("+-");
+                    if (parsed && eq != std::string::npos && pm != std::string::npos && pm > eq) {
+                        for (const std::string &w : split(spec.substr(eq + 1, pm - eq - 1), '|'))
+                            wants.push_back(strtod(w.c_str(), nullptr));
+                        tolp = strtod(spec.c_str() + pm + 2, nullptr);
+                    }
+                    parsed = parsed && !wants.empty();
+                    int n = 0, bad = 0;
+                    double worst = 0;
+                    for (const auto &s : r.pacing) {
+                        if (s.t < a || s.t >= bnd || s.gap)
+                            continue;
+                        n++;
+                        bool hit = false;
+                        for (double w : wants)
+                            hit = hit || fabs(s.ms - w) <= tolp;
+                        if (!hit) {
+                            bad++;
+                            if (bad == 1)
+                                worst = s.ms;
+                        }
+                    }
+                    bool good = parsed && n > 0 && bad == 0;
+                    printf("  %s %s: %d samples, %d outside%s\n", good ? "[ok]" : "[FAIL]", spec.c_str(), n, bad,
+                           bad ? (" (e.g. " + num(worst) + " ms)").c_str() : "");
+                    ok = ok && good;
+                    continue;
+                }
+                if (spec.rfind("pacinggaps", 0) == 0) {
+                    int gaps = 0;
+                    for (const auto &s : r.pacing)
+                        gaps += s.gap ? 1 : 0;
+                    bool good = spec == "pacinggaps>0" ? gaps > 0
+                                                       : gaps == atoi(spec.c_str() + spec.find('=') + 1);
+                    printf("  %s %s: %d samples with a frame lost by the capture device\n",
+                           good ? "[ok]" : "[FAIL]", spec.c_str(), gaps);
                     ok = ok && good;
                     continue;
                 }

@@ -34,6 +34,8 @@ struct fps_shared_data {
     double graph_frametimes_raw[FPS_GRAPH_HISTORY]; // raw (for future use)
     double graph_fps[FPS_GRAPH_HISTORY];
     bool graph_tearing[FPS_GRAPH_HISTORY];
+    double graph_pacing[FPS_GRAPH_HISTORY];     // frame pacing per game frame, unsmoothed (ms)
+    bool graph_pacing_gap[FPS_GRAPH_HISTORY];   // the capture device lost a frame in this sample
     int graph_count;
     // Upscale source resolution detection (DCT spectral analysis)
     bool res_detect_enabled;  // filter checkbox state

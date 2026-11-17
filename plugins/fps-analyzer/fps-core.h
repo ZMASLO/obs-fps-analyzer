@@ -68,6 +68,8 @@ struct fps_core_params {
     double update_interval;        // seconds between publishes; <= 0 falls back to 1.0
     bool measure_deltas;           // fill the per-frame |d| histogram (frame debug, trace v4)
     bool beat_enabled;             // run the capture-path beat detector (fps_core_obs_tick et al.)
+    uint64_t pacing_period_ns;     // OBS frame interval: frame pacing without source timestamps
+                                   // (sync path) is rounded to whole multiples of it; 0 = not rounded
 };
 
 static inline struct fps_core_params fps_core_params_defaults(void)
@@ -80,6 +82,7 @@ static inline struct fps_core_params fps_core_params_defaults(void)
     p.update_interval = 1.0 / 30.0;
     p.measure_deltas = false;
     p.beat_enabled = true;
+    p.pacing_period_ns = 0;
     return p;
 }
 
@@ -89,6 +92,7 @@ struct fps_frame_view {
     uint32_t width, height;
     const uint8_t *data;
     uint32_t linesize;
+    uint64_t src_ts_ns;            // the capture device's timestamp of this frame, 0 = none (sync path)
 };
 
 enum fps_feed_status {
@@ -108,6 +112,13 @@ struct fps_core_output {
     double graph_frametimes_raw[FPS_CORE_HISTORY];
     double graph_fps[FPS_CORE_HISTORY];
     bool graph_tearing[FPS_CORE_HISTORY];
+    // Frame pacing (Digital Foundry style): how long each game frame was on
+    // screen, unsmoothed, from the capture device's timestamps (whole refresh
+    // periods). One sample per new frame, same positions as graph_frametimes.
+    double graph_pacing[FPS_CORE_HISTORY];
+    // the capture device lost a frame within this sample: the value is kept,
+    // but it is not the game's pacing
+    bool graph_pacing_gap[FPS_CORE_HISTORY];
 };
 
 struct fps_core;
@@ -265,6 +276,8 @@ struct fps_core_frame_debug {
     bool tearing_flag;             // verdict for this frame
     bool sample_written;           // a frametime sample was recorded
     double ft_ms, ema, fps_pf;     // valid when sample_written
+    double pacing_ms;              // frame pacing sample, valid when sample_written
+    bool pacing_gap;               // ... with a frame lost by the capture device
     int pos, count;
     bool deltas_valid;             // compared and params.measure_deltas
     uint32_t deltas[FPS_CORE_DELTA_BUCKETS]; // bytes per |d| bucket; deltas[0] = luma_size - diff
@@ -281,6 +294,16 @@ int fps_core_debug_last_published_fps(const struct fps_core *c);
 
 // True while the altered-frame check holds (see FPS_ALTERED_TRIGGER).
 bool fps_core_frames_altered(const struct fps_core *c);
+
+// Empties the graph histories (frametime, EMA, per-frame FPS, tearing, frame
+// pacing) and the published averages, as if the source had just started.
+// Keeps the reference frame and the beat / altered-frame checks: those are
+// verdicts about the capture path, not graphs.
+void fps_core_clear_history(struct fps_core *c);
+
+// Replay: the source timestamp of the next frame given to
+// fps_core_debug_feed_decision (a trace's src_ts column), 0 = none.
+void fps_core_debug_set_source_ts(struct fps_core *c, uint64_t src_ts_ns);
 
 // Replay of a v4 trace row's difference histogram into the altered-frame
 // check, without pixels. Call before fps_core_debug_feed_decision for the

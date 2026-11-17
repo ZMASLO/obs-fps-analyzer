@@ -31,6 +31,10 @@
 #                 blocked=altered  traces only (v4): the altered-frame check hid
 #                                the FPS (the capture device alters every frame)
 #                 notblocked     traces only (v4): it never did
+#                 pacing@A-B=V+-T  traces only (v3+): every frame-pacing sample in
+#                                [A, B) seconds not flagged as a capture loss is V ms within T
+#                 pacinggaps=N | pacinggaps>0  samples flagged because the capture
+#                                device lost a frame
 #                 clear<=S       traces only (v3): the signal check said CLEAR
 #                                within S seconds of the start
 #                 prefix "xfail:" marks a known limitation: reported, but not
@@ -78,6 +82,13 @@ trace:traces/4kx_nv12_game30_v4.csv    ; ; self, blocked=altered ; Elgato 4K X, 
 trace:traces/4kx_i420_game30_v4.csv    ; ; self, blocked=altered ; Elgato 4K X, I420 4K, game at 30 FPS: the same in the other 4:2:0 mode
 trace:traces/4kx_i420_ps5menu_v4.csv   ; ; self, blocked=altered ; Elgato 4K X, I420 4K, PS5 home menu: the bottom line is still, only card noise changes
 trace:traces/4kx_i420_paused_v4.csv    ; ; self, blocked=altered ; Elgato 4K X, I420 4K, game paused: nothing moves, yet every frame differs
-trace:traces/mk2_yuy2_game30_v4.csv    ; ; self, notblocked, fps@3-20=30+-1 ; Elgato 4K Mk2, YUY2 4K, game at 30 FPS: every repeat identical, reads 30
-trace:traces/mk2_yuy2_ps5menu_v4.csv   ; ; self, notblocked, fps@3-20=60+-1 ; Elgato 4K Mk2, YUY2 4K, PS5 home menu (animated, 60)
+trace:traces/mk2_yuy2_game30_v4.csv    ; ; self, notblocked, fps@3-20=30+-1, pacing@3-20=33.37+-0.05, pacinggaps=0 ; Elgato 4K Mk2, YUY2 4K, game at 30 FPS: every repeat identical, reads 30
+trace:traces/mk2_yuy2_ps5menu_v4.csv   ; ; self, notblocked, fps@3-20=60+-1, pacing@3-20=16.68+-0.05, pacinggaps=0 ; Elgato 4K Mk2, YUY2 4K, PS5 home menu (animated, 60)
 trace:traces/mk2_yuy2_pausemenu_v4.csv ; ; self, notblocked, fps@3-20=60+-1 ; Elgato 4K Mk2, YUY2 4K, GTA V pause menu (animated grain background, 60)
+# Frame pacing (Digital Foundry style) with a capture device that loses frames: the 4K Mk2 in a
+# bad state dropped ~5 frames a second (its timestamps jump by two periods). Every such sample is
+# flagged instead of showing up as a game stutter; all others are the game's even 33.37 ms.
+# A game with real judder: 30 FPS on average, but frames shown for 16.7 / 33.4 / 50 ms; the
+# counter and the smoothed frametime say a steady 30, only the frame pacing graph shows it.
+trace:traces/mk2_yuy2_game30_judder_v4.csv ; ; self, notblocked, fps@2-10=30+-1, pacinggaps=0, pacing@0-10=16.68|33.37|50.05+-0.05 ; Elgato 4K Mk2, YUY2 4K, game at 30 FPS with uneven pacing (74 x 16.7, 153 x 33.4, 73 x 50 ms in 10 s), no capture loss
+trace:traces/mk2_yuy2_game30_carddrops_v4.csv ; ; self, notblocked, pacinggaps>0, pacing@3-20=33.37+-0.05 ; Elgato 4K Mk2, YUY2 4K, game at 30 FPS, the card dropping 98 frames in 20 s

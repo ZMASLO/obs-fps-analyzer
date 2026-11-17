@@ -18,6 +18,7 @@
 #include <string.h>
 
 #include <new>
+#include <algorithm>
 #include <vector>
 
 #define FRAMETIME_HISTORY FPS_CORE_HISTORY
@@ -35,6 +36,18 @@ struct fps_core {
     int frametime_pos = 0;
     int frametime_count = 0;
     double ema_frametime = 0.0;
+
+    // frame pacing (see fps_core_output.graph_pacing)
+    double pacing_ms[FRAMETIME_HISTORY] = {};
+    bool pacing_gap[FRAMETIME_HISTORY] = {};
+    uint64_t src_ts = 0;             // source timestamp of the frame being analysed, 0 = none
+    uint64_t last_src_ts = 0;        // of the previous delivered frame
+    uint64_t last_unique_src_ts = 0; // of the previous new frame
+    uint64_t src_iv[15] = {};        // recent intervals between delivered frames
+    int src_iv_n = 0, src_iv_pos = 0;
+    bool pending_gap = false;        // the device lost a frame since the last new one
+    bool frame_after_gap = false;    // the frame being analysed arrived right after a lost one
+    bool carry_gap = false;          // the last new frame did: the next sample starts late too
 
     // frame comparison. `*_allocated` mirrors v0.5.0's "is the pointer set"
     // test, which is not the same as "is the buffer non-empty" for a
@@ -523,11 +536,64 @@ void fps_core_get_beat(const struct fps_core *c, uint64_t now_ns, double deliver
 
 // Everything v0.5.0 did under `if (is_unique)`. Split out so a recorded trace
 // can replay the decision without pixels.
+// Every delivered frame: a gap in the device's timestamps (more than 1.5x the
+// median interval) means the device lost a frame before OBS saw it. It is
+// charged to the next frame-pacing sample, whose value stays as measured.
+static void pacing_note_frame(struct fps_core *c)
+{
+    c->frame_after_gap = false;
+    if (!c->src_ts)
+        return;
+    if (c->last_src_ts && c->src_ts > c->last_src_ts) {
+        uint64_t iv = c->src_ts - c->last_src_ts;
+        if (c->src_iv_n >= 5) {
+            uint64_t tmp[15];
+            std::copy(c->src_iv, c->src_iv + c->src_iv_n, tmp);
+            std::nth_element(tmp, tmp + c->src_iv_n / 2, tmp + c->src_iv_n);
+            uint64_t median = tmp[c->src_iv_n / 2];
+            if (iv * 2 > median * 3) {
+                c->pending_gap = true;
+                c->frame_after_gap = true;
+            }
+        }
+        c->src_iv[c->src_iv_pos] = iv;
+        c->src_iv_pos = (c->src_iv_pos + 1) % 15;
+        if (c->src_iv_n < 15)
+            c->src_iv_n++;
+    }
+    c->last_src_ts = c->src_ts;
+}
+
+// How long the previous new frame was on screen: from the device's
+// timestamps when there are any (exact refresh periods), else from the
+// analysis clock rounded to whole OBS frames (sync path: one frame per tick).
+static double pacing_sample(const struct fps_core *c, double ft_ms)
+{
+    if (c->src_ts && c->last_unique_src_ts && c->src_ts > c->last_unique_src_ts)
+        return (double)(c->src_ts - c->last_unique_src_ts) / 1e6;
+    if (c->params.pacing_period_ns > 0) {
+        double per = (double)c->params.pacing_period_ns / 1e6;
+        double k = round(ft_ms / per);
+        if (k < 1.0)
+            k = 1.0;
+        return k * per;
+    }
+    return ft_ms;
+}
+
 static void analyze_unique(struct fps_core *c, uint64_t now)
 {
     if (c->last_unique_frame_time != 0) {
         double ft = (now - c->last_unique_frame_time) / 1000000.0;
         c->frametime_history[c->frametime_pos] = ft;
+        c->pacing_ms[c->frametime_pos] = pacing_sample(c, ft);
+        // A lost frame touches two samples: the one it falls in, and - when
+        // the new frame that ends it is the late stand-in for a lost one -
+        // the next, whose start is then late as well.
+        bool gap = c->pending_gap || c->carry_gap;
+        c->pacing_gap[c->frametime_pos] = gap;
+        c->dbg.pacing_ms = c->pacing_ms[c->frametime_pos];
+        c->dbg.pacing_gap = gap;
         c->tearing_per_frame[c->frametime_pos] = c->tearing_detected;
 
         // Smoothed frametime: EMA, alpha 0.15 — responsive enough to show
@@ -567,6 +633,9 @@ static void analyze_unique(struct fps_core *c, uint64_t now)
             c->frametime_count++;
     }
     c->last_unique_frame_time = now;
+    c->last_unique_src_ts = c->src_ts;
+    c->carry_gap = c->frame_after_gap;
+    c->pending_gap = false;
 }
 
 static void analyze_luma_frame(struct fps_core *c, const uint8_t *luma_ptr, size_t luma_size, uint64_t now)
@@ -770,6 +839,9 @@ int fps_core_feed(struct fps_core *c, const struct fps_frame_view *frame, uint64
     if (!extract_luma_rows(frame, luma, roi_line, roi_lines))
         return FPS_FEED_UNSUPPORTED_FORMAT;
 
+    c->src_ts = frame->src_ts_ns;
+    pacing_note_frame(c);
+
     // Tearing is judged on every frame, including duplicates.
     c->tearing_detected = detect_tearing_frame(c, frame);
     c->dbg.tearing_flag = c->tearing_detected;
@@ -832,6 +904,8 @@ bool fps_core_tick(struct fps_core *c, uint64_t now_ns, struct fps_core_output *
         out->graph_frametimes_raw[i] = c->frametime_history[idx];
         out->graph_fps[i] = c->fps_per_frame[idx];
         out->graph_tearing[i] = c->tearing_per_frame[idx];
+        out->graph_pacing[i] = c->pacing_ms[idx];
+        out->graph_pacing_gap[i] = c->pacing_gap[idx];
     }
     out->graph_count = count;
     return true;
@@ -905,6 +979,34 @@ void fps_core_debug_last_frame(const struct fps_core *c, struct fps_core_frame_d
 {
     if (c && out)
         *out = c->dbg;
+}
+
+void fps_core_clear_history(struct fps_core *c)
+{
+    if (!c)
+        return;
+    std::fill(c->frametime_history, c->frametime_history + FRAMETIME_HISTORY, 0.0);
+    std::fill(c->smoothed_frametime, c->smoothed_frametime + FRAMETIME_HISTORY, 0.0);
+    std::fill(c->fps_per_frame, c->fps_per_frame + FRAMETIME_HISTORY, 0.0);
+    std::fill(c->tearing_per_frame, c->tearing_per_frame + FRAMETIME_HISTORY, false);
+    std::fill(c->pacing_ms, c->pacing_ms + FRAMETIME_HISTORY, 0.0);
+    std::fill(c->pacing_gap, c->pacing_gap + FRAMETIME_HISTORY, false);
+    c->frametime_pos = 0;
+    c->frametime_count = 0;
+    c->ema_frametime = 0.0;
+    c->last_unique_frame_time = 0;
+    c->last_unique_src_ts = 0;
+    c->pending_gap = false;
+    c->carry_gap = false;
+    c->last_published_fps = 0;
+}
+
+void fps_core_debug_set_source_ts(struct fps_core *c, uint64_t src_ts_ns)
+{
+    if (!c)
+        return;
+    c->src_ts = src_ts_ns;
+    pacing_note_frame(c);
 }
 
 bool fps_core_frames_altered(const struct fps_core *c)
