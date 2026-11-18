@@ -1694,6 +1694,43 @@ static void s24_altered_frames(Runner &r)
         r.check(b.clusters == 0 && !b.detected, "beat_enabled off: no clusters (%d), no verdict", b.clusters);
         fps_core_destroy(c);
     }
+    {   // a fresh core for an FPS trace inherits the verdict (fps_core_inherit_altered):
+        // the device's FPS is not shown while the new core would re-learn it
+        fps_core_params p = fps_core_params_defaults();
+        p.measure_deltas = true;
+        Frame f = make_frame(FPS_PIXFMT_NV12, 64, 4), big = make_frame(FPS_PIXFMT_NV12, 128, 4);
+        uint64_t k = 0;
+        auto feed = [&](fps_core *c, Frame &fr, int v) {
+            std::fill(fr.buf.begin(), fr.buf.end(), (uint8_t)v);
+            fps_frame_view view = fr.view();
+            fps_core_feed(c, &view, at(k++, 60));
+        };
+        fps_core *old_core = fps_core_create(&p);
+        for (int i = 0; i < 200; i++)
+            feed(old_core, f, 100 + (i & 1)); // every frame +-1: a dithering device
+        const bool old_altered = fps_core_frames_altered(old_core);
+        fps_core *c = fps_core_create(&p);
+        fps_core_inherit_altered(c);
+        bool held = fps_core_frames_altered(c);
+        feed(c, f, 100); // the first frame (no comparison yet) keeps it
+        held = held && fps_core_frames_altered(c);
+        for (int i = 0; i < 40; i++) // still dithering, fewer than the 90 a fresh core needs
+            feed(c, f, 100 + (i & 1));
+        held = held && fps_core_frames_altered(c);
+        r.check(old_altered && held, "inherited verdict holds from the first frame on (old %d, new %d)",
+                (int)old_altered, (int)held);
+        for (int i = 0; i < FPS_ALTERED_CLEAR; i++)
+            feed(c, f, 50); // identical frames: the device passes frames untouched after all
+        r.check(!fps_core_frames_altered(c), "inherited verdict: %d identical frames clear it", FPS_ALTERED_CLEAR);
+        fps_core_destroy(c);
+        c = fps_core_create(&p);
+        fps_core_inherit_altered(c);
+        feed(c, f, 100);
+        feed(c, big, 100); // the picture size changed: a new check, as without inheriting
+        r.check(!fps_core_frames_altered(c), "inherited verdict: a new picture size starts the check over");
+        fps_core_destroy(c);
+        fps_core_destroy(old_core);
+    }
 }
 
 // --- s25: frame pacing (per game frame, unsmoothed, from device timestamps) ---
@@ -2075,6 +2112,12 @@ struct DropSim {
     bool obs_buffered = false;     // OBS buffers a frame: the empty tick comes one frame before the gap
     bool empty_after = false;      // ... or two ticks after it
     bool lose_two = false;         // each loss is two frames in a row
+    // OBS rendering lag (0.6.0): every Nth tick (k % N == lag_at) OBS skips a tick -
+    // its video time steps two periods and the source frame of the skipped tick is
+    // never seen (a gap in the timestamps, no empty tick)
+    int obs_lag_every = 0;
+    int lag_at = 9;                // 2 ticks after the card's losses (k % N == 7)
+    bool video_time = true;        // pass OBS's video time (false: as before 0.6.0)
 };
 struct DropRun {
     fps_drops at_end{};
@@ -2097,6 +2140,11 @@ static DropRun run_drops(const DropSim &s)
     uint64_t ts = T0;
     int late_gap = 0; // obs_buffered: the gap to deliver on the next frame
     uint64_t empty_at = 0; // empty_after: the tick that gets no frame
+    uint64_t vt = T0;      // OBS's video time
+    auto tick = [&](uint64_t now, int frames) {
+        vt += s.period_ns;
+        fps_core_obs_tick_at(c, now, frames, s.video_time ? vt : 0);
+    };
     for (uint64_t k = 0; k < n; k++) {
         uint64_t now = T0 + k * s.period_ns + 2000000;
         double t = (double)(now - T0) / 1e9;
@@ -2110,7 +2158,7 @@ static DropRun run_drops(const DropSim &s)
             step = s.period_ns / 2 + (rng >> 40) % (2 * s.period_ns); // 0.5 .. 2.5 periods
         }
         if (s.empty_after && empty_at && k == empty_at) {
-            fps_core_obs_tick(c, now, 0); // the empty tick, two ticks after the gap
+            tick(now, 0); // the empty tick, two ticks after the gap
             empty_at = 0;
             continue;
         }
@@ -2121,13 +2169,13 @@ static DropRun run_drops(const DropSim &s)
             fps_frame_view v = f.view();
             v.src_ts_ns = ts;
             fps_core_feed(c, &v, now);
-            fps_core_obs_tick(c, now, 1);
+            tick(now, 1);
             continue;
         }
         if (card_loss && s.obs_buffered) {
             // as in the 17.11.2026 Mk2 traces: an empty tick, then one frame at the
             // usual interval, then the one after the lost frame
-            fps_core_obs_tick(c, now, 0);
+            tick(now, 0);
             late_gap = 1;
             continue;
         }
@@ -2141,17 +2189,22 @@ static DropRun run_drops(const DropSim &s)
             // nothing delivered on this tick (a lost frame, or OBS repeating one)
             if (card_loss)
                 ts += step * (s.lose_two ? 2 : 1); // the device's clock moves on: the next frame comes late
-            fps_core_obs_tick(c, now, 0);
+            tick(now, 0);
             continue;
         }
         if (obs_loss)
             ts += step; // OBS skipped the older of two frames: a gap, but this tick has a frame
+        const bool lag = losing && s.obs_lag_every && k % (uint64_t)s.obs_lag_every == (uint64_t)s.lag_at;
+        if (lag) {
+            ts += step;          // the skipped tick's source frame is never seen
+            vt += s.period_ns;   // and OBS's video time steps two periods
+        }
         ts += step;
         Frame &f = (k & 1) ? b : a;
         fps_frame_view v = f.view();
         v.src_ts_ns = ts;
         fps_core_feed(c, &v, now);
-        fps_core_obs_tick(c, now, 1);
+        tick(now, 1);
         if (t >= 10.0 && t < 10.0 + s.period_ns / 1e9) {
             fps_drops d;
             fps_core_get_drops(c, now, &d);
@@ -2271,6 +2324,69 @@ static void s27_dropped_frames(Runner &r)
         DropRun d = run_drops(s);
         r.check(d.inactive_after_s > 4.5 && d.inactive_after_s < 5.6,
                 "losses stop at 8 s: warning gone %.2f s later (want ~5)", d.inactive_after_s);
+    }
+    // OBS rendering lag, told apart by OBS's video time (0.6.0): one skipped tick
+    // every 24, the source frame of that tick never seen
+    const double lag_n = (20.0 * 1e9 / 16683333.0 - 7) / 24.0; // ~49 in 20 s
+    {   // lag alone: OBS's
+        DropSim s;
+        s.obs_lag_every = 24;
+        DropRun d = run_drops(s);
+        r.check(d.at_end.card_total == 0 && fabs((double)d.at_end.obs_total - lag_n) <= 2,
+                "OBS lag alone: OBS %llu (want ~%.0f), card %llu", (unsigned long long)d.at_end.obs_total, lag_n,
+                (unsigned long long)d.at_end.card_total);
+    }
+    {   // lag 2 ticks after each card loss (empty tick): each to its own side - as in
+        // the 18.11.2026 OBS-lag trace, where the empty tick claimed OBS's losses
+        DropSim s;
+        s.card_lose_every = 24;
+        s.obs_lag_every = 24;
+        DropRun d = run_drops(s);
+        r.check(fabs((double)d.at_end.card_total - lag_n) <= 2 && fabs((double)d.at_end.obs_total - lag_n) <= 2,
+                "card losses + OBS lag 2 ticks apart: card %llu, OBS %llu (want ~%.0f each)",
+                (unsigned long long)d.at_end.card_total, (unsigned long long)d.at_end.obs_total, lag_n);
+        // without the video time the empty tick takes both (the old attribution)
+        s.video_time = false;
+        DropRun old = run_drops(s);
+        r.check(old.at_end.card_total > old.at_end.obs_total,
+                "without OBS's video time: the empty tick claims OBS's losses too (card %llu, OBS %llu)",
+                (unsigned long long)old.at_end.card_total, (unsigned long long)old.at_end.obs_total);
+    }
+    {   // lag 2 ticks before the card's losses: the same
+        DropSim s;
+        s.card_lose_every = 24;
+        s.obs_lag_every = 24;
+        s.lag_at = 5;
+        DropRun d = run_drops(s);
+        r.check(fabs((double)d.at_end.card_total - lag_n) <= 2 && fabs((double)d.at_end.obs_total - lag_n) <= 2,
+                "OBS lag 2 ticks before card losses: card %llu, OBS %llu (want ~%.0f each)",
+                (unsigned long long)d.at_end.card_total, (unsigned long long)d.at_end.obs_total, lag_n);
+    }
+    {   // without OBS's video time (older traces, a source without it): the 0.5 rules
+        DropSim s;
+        s.video_time = false;
+        s.obs_lose_every = 12; // no empty tick near the gap: OBS took the newer frame
+        DropRun d = run_drops(s);
+        r.check(d.at_end.card_total == 0 && d.at_end.obs_total > 0,
+                "no video time, OBS losses: OBS's (card %llu, OBS %llu)", (unsigned long long)d.at_end.card_total,
+                (unsigned long long)d.at_end.obs_total);
+        DropSim e;
+        e.video_time = false;
+        e.card_lose_every = 12;
+        e.empty_after = true; // the empty tick two ticks after the gap: the gap waits for it
+        DropRun de = run_drops(e);
+        r.check(de.at_end.obs_total == 0 && de.at_end.card_total > 0,
+                "no video time, empty tick 2 ticks after the gap: the card's (card %llu, OBS %llu)",
+                (unsigned long long)de.at_end.card_total, (unsigned long long)de.at_end.obs_total);
+    }
+    {   // card losses only, with the video time: unchanged
+        DropSim s;
+        s.card_lose_every = 12;
+        s.obs_buffered = true;
+        DropRun d = run_drops(s);
+        r.check(d.at_end.obs_total == 0 && d.at_end.card_total > 0,
+                "card losses with OBS's video time, no lag: all the card's (card %llu, OBS %llu)",
+                (unsigned long long)d.at_end.card_total, (unsigned long long)d.at_end.obs_total);
     }
 }
 

@@ -269,6 +269,10 @@ struct fps_beat {
 // One OBS video tick on an async source: `frames` is how many source frames
 // reached the filter since the previous tick (0 = OBS repeated a frame).
 void fps_core_obs_tick(struct fps_core *c, uint64_t now_ns, int frames);
+// The same with OBS's video time of the tick (obs_get_video_frame_time, 0 =
+// unknown). A step of two periods is a tick OBS skipped (rendering lag); a gap
+// in the device's timestamps near it is OBS's loss, not the device's.
+void fps_core_obs_tick_at(struct fps_core *c, uint64_t now_ns, int frames, uint64_t video_time_ns);
 
 // Starts the check over (the OBS FPS or the capture device's FPS changed).
 void fps_core_beat_reset(struct fps_core *c, uint64_t now_ns);
@@ -326,6 +330,13 @@ int fps_core_debug_last_published_fps(const struct fps_core *c);
 
 // True while the altered-frame check holds (see FPS_ALTERED_TRIGGER).
 bool fps_core_frames_altered(const struct fps_core *c);
+
+// Starts a fresh core in the altered state, as if the check had just
+// triggered: FPS_ALTERED_CLEAR identical frames still clear it, and a later
+// change of the picture size still starts the check over. The filter calls it
+// when it recreates the core for an FPS trace, so starting a trace on a
+// frame-altering device does not show its FPS while the new core re-learns.
+void fps_core_inherit_altered(struct fps_core *c);
 
 // --- Dropped frames (who lost them: the capture device or OBS) ---
 //

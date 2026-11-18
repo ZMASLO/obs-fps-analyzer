@@ -77,6 +77,7 @@ struct TraceHeader {
     uint32_t w = 0, h = 0;
     double obs_hz = 0.0;            // v3: obs_fps=num/den
     long long dev_interval = 0;     // v3: capture device frame interval, 100 ns units (0 = unknown)
+    bool altered = false;           // 0.6.0+: the core started with the altered-frame verdict
 };
 
 // "# fpstrace v2 ; plugin=0.5.0 ; path=async ; method=0 ; sens=0.1 ; ..."
@@ -120,6 +121,7 @@ static bool parse_header(const std::string &line, TraceHeader &out, std::string 
             if (num > 0.0 && den > 0.0)
                 out.params.pacing_period_ns = (uint64_t)(den * 1e9 / num);
         } else if (k == "dev_interval") out.dev_interval = strtoll(val.c_str(), nullptr, 10);
+        else if (k == "altered") out.altered = atoi(val.c_str()) != 0;
     }
     return true;
 }
@@ -214,6 +216,8 @@ static ReplayResult replay_trace(const fs::path &path, double tol, bool verbose)
                         break;
                     }
                     core = fps_core_create(&h.params);
+                    if (h.altered)
+                        fps_core_inherit_altered(core); // as the filter's fresh core did
                     have_header = true;
                 } else {
                     // parameters changed mid-session
@@ -350,7 +354,7 @@ static ReplayResult replay_trace(const fs::path &path, double tol, bool verbose)
                 break;
             }
             uint64_t now = (uint64_t)ll(f, 1);
-            fps_core_obs_tick(core, now, ival(f, 3));
+            fps_core_obs_tick_at(core, now, ival(f, 3), (uint64_t)ll(f, 2));
             r.k_rows++;
             last_ns = now > last_ns ? now : last_ns;
             if (!first_ns)
@@ -994,6 +998,21 @@ static int run_manifest(const fs::path &manifest, double tol, bool verbose, bool
                     printf("  %s %s: %llu lost by the capture device, %llu by OBS%s\n", good ? "[ok]" : "[FAIL]",
                            spec.c_str(), (unsigned long long)card, (unsigned long long)obsl,
                            r.drops.variable_source ? " (variable source)" : "");
+                    ok = ok && good;
+                    continue;
+                }
+                // "dropcard=N+-T" / "dropobs=N+-T": frames lost by the capture device /
+                // by OBS over the whole trace, N within T
+                if (spec.rfind("dropcard=", 0) == 0 || spec.rfind("dropobs=", 0) == 0) {
+                    const bool card_side = spec[4] == 'c';
+                    const char *v = spec.c_str() + (card_side ? 9 : 8);
+                    char *end = nullptr;
+                    double want = strtod(v, &end), tol = 0.0;
+                    if (end && strncmp(end, "+-", 2) == 0)
+                        tol = strtod(end + 2, nullptr);
+                    const double got = (double)(card_side ? r.drops.card_total : r.drops.obs_total);
+                    bool good = fabs(got - want) <= tol;
+                    printf("  %s %s: %.0f\n", good ? "[ok]" : "[FAIL]", spec.c_str(), got);
                     ok = ok && good;
                     continue;
                 }

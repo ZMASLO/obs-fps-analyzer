@@ -114,6 +114,7 @@ struct fps_analyzer_filter {
     bool block_unreliable;        // "block_unreliable" setting (default on)
     int unsupported_fmt;          // VIDEO_FORMAT_* of the last async frame the core cannot read, -1 = ok
     int blocked_reason;           // FPS_BLOCK_* last published (for the log)
+    bool trace_altered_start;     // the trace's fresh core inherited the altered verdict
     // What the core is asked to compute, kept in step with the settings and
     // with the overlay's demand (core_sync)
     bool core_measure_deltas;
@@ -561,6 +562,7 @@ static void debug_dump_frame(struct fps_analyzer_filter *filter, const uint8_t *
 //   # fpstrace v4 ; plugin=... ; path=async|sync ; method=.. ; sens=.. ; tear=.. ; tsens=.. ; interval=.. ; w=.. ; h=.. ; fmt=..
 //     ; obs_fps=num/den ; dev_interval=.. (the parent's "frame_interval" setting, 100 ns units; empty if none)
 //     ; dev_format=.. (the parent's "video_format" setting, win-dshow VideoFormat; empty if none)
+//     ; altered=0|1 (0.6.0+: the fresh core started with the altered-frame verdict carried over)
 //   F,now_ns,luma_size,diff,percent,unique,tear,ft_ms,ema,fps_pf,pos,count,src_ts,d0,d1,d2,d3,d4,d5,d6,d7
 //   T,now_ns,window,avg_ft,fps,frametime_ms,tearing,graph_count
 //   K,now_ns,video_time_ns,frames
@@ -633,8 +635,15 @@ static void trace_arm(struct fps_analyzer_filter *filter, int delay_sec) {
 // already at 960, a warm EMA, a published FPS feeding the averaging window) that
 // the replay cannot reconstruct, and the recorded ticks would never reproduce.
 // Resetting here also means every trace exercises the warm-up path.
+// The verdict that the device alters every frame is carried over (recorded in
+// the header as altered=1, so the replay starts from it too): a fresh core would
+// otherwise show that device's FPS for the ~3 s it takes to learn it again.
 static void trace_reset_analysis(struct fps_analyzer_filter *filter) {
+    const bool altered = fps_core_frames_altered(filter->core);
     core_recreate(filter);
+    if (altered)
+        fps_core_inherit_altered(filter->core);
+    filter->trace_altered_start = altered;
     g_fps_shared.fps = 0;
     g_fps_shared.frametime_ms = 0.0;
     g_fps_shared.graph_count = 0;
@@ -710,11 +719,12 @@ static void trace_note_frame(struct fps_analyzer_filter *filter, int path_kind,
         fprintf(filter->trace_file,
                 "# fpstrace v4 ; plugin=" FPS_TRACE_PLUGIN_VERSION " ; path=%s ; method=%d ; sens=%.17g ; "
                 "tear=%d ; tsens=%.17g ; interval=%.17g ; w=%u ; h=%u ; fmt=%s ; obs_fps=%u/%u ; "
-                "dev_interval=%s ; dev_format=%s\n",
+                "dev_interval=%s ; dev_format=%s ; altered=%d\n",
                 path_kind == 2 ? "sync" : "async", (int)filter->analyze_method, filter->sensitivity,
                 filter->enable_tearing_detection ? 1 : 0, filter->tearing_sensitivity,
                 filter->update_interval, width, height, trace_format_name(format),
-                have_ovi ? ovi.fps_num : 0, have_ovi ? ovi.fps_den : 0, dev_interval, dev_format);
+                have_ovi ? ovi.fps_num : 0, have_ovi ? ovi.fps_den : 0, dev_interval, dev_format,
+                filter->trace_altered_start ? 1 : 0);
         fputs("# F,now_ns,luma_size,diff,percent,unique,tear,ft_ms,ema,fps_pf,pos,count,src_ts,"
               "d0,d1,d2,d3,d4,d5,d6,d7\n"
               "# T,now_ns,window,avg_ft,fps,frametime_ms,tearing,graph_count\n"
@@ -1308,10 +1318,11 @@ static void fps_analyzer_video_tick(void *data, float seconds)
     update_block(filter, parent);
     publish_drops(filter, now);
     if (parent && (obs_source_get_output_flags(parent) & OBS_SOURCE_ASYNC)) {
-        fps_core_obs_tick(filter->core, now, filter->frames_since_tick);
+        const uint64_t video_time = obs_get_video_frame_time();
+        fps_core_obs_tick_at(filter->core, now, filter->frames_since_tick, video_time);
         if (filter->trace_file)
             fprintf(filter->trace_file, "K,%llu,%llu,%d\n", (unsigned long long)now,
-                    (unsigned long long)obs_get_video_frame_time(), filter->frames_since_tick);
+                    (unsigned long long)video_time, filter->frames_since_tick);
     }
     filter->frames_since_tick = 0;
 

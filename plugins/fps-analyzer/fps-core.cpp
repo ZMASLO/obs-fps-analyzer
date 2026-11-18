@@ -60,13 +60,23 @@ struct fps_core {
     struct gap_waiting {             // a gap waiting for an empty tick after it
         uint64_t tick;
         int n;
-    } gap_wait[16] = {};
+        bool empty_seen;             // with OBS's video time: an empty tick already near it
+    } gap_wait[64] = {};
     int gap_wait_n = 0;
     uint64_t iv60[60] = {};          // last intervals between delivered frames (variable-source test)
     int iv60_n = 0, iv60_pos = 0;
     bool drops_variable = false;
     int pending_lost = 0;            // frames lost before the frame being analysed...
     bool pending_card = false;       // ...and whether the card lost them
+    // OBS's video time (fps_core_obs_tick_at): a step of two periods is a tick OBS skipped
+    uint64_t last_vt = 0;
+    uint64_t vt_iv[60] = {};
+    int vt_n = 0, vt_pos = 0;
+    struct vt_skip {
+        uint64_t tick;
+        int n;
+    } vskip[16] = {};
+    int vskip_n = 0;
     struct drop_event {
         uint64_t t;
         int n;
@@ -102,6 +112,7 @@ struct fps_core {
     int altered_noise_run = 0;   // tiny-only "new" frames since the last identical one
     int altered_exact = 0;       // identical frames since the check triggered
     bool altered = false;
+    bool altered_inherited = false; // set by fps_core_inherit_altered, survives the first frame
 
     // Capture-path beat detector (observes only; see fps-core.h)
     struct beat_state {
@@ -488,14 +499,22 @@ static void beat_on_frame(struct fps_core *c, bool unique, uint64_t now)
 }
 
 static void drops_on_tick(struct fps_core *c, uint64_t now, bool empty);
+static void drops_note_video_time(struct fps_core *c, uint64_t vt);
 
 void fps_core_obs_tick(struct fps_core *c, uint64_t now_ns, int frames)
+{
+    fps_core_obs_tick_at(c, now_ns, frames, 0);
+}
+
+void fps_core_obs_tick_at(struct fps_core *c, uint64_t now_ns, int frames, uint64_t video_time_ns)
 {
     if (!c)
         return;
     c->tick_no++;
     if (frames == 0)
         c->last_empty_tick = c->tick_no; // dropped-frame attribution: the device delivered nothing
+    if (c->params.detect_drops)
+        drops_note_video_time(c, video_time_ns);
     drops_on_tick(c, now_ns, frames == 0);
     if (!c->params.beat_enabled)
         return;
@@ -760,14 +779,83 @@ static void drops_commit(struct fps_core *c, uint64_t now)
     c->pending_lost = 0;
 }
 
-// Per OBS tick: an empty tick claims the gaps waiting for it (the card lost
-// those frames); a gap that saw none within the look-back went to OBS.
+// Up to `want` of the ticks OBS skipped within FPS_DROPS_EMPTY_TICK_LOOKBACK
+// ticks of `tick` (before or after it, as far as seen): each explains one frame
+// lost from the source's timestamps. Consumed, so one skip explains one frame.
+static int vskip_take(struct fps_core *c, uint64_t tick, int want)
+{
+    int got = 0, keep = 0;
+    for (int i = 0; i < c->vskip_n; i++) {
+        fps_core::vt_skip s = c->vskip[i];
+        const uint64_t d = s.tick > tick ? s.tick - tick : tick - s.tick;
+        if (got < want && d <= FPS_DROPS_EMPTY_TICK_LOOKBACK) {
+            int t = want - got < s.n ? want - got : s.n;
+            got += t;
+            s.n -= t;
+        }
+        if (s.n > 0 && c->tick_no - s.tick <= 2 * FPS_DROPS_EMPTY_TICK_LOOKBACK)
+            c->vskip[keep++] = s; // unclaimed, still in reach of a gap
+    }
+    c->vskip_n = keep;
+    return got;
+}
+
+// OBS's video time for this tick: a step of more than 1.5x the median step
+// means OBS skipped round(step / median) - 1 ticks (rendering lag).
+static void drops_note_video_time(struct fps_core *c, uint64_t vt)
+{
+    if (!vt)
+        return;
+    if (c->last_vt && vt > c->last_vt) {
+        const uint64_t step = vt - c->last_vt;
+        if (c->vt_n >= 10) {
+            uint64_t tmp[60];
+            std::copy(c->vt_iv, c->vt_iv + c->vt_n, tmp);
+            std::nth_element(tmp, tmp + c->vt_n / 2, tmp + c->vt_n);
+            const uint64_t median = tmp[c->vt_n / 2];
+            if (median && step * 2 > median * 3 && step <= FPS_DROPS_MAX_GAP_NS) {
+                int n = (int)((step + median / 2) / median) - 1;
+                if (c->vskip_n == 16) {
+                    std::copy(c->vskip + 1, c->vskip + 16, c->vskip);
+                    c->vskip_n--;
+                }
+                c->vskip[c->vskip_n].tick = c->tick_no;
+                c->vskip[c->vskip_n].n = n;
+                c->vskip_n++;
+            }
+        }
+        c->vt_iv[c->vt_pos] = step;
+        c->vt_pos = (c->vt_pos + 1) % 60;
+        if (c->vt_n < 60)
+            c->vt_n++;
+    }
+    c->last_vt = vt;
+}
+
+// Per OBS tick: a tick OBS skipped near a waiting gap explains (part of) it;
+// an empty tick claims the rest (the card lost those frames); a gap that saw
+// neither within the look-back went to OBS.
 static void drops_on_tick(struct fps_core *c, uint64_t now, bool empty)
 {
     int keep = 0;
     for (int i = 0; i < c->gap_wait_n; i++) {
-        const fps_core::gap_waiting g = c->gap_wait[i];
-        if (empty)
+        fps_core::gap_waiting g = c->gap_wait[i];
+        int o = vskip_take(c, g.tick, g.n);
+        if (o > 0) {
+            drops_record(c, o, false, now);
+            g.n -= o;
+        }
+        if (g.n <= 0)
+            continue;
+        const bool have_vt = c->vt_n >= 10;
+        if (have_vt) {
+            // decided when the look-back is over: an empty tick near it -> the card
+            g.empty_seen = g.empty_seen || empty;
+            if (c->tick_no - g.tick > FPS_DROPS_EMPTY_TICK_LOOKBACK)
+                drops_record(c, g.n, g.empty_seen, now);
+            else
+                c->gap_wait[keep++] = g;
+        } else if (empty)
             drops_record(c, g.n, true, now);
         else if (c->tick_no - g.tick > FPS_DROPS_EMPTY_TICK_LOOKBACK)
             drops_record(c, g.n, false, now);
@@ -800,17 +888,26 @@ static void pacing_note_frame(struct fps_core *c)
                     c->drops_variable = drops_source_variable(c, median);
                     if (!c->drops_variable) {
                         int lost = (int)((iv + median / 2) / median) - 1;
-                        // The device lost them if OBS had a tick without a frame
+                        // A tick OBS skipped (its video time stepped two periods)
+                        // near the gap explains one lost frame each: OBS's
+                        // (drops_on_tick; 18.11.2026 OBS-lag trace: 122 skips = OBS's
+                        // 122 skipped frames). The device lost the rest if OBS had a tick without a frame
                         // near the gap. OBS buffers frames, so in the 17.11.2026
                         // Mk2 traces that tick came up to 3 ticks before the gap
                         // or after it: an empty tick already seen decides now,
-                        // otherwise the gap waits (fps_core_obs_tick).
-                        if (c->last_empty_tick && c->tick_no - c->last_empty_tick <= FPS_DROPS_EMPTY_TICK_LOOKBACK) {
+                        // otherwise the gap waits (fps_core_obs_tick). With OBS's
+                        // video time the gap always waits the look-back out: the
+                        // tick OBS skipped can show only after the gap's frame.
+                        const bool empty_near =
+                            c->last_empty_tick && c->tick_no - c->last_empty_tick <= FPS_DROPS_EMPTY_TICK_LOOKBACK;
+                        const bool have_vt = c->vt_n >= 10;
+                        if (empty_near && !have_vt) {
                             c->pending_lost = lost;
                             c->pending_card = true;
-                        } else if (c->gap_wait_n < 16) {
+                        } else if (c->gap_wait_n < 64) {
                             c->gap_wait[c->gap_wait_n].tick = c->tick_no;
                             c->gap_wait[c->gap_wait_n].n = lost;
+                            c->gap_wait[c->gap_wait_n].empty_seen = empty_near;
                             c->gap_wait_n++;
                         }
                     }
@@ -918,8 +1015,13 @@ static void analyze_luma_frame(struct fps_core *c, const uint8_t *luma_ptr, size
     if (!c->prev_frame_allocated || c->prev_frame.size() != luma_size) {
         // First frame, or the analysed region changed size: nothing to compare
         // against, so treat it as new. A new picture size is a new check.
+        // A new picture size is a new check; the very first frame of a core that
+        // inherited the verdict (fps_core_inherit_altered) is not.
+        const bool keep = !c->prev_frame_allocated && c->altered_inherited;
         init_prev_frame_buffer(c, luma_size, luma_ptr);
-        altered_reset(c);
+        if (!keep)
+            altered_reset(c);
+        c->altered_inherited = false;
         is_unique = true;
     } else {
         size_t diff;
@@ -1324,6 +1426,16 @@ void fps_core_debug_set_source_ts(struct fps_core *c, uint64_t src_ts_ns)
 bool fps_core_frames_altered(const struct fps_core *c)
 {
     return c && c->altered;
+}
+
+void fps_core_inherit_altered(struct fps_core *c)
+{
+    if (!c)
+        return;
+    c->altered = true;
+    c->altered_exact = 0;
+    c->altered_noise_run = 0;
+    c->altered_inherited = true;
 }
 
 void fps_core_debug_feed_deltas(struct fps_core *c, size_t diff, bool unique,

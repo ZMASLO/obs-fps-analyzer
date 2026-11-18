@@ -94,16 +94,16 @@ trace:traces/mk2_yuy2_pausemenu_v4.csv ; ; self, notblocked, fps@3-20=60+-1, nod
 # A game with real judder: 30 FPS on average, but frames shown for 16.7 / 33.4 / 50 ms; the
 # counter and the smoothed frametime say a steady 30, only the frame pacing graph shows it.
 trace:traces/mk2_yuy2_game30_judder_v4.csv ; ; self, notblocked, fps@2-10=30+-1, pacinggaps=0, pacing@0-10=16.68|33.37|50.05+-0.05, nodrops ; Elgato 4K Mk2, YUY2 4K, game at 30 FPS with uneven pacing (74 x 16.7, 153 x 33.4, 73 x 50 ms in 10 s), no capture loss
-trace:traces/mk2_yuy2_game30_carddrops_v4.csv ; ; self, notblocked, pacinggaps>0, pacing@3-20=33.37+-0.05, drops=card ; Elgato 4K Mk2, YUY2 4K, game at 30 FPS, the card dropping 98 frames in 20 s
+trace:traces/mk2_yuy2_game30_carddrops_v4.csv ; ; self, notblocked, pacinggaps>0, pacing@3-20=33.37+-0.05, drops=card, dropcard=98+-2, dropobs=0+-1 ; Elgato 4K Mk2, YUY2 4K, game at 30 FPS, the card dropping 98 frames in 20 s
 # Two more recordings of the Mk2 dropping frames (257 and 133 gaps in its timestamps, OBS
 # rendering without a single late tick): the empty OBS tick lies up to 3 ticks before or after
 # each gap (OBS buffers frames), and the losses must still go to the card, not to OBS.
-trace:traces/mk2_yuy2_carddrops_257_v4.csv ; ; self, drops=card ; Elgato 4K Mk2, YUY2 4K, PS5, the card dropping ~8.6 frames/s
-trace:traces/mk2_yuy2_carddrops_133_v4.csv ; ; self, drops=card ; Elgato 4K Mk2, YUY2 4K, PS5, the card dropping ~13 frames/s, empty ticks often after the gap
+trace:traces/mk2_yuy2_carddrops_257_v4.csv ; ; self, drops=card, dropcard=248+-3, dropobs=1+-1 ; Elgato 4K Mk2, YUY2 4K, PS5, the card dropping ~8.6 frames/s
+trace:traces/mk2_yuy2_carddrops_133_v4.csv ; ; self, drops=card, dropcard=113+-3, dropobs=1+-2 ; Elgato 4K Mk2, YUY2 4K, PS5, the card dropping ~13 frames/s, empty ticks often after the gap
 # OBS itself lagging (18.11.2026, v0.6.0 with the slow Full frame histogram: 19 ms render per
 # frame at 59.94 FPS). OBS's stats: 122 of 1199 frames skipped; the trace has exactly 122 video-time
 # steps of two periods. The card was dropping frames as well (36 empty ticks), so this is mixed.
-trace:traces/mk2_yuy2_obslag_v4.csv ; ; self, drops=obs ; Elgato 4K Mk2, YUY2 4K, Full frame diff, OBS lagging (122 frames skipped) while the card drops some too
+trace:traces/mk2_yuy2_obslag_v4.csv ; ; self, drops=obs, dropobs=122+-4, dropcard=36+-4 ; Elgato 4K Mk2, YUY2 4K, Full frame diff, OBS lagging (122 frames skipped) while the card drops some too
 # A PC as the source (18.11.2026, RTX 5090 over HDMI into the 4K Mk2, Cyberpunk 2077 at ~38 FPS,
 # Windows 60 Hz). NVIDIA's default colour settings for an "HDMI - HDTV" display: the driver converts
 # the desktop's RGB 8-bit and dithers, so every repeat the game made differs by |d| = 1 (FPS hidden),
@@ -112,3 +112,6 @@ trace:traces/mk2_yuy2_obslag_v4.csv ; ; self, drops=obs ; Elgato 4K Mk2, YUY2 4K
 trace:traces/mk2_yuy2_pc_nvidia_default_dither_v4.csv ; ; self, blocked=altered, drops=card, nobeat ; Elgato 4K Mk2, YUY2 4K, PC (NVIDIA default colour settings): the GPU dithers every repeat, the card drops frames in bursts
 trace:traces/mk2_yuy2_pc_nvidia_rgb8_v4.csv ; ; self, notblocked, fps@3-35=38+-2, pacinggaps=0, nodrops ; Elgato 4K Mk2, YUY2 4K, PC with NVIDIA set to RGB / 8 bpc / Full: identical repeats, reads 38
 trace:traces/mk2_yuy2_pc_nvidia_default_full_v4.csv ; ; self, blocked=altered, nobeat ; Elgato 4K Mk2, YUY2 4K, Full frame diff, PC with NVIDIA default colour settings, 75 s: the GPU dithers every repeat (FPS hidden), this time the card lost 1 frame, no bursts, and the signal check says 60 Hz OK
+# Starting a trace on a device already blocked (18.11.2026, 0.6.0): the fresh core inherits the verdict
+# (header altered=1), so the FPS stays hidden from the first frame of the trace on
+trace:traces/4kx_nv12_trace_start_altered_v4.csv ; ; self, blocked=altered ; Elgato 4K X, NV12 4K, PS5 (GTA V at 60), trace started while blocked: hidden from the first frame

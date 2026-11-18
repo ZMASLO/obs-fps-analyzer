@@ -67,6 +67,13 @@ $mutations = @(
     @{ name = "dudnienie: brak zastoju";             find = 'b.cluster_stall = true;'; repl = '(void)0;' },
     @{ name = "dudnienie: duplikat bez czystego ciagu"; find = 'beat_event(c, now, false, b.clean_frames >= FPS_BEAT_CLEAN_RUN, b.run_dup);'; repl = 'beat_event(c, now, false, true, b.run_dup);' },
     @{ name = "dudnienie: pusty tick nie jest zdarzeniem"; find = 'if (frames == 0) {'; repl = 'if (frames == -5) {' },
+    # Werdykt "zmienione klatki" przezywa start sladu; straty OBS z czasu wideo (0.6.0)
+    @{ name = "slad: werdykt nie dziedziczony";       find = '    c->altered = true;' + $nl + '    c->altered_exact = 0;' + $nl + '    c->altered_noise_run = 0;' + $nl + '    c->altered_inherited = true;'; repl = '    c->altered_inherited = true;' },
+    @{ name = "slad: pierwsza klatka kasuje werdykt"; find = 'const bool keep = !c->prev_frame_allocated && c->altered_inherited;'; repl = 'const bool keep = false;' },
+    @{ name = "slad: zmiana rozmiaru nie kasuje";     find = 'const bool keep = !c->prev_frame_allocated && c->altered_inherited;'; repl = 'const bool keep = c->altered_inherited || c->altered;' },
+    @{ name = "straty: pominiete takty dopiero od 3x"; find = 'if (median && step * 2 > median * 3 && step <= FPS_DROPS_MAX_GAP_NS) {'; repl = 'if (median && step > median * 3 && step <= FPS_DROPS_MAX_GAP_NS) {' },
+    @{ name = "straty: odlozone bez czasu wideo";      find = 'int o = vskip_take(c, g.tick, g.n);'; repl = 'int o = 0;' },
+    @{ name = "straty: bez czekania przy czasie wideo"; find = 'const bool have_vt = c->vt_n >= 10;' + $nl + '                        if (empty_near && !have_vt) {'; repl = 'const bool have_vt = false;' + $nl + '                        if (empty_near && !have_vt) {' },
     # Serie strat karty nie sa dudnieniem (PC -> 4K Mk2, 18.11.2026)
     @{ name = "dudnienie: brak kontroli przychodzenia"; find = 'out->arrival_rejected = true;' + $nl + '                continue;'; repl = 'out->arrival_rejected = true;' },
     @{ name = "dudnienie: prog przychodzenia 0";      find = 'fabs(delivery_hz - out->arrival_hz) < FPS_BEAT_ARRIVAL_MIN_FRAC / period'; repl = 'fabs(delivery_hz - out->arrival_hz) < 0.0 / period' },
