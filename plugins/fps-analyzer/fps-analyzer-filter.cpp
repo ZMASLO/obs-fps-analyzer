@@ -25,7 +25,7 @@ extern struct obs_source_info fps_overlay_source_info;
 
 #define FPS_CSV_HISTORY_LIMIT 300
 // Version stamped into FPS trace headers (see trace_note_frame)
-#define FPS_TRACE_PLUGIN_VERSION "0.5.2"
+#define FPS_TRACE_PLUGIN_VERSION "0.6.0"
 
 // Dodaj enum do wyboru metody analizy
 typedef enum {
@@ -1456,7 +1456,7 @@ static void *fps_analyzer_create(obs_data_t *settings, obs_source_t *context)
 static const char *fps_analyzer_get_name(void *unused)
 {
     UNUSED_PARAMETER(unused);
-    return "FPS Analyzer 0.5.2";
+    return "FPS Analyzer 0.6.0";
 }
 
 // --- Properties ---
