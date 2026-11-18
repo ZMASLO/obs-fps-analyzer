@@ -123,6 +123,15 @@ struct fps_core {
         int clusters = 0;
         uint64_t obs_start = 0;        // when the current check started (0 = no frame yet)
         uint64_t last_activity = 0;    // last frame / tick that delivered one
+        // when frames arrive (analysis clock) against their device timestamps:
+        // a least-squares fit of arrival on timestamp, both relative to the first frame
+        uint64_t arr_first_now = 0, arr_first_ts = 0, arr_last_now = 0, arr_last_ts = 0;
+        double arr_n = 0, arr_sx = 0, arr_sy = 0, arr_sxx = 0, arr_sxy = 0;
+        // frames lost by the device (gaps in its timestamps), for the capture clusters
+        bool gap_pending = false;      // pacing_note_frame saw a gap before this frame
+        uint64_t last_gap = 0;         // analysis time of the last gap
+        bool cluster_lossy = false;    // the open cluster had a gap in it (or just before it)
+        int lossy_clusters = 0;        // capture clusters discarded for that (diagnostic)
     } beat;
 };
 
@@ -355,6 +364,13 @@ static void beat_close_cluster(struct fps_core *c)
     b.in_cluster = false;
     if (b.cluster_stall || b.cluster_events > FPS_BEAT_MAX_EVENTS)
         return; // a stall (static scene, loading screen, signal loss), not a beat
+    if (!b.cluster_obs && b.cluster_lossy) {
+        // Identical frames around a gap in the device's timestamps: the device
+        // losing frames, not resampling a slower source (that keeps its
+        // timestamps perfect)
+        b.lossy_clusters++;
+        return;
+    }
     b.clusters++;
     if (b.n == FPS_BEAT_HISTORY) {
         memmove(b.times, b.times + 1, sizeof(b.times[0]) * (FPS_BEAT_HISTORY - 1));
@@ -382,8 +398,10 @@ static double beat_snap(double hz)
 static void beat_reset(struct fps_core *c, uint64_t now)
 {
     int clusters = c->beat.clusters;
+    int lossy = c->beat.lossy_clusters;
     c->beat = fps_core::beat_state();
-    c->beat.clusters = clusters; // diagnostic total survives
+    c->beat.clusters = clusters; // diagnostic totals survive
+    c->beat.lossy_clusters = lossy;
     c->beat.obs_start = now;
     c->beat.last_activity = now;
 }
@@ -422,6 +440,7 @@ static void beat_event(struct fps_core *c, uint64_t now, bool from_obs, bool cle
         b.cluster_sum_s = 0.0;
         b.cluster_obs = false;
         b.cluster_stall = false;
+        b.cluster_lossy = b.last_gap && now >= b.last_gap && now - b.last_gap <= FPS_BEAT_GAP_BEFORE_NS;
     }
     b.cluster_events++;
     b.cluster_last = now;
@@ -437,6 +456,27 @@ static void beat_on_frame(struct fps_core *c, bool unique, uint64_t now)
         return;
     auto &b = c->beat;
     beat_advance(c, now, true);
+    if (c->src_ts) {
+        if (!b.arr_first_now || c->src_ts < b.arr_last_ts || now < b.arr_last_now) {
+            b.arr_first_now = now; // first frame of the check, or the timestamps restarted
+            b.arr_first_ts = c->src_ts;
+            b.arr_n = b.arr_sx = b.arr_sy = b.arr_sxx = b.arr_sxy = 0.0;
+        }
+        b.arr_last_now = now;
+        b.arr_last_ts = c->src_ts;
+        const double x = (double)(c->src_ts - b.arr_first_ts) / 1e9, y = (double)(now - b.arr_first_now) / 1e9;
+        b.arr_n += 1.0;
+        b.arr_sx += x;
+        b.arr_sy += y;
+        b.arr_sxx += x * x;
+        b.arr_sxy += x * y;
+    }
+    if (b.gap_pending) {
+        b.gap_pending = false;
+        b.last_gap = now;
+        if (b.in_cluster)
+            b.cluster_lossy = true;
+    }
     if (unique) {
         b.clean_frames++;
         b.run_dup = 0;
@@ -489,11 +529,48 @@ static int beat_find(const struct fps_core::beat_state &b, bool obs, double t, d
     return -1;
 }
 
+// How fast the source's frames arrive on the analysis clock: the device's
+// frame rate (median timestamp interval) scaled by how its clock runs against
+// the analysis clock, over the whole check. 0 = unknown (no timestamps, under
+// FPS_BEAT_ARRIVAL_MIN_S watched, or timestamps that do not follow the clock).
+static double beat_arrival_hz(const struct fps_core *c)
+{
+    const auto &b = c->beat;
+    if (!b.arr_first_now || b.arr_last_now <= b.arr_first_now || b.arr_last_ts <= b.arr_first_ts ||
+        c->src_iv_n < 5)
+        return 0.0;
+    const double span_now = (double)(b.arr_last_now - b.arr_first_now);
+    if (span_now < FPS_BEAT_ARRIVAL_MIN_S * 1e9)
+        return 0.0;
+    // arrival time per timestamp second (the slope of the fit), inverted: how
+    // many timestamp seconds pass per second of the analysis clock
+    const double den = b.arr_n * b.arr_sxx - b.arr_sx * b.arr_sx;
+    const double slope = den > 0.0 ? (b.arr_n * b.arr_sxy - b.arr_sx * b.arr_sy) / den : 0.0;
+    if (slope <= 0.0)
+        return 0.0;
+    const double ratio = 1.0 / slope;
+    if (ratio < 0.9 || ratio > 1.1)
+        return 0.0;
+    // The device's frame period: the median of the recent intervals that are
+    // single periods. Lost frames only lengthen an interval, so inside a burst
+    // of losses (more than half of them doubled) the plain median would be two.
+    const uint64_t shortest = *std::min_element(c->src_iv, c->src_iv + c->src_iv_n);
+    uint64_t tmp[15];
+    int m = 0;
+    for (int i = 0; i < c->src_iv_n; i++)
+        if (c->src_iv[i] * 2 < shortest * 3)
+            tmp[m++] = c->src_iv[i];
+    std::nth_element(tmp, tmp + m / 2, tmp + m);
+    const uint64_t period = tmp[m / 2];
+    return period ? 1e9 / (double)period * ratio : 0.0;
+}
+
 // The confirmed-beat search: fills the beat fields of `out` and sets
 // out->detected when a chain qualifies.
 static void beat_detect(const struct fps_core *c, uint64_t now_ns, double delivery_hz, struct fps_beat *out)
 {
     const auto &b = c->beat;
+    out->arrival_hz = beat_arrival_hz(c);
     if (b.n < 2)
         return;
 
@@ -536,6 +613,16 @@ static void beat_detect(const struct fps_core *c, uint64_t now_ns, double delive
             if (nominal > 0.0 && fabs(nominal / delivery_hz - 1.0) < 1e-9 &&
                 chain < need + FPS_BEAT_CHAIN_DRIFT_EXTRA)
                 return; // same nominal rate (crystal drift): needs a longer chain
+            // Empty OBS ticks every P can only come from source frames arriving
+            // about 1/P slower or faster than OBS ticks. Frames arriving in step
+            // with OBS (a card losing frames in periodic bursts) make no beat.
+            // Drift (1/P under FPS_BEAT_ARRIVAL_MIN_BEAT_HZ) is below what the
+            // measurement resolves and keeps the plain check.
+            if (obs && out->arrival_hz > 0.0 && delivery_hz > 0.0 && 1.0 / period >= FPS_BEAT_ARRIVAL_MIN_BEAT_HZ &&
+                fabs(delivery_hz - out->arrival_hz) < FPS_BEAT_ARRIVAL_MIN_FRAC / period) {
+                out->arrival_rejected = true;
+                continue;
+            }
             // Gone quiet for three periods (settings fixed, source changed): expired.
             if (now_ns > b.times[last] && (double)(now_ns - b.times[last]) / 1e9 > 3.0 * period)
                 return;
@@ -616,6 +703,7 @@ void fps_core_get_beat(const struct fps_core *c, uint64_t now_ns, double deliver
     if (!c)
         return;
     out->clusters = c->beat.clusters;
+    out->lossy_clusters = c->beat.lossy_clusters;
     beat_detect(c, now_ns, delivery_hz, out);
     beat_verify(c, now_ns, delivery_hz, out);
     if (out->detected)
@@ -704,6 +792,7 @@ static void pacing_note_frame(struct fps_core *c)
             if (iv * 2 > median * 3) {
                 c->pending_gap = true;
                 c->frame_after_gap = true;
+                c->beat.gap_pending = true; // the beat detector: a lossy capture cluster
                 // (nothing counted before 30 intervals: the variable-source test needs them)
                 // A gap of more than FPS_DROPS_MAX_GAP_NS is an interrupted stream
                 // (the filter or the source switched off, the signal lost), not lost frames

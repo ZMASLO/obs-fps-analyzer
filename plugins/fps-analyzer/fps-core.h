@@ -182,7 +182,22 @@ bool fps_core_tick(struct fps_core *c, uint64_t now_ns, struct fps_core_output *
 //     beat is the difference of two standard clocks, a coincidence of game
 //     hitches almost never is. When it snaps to D itself (two crystals of the
 //     same nominal rate drifting, P of minutes) FPS_BEAT_CHAIN_DRIFT_EXTRA
-//     more clusters are required.
+//     more clusters are required;
+//   - a device losing frames in bursts (the 4K Mk2 with a PC sending YCbCr,
+//     18.11.2026: bursts every ~16.7 s of empty ticks, timestamp gaps and
+//     identical frames) must not pass for a beat:
+//       OBS:      empty ticks every P need source frames arriving about 1/P
+//                 off the OBS rate. Once FPS_BEAT_ARRIVAL_MIN_S has been
+//                 watched, the arrival rate (the device's frame rate scaled
+//                 by its clock against the analysis clock) must differ from
+//                 the delivery rate by at least FPS_BEAT_ARRIVAL_MIN_FRAC / P,
+//                 else the chain is rejected (arrival_rejected). Beats slower
+//                 than FPS_BEAT_ARRIVAL_MIN_BEAT_HZ (drift) skip this test;
+//       capture:  a card resampling a slower source keeps its timestamps
+//                 perfect, so a capture cluster with a timestamp gap in it,
+//                 or within FPS_BEAT_GAP_BEFORE_NS before it, is the device
+//                 losing frames and is discarded (lossy_clusters).
+//     Without device timestamps (sync path) neither test applies.
 //
 // Until a beat is confirmed the verdict is CHECKING, not "fine": a console
 // at 59.94 Hz into 60 FPS repeats a frame only every 1001/D seconds, so
@@ -217,6 +232,10 @@ bool fps_core_tick(struct fps_core *c, uint64_t now_ns, struct fps_core_output *
 #define FPS_BEAT_VERIFY_PERIODS 2.4
 #define FPS_BEAT_RESET_GAP_NS 2000000000ULL
 #define FPS_BEAT_UNEVEN_CLUSTERS 3
+#define FPS_BEAT_ARRIVAL_MIN_S 20.0       // arrival rate measured over at least this long
+#define FPS_BEAT_ARRIVAL_MIN_FRAC 0.5     // |delivery - arrival| >= this * 1/P for an OBS beat
+#define FPS_BEAT_ARRIVAL_MIN_BEAT_HZ 0.02 // slower beats (drift) skip the arrival test
+#define FPS_BEAT_GAP_BEFORE_NS 500000000ULL
 
 enum fps_beat_status {
     FPS_BEAT_CHECKING = 0,  // not watched long enough to rule a mismatch out
@@ -242,6 +261,9 @@ struct fps_beat {
     double nominal_hz;   // the standard rate signal_hz snapped to (0 = none / delivery unknown)
     int chain;           // clusters in the chain (diagnostic)
     int clusters;        // clusters seen since creation (diagnostic)
+    int lossy_clusters;  // capture clusters discarded: a timestamp gap in them (diagnostic)
+    double arrival_hz;   // source frames per second on the analysis clock (0 = unknown)
+    bool arrival_rejected; // an OBS chain was rejected: frames arrive in step with OBS
 };
 
 // One OBS video tick on an async source: `frames` is how many source frames

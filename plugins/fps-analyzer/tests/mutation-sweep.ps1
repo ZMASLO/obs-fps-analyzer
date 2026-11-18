@@ -67,6 +67,12 @@ $mutations = @(
     @{ name = "dudnienie: brak zastoju";             find = 'b.cluster_stall = true;'; repl = '(void)0;' },
     @{ name = "dudnienie: duplikat bez czystego ciagu"; find = 'beat_event(c, now, false, b.clean_frames >= FPS_BEAT_CLEAN_RUN, b.run_dup);'; repl = 'beat_event(c, now, false, true, b.run_dup);' },
     @{ name = "dudnienie: pusty tick nie jest zdarzeniem"; find = 'if (frames == 0) {'; repl = 'if (frames == -5) {' },
+    # Serie strat karty nie sa dudnieniem (PC -> 4K Mk2, 18.11.2026)
+    @{ name = "dudnienie: brak kontroli przychodzenia"; find = 'out->arrival_rejected = true;' + $nl + '                continue;'; repl = 'out->arrival_rejected = true;' },
+    @{ name = "dudnienie: prog przychodzenia 0";      find = 'fabs(delivery_hz - out->arrival_hz) < FPS_BEAT_ARRIVAL_MIN_FRAC / period'; repl = 'fabs(delivery_hz - out->arrival_hz) < 0.0 / period' },
+    @{ name = "dudnienie: przychodzenie z mediany";   find = 'if (c->src_iv[i] * 2 < shortest * 3)'; repl = 'if (true)' },
+    @{ name = "dudnienie: klaster ze stratami liczony"; find = 'if (!b.cluster_obs && b.cluster_lossy) {'; repl = 'if (false) {' },
+    @{ name = "dudnienie: strata w klastrze nie oznacza"; find = 'if (b.in_cluster)' + $nl + '            b.cluster_lossy = true;'; repl = '(void)0;' },
     # Sprawdzanie sygnalu: "OK" dopiero, gdy rozjazd 59.94/60 jest wykluczony
     @{ name = "sprawdzanie: powtorka nie wstrzymuje"; find = 'held = now_s - t[i] < 2.0 * p + tol;'; repl = 'held = false;' },
     @{ name = "sprawdzanie: wstrzymanie 1P zamiast 2P"; find = 'held = now_s - t[i] < 2.0 * p + tol;'; repl = 'held = now_s - t[i] < 1.0 * p + tol;' },

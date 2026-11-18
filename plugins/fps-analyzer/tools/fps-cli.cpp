@@ -402,7 +402,11 @@ static void print_result(const fs::path &path, const ReplayResult &r)
                r.beat.period_s, r.beat.origin == FPS_BEAT_ORIGIN_OBS ? "OBS" : "capture device", r.beat.signal_hz,
                r.beat.nominal_hz, r.header.obs_hz, r.beat.chain, r.beat.clusters);
     else
-        printf("  capture beat: none (%d clusters%s)\n", r.beat.clusters, r.k_rows ? "" : ", no K rows");
+        printf("  capture beat: none (%d clusters%s%s)\n", r.beat.clusters, r.k_rows ? "" : ", no K rows",
+               r.beat.arrival_rejected ? ", a chain rejected: frames arrive in step with OBS" : "");
+    if (r.beat.arrival_hz > 0.0 || r.beat.lossy_clusters)
+        printf("  beat checks: frames arrive at %.4f Hz, %d capture clusters with lost frames discarded\n",
+               r.beat.arrival_hz, r.beat.lossy_clusters);
     if (r.k_rows)
         printf("  signal check: first CLEAR %s, first warning %s\n",
                r.first_clear_s >= 0 ? (num(r.first_clear_s) + " s").c_str() : "never",

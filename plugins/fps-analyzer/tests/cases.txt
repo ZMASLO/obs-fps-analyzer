@@ -109,5 +109,6 @@ trace:traces/mk2_yuy2_obslag_v4.csv ; ; self, drops=obs ; Elgato 4K Mk2, YUY2 4K
 # the desktop's RGB 8-bit and dithers, so every repeat the game made differs by |d| = 1 (FPS hidden),
 # and the Mk2 dropped frames in bursts every ~16.7 s. NVIDIA Control Panel set to RGB / 8 bpc / Full:
 # identical repeats, no card drops, reads 38 (RTSS 39).
-trace:traces/mk2_yuy2_pc_nvidia_default_dither_v4.csv ; ; self, blocked=altered, drops=card ; Elgato 4K Mk2, YUY2 4K, PC (NVIDIA default colour settings): the GPU dithers every repeat, the card drops frames in bursts
+trace:traces/mk2_yuy2_pc_nvidia_default_dither_v4.csv ; ; self, blocked=altered, drops=card, nobeat ; Elgato 4K Mk2, YUY2 4K, PC (NVIDIA default colour settings): the GPU dithers every repeat, the card drops frames in bursts
 trace:traces/mk2_yuy2_pc_nvidia_rgb8_v4.csv ; ; self, notblocked, fps@3-35=38+-2, pacinggaps=0, nodrops ; Elgato 4K Mk2, YUY2 4K, PC with NVIDIA set to RGB / 8 bpc / Full: identical repeats, reads 38
+trace:traces/mk2_yuy2_pc_nvidia_default_full_v4.csv ; ; self, blocked=altered, nobeat ; Elgato 4K Mk2, YUY2 4K, Full frame diff, PC with NVIDIA default colour settings, 75 s: the GPU dithers every repeat (FPS hidden), this time the card lost 1 frame, no bursts, and the signal check says 60 Hz OK

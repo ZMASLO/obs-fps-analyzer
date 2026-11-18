@@ -1325,12 +1325,22 @@ struct BeatSim {
     double empty_p = 0.0;        // per tick: a stray empty tick (obs-side hiccup), card mode
     double reset_at_s = -1.0;    // fps_core_beat_reset at this time (settings changed)
     int mask_repeat = 0;         // card mode: the Nth capture repeat goes unseen (delivered as new)
+    // obs mode: the device loses frames in bursts (4K Mk2 with a PC sending YCbCr): from
+    // loss_every_s on, for loss_len_s every loss_every_s, a source frame is lost with
+    // loss_p (never arrives, a gap in the timestamps) or, with loss_p / 2, arrives
+    // with the previous frame's picture (an identical frame)
+    double loss_every_s = 0.0;
+    double loss_len_s = 0.0;
+    double loss_p = 0.0;
+    double loss_dups_first_s = 0.0; // card mode: the first part of each burst repeats frames only
+    bool timestamps = true;      // feed the device timestamps (false: as before 0.6.1)
     uint64_t seed = 1;
 };
 
 struct BeatRun {
     fps_beat beat{};             // at the end
     double first_detect_s = -1;  // first whole second at which a beat was reported
+    fps_beat first_beat{};       // the beat as first reported
     double first_clear_s = -1;   // first whole second at which CLEAR was reported
     bool clear_before_detect = false;
     bool uneven_seen = false;
@@ -1383,6 +1393,9 @@ static BeatRun run_beat(const BeatSim &s, double seconds)
     auto arrival = [&](size_t k) { return src_t[k] + (s.jitter_ms > 0.0 ? (rnd() - 0.5) * 2e-3 * s.jitter_ms : 0.0); };
 
     std::vector<double> arr; // jittered arrival per source frame (obs mode)
+    std::vector<bool> lost, dup; // per source frame: lost by the device / arrives as an identical frame
+    uint64_t src_ts = 0;
+    long long card_frames = 0;
     long long prev_gid = -1;
     int card_repeats = 0;
     size_t next_src = 0;
@@ -1402,23 +1415,51 @@ static BeatRun run_beat(const BeatSim &s, double seconds)
             shown = gid[next_src];
             if (s.empty_p > 0.0 && rnd() < s.empty_p)
                 frames = 0;
+            // the card losing frames (loss_*): it skips a period of its own clock
+            // (a gap in its timestamps, OBS buffered so no empty tick) or sends its
+            // previous picture again (an identical frame)
+            if (s.loss_every_s > 0.0 && t >= s.loss_every_s && fmod(t, s.loss_every_s) < s.loss_len_s) {
+                double u = rnd();
+                if (fmod(t, s.loss_every_s) < s.loss_dups_first_s)
+                    u = u < 0.5 * s.loss_p ? s.loss_p : 1.0; // a repeat, never a gap
+                if (u < s.loss_p)
+                    card_frames++;
+                else if (u < 1.5 * s.loss_p)
+                    shown = prev_gid;
+            }
         } else {
-            while (arr.size() < src_t.size())
-                arr.push_back(arrival(arr.size()));
+            while (arr.size() < src_t.size()) {
+                size_t k = arr.size();
+                arr.push_back(arrival(k));
+                bool in_loss = s.loss_every_s > 0.0 && src_t[k] >= s.loss_every_s &&
+                               fmod(src_t[k], s.loss_every_s) < s.loss_len_s;
+                double u = in_loss ? rnd() : 1.0;
+                lost.push_back(u < s.loss_p);
+                dup.push_back(u >= s.loss_p && u < 1.5 * s.loss_p);
+            }
             int count = 0;
             size_t newest = next_src;
             while (next_src < arr.size() && arr[next_src] <= t) {
-                newest = next_src;
+                if (!lost[next_src]) {
+                    newest = next_src;
+                    count++;
+                }
                 next_src++;
-                count++;
             }
             frames = count ? 1 : 0;
-            shown = count ? gid[newest] : prev_gid;
+            shown = count && !dup[newest] ? gid[newest] : prev_gid;
+            src_ts = base_ns + (uint64_t)(src_t[newest] * 1e9);
         }
         if (frames) {
             bool unique = shown != prev_gid;
             if (s.card && !unique && ++card_repeats == s.mask_repeat)
                 unique = true; // this repeat is missed (e.g. hidden behind a game hitch)
+            // a resampling card stamps its own output clock, one period per frame
+            // it delivers (a stray empty OBS tick is OBS's, not a lost frame)
+            if (s.card)
+                src_ts = base_ns + (uint64_t)((double)(++card_frames) / s.obs_hz * 1e9);
+            if (s.timestamps)
+                fps_core_debug_set_source_ts(c, src_ts);
             fps_core_debug_feed_decision(c, unique, false, now);
             prev_gid = shown;
         }
@@ -1430,8 +1471,10 @@ static BeatRun run_beat(const BeatSim &s, double seconds)
             last_reported = sec;
             fps_beat b{};
             fps_core_get_beat(c, now, s.obs_hz, &b);
-            if (b.detected && br.first_detect_s < 0)
+            if (b.detected && br.first_detect_s < 0) {
                 br.first_detect_s = t;
+                br.first_beat = b;
+            }
             if (b.status == FPS_BEAT_CLEAR) {
                 if (br.first_clear_s < 0)
                     br.first_clear_s = t;
@@ -1458,6 +1501,9 @@ static void b_report(Runner &r, const char *name, const BeatRun &br)
         printf("    %s: detected=%d period %.3f s signal %.4f nominal %.4f origin %d chain %d clusters %d first %.1f s\n",
                name, br.beat.detected, br.beat.period_s, br.beat.signal_hz, br.beat.nominal_hz, br.beat.origin,
                br.beat.chain, br.beat.clusters, br.first_detect_s);
+    if (r.verbose && br.first_detect_s >= 0)
+        printf("      first: period %.3f s origin %d chain %d arrival %.4f lossy %d\n", br.first_beat.period_s,
+               br.first_beat.origin, br.first_beat.chain, br.first_beat.arrival_hz, br.first_beat.lossy_clusters);
 }
 
 // --- s24: altered-frame check (capture devices that dither every frame) ---
@@ -2421,6 +2467,78 @@ static void s23_capture_beat(Runner &r)
         b_report(r, "obs 60->60", br);
         r.check(!br.beat.detected && br.beat.clusters == 0, "matched 60 into 60: no beat (%d clusters)",
                 br.beat.clusters);
+    }
+    // A 60 Hz source whose device loses frames in bursts every 16.68 s (the 4K
+    // Mk2 with a PC sending YCbCr, 18.11.2026): empty ticks, timestamp gaps and
+    // identical frames that look like a 59.94 beat, but the frames arrive in
+    // step with OBS.
+    for (double jit : {0.2, 1.0}) {
+        BeatSim s;
+        s.card = false;
+        s.src_hz = 60.0;
+        s.jitter_ms = jit;
+        s.loss_every_s = 1001.0 / 60.0;
+        s.loss_len_s = 2.5;
+        s.loss_p = 0.3;
+        BeatRun br = run_beat(s, 300);
+        b_report(r, "obs 60->60 + loss bursts", br);
+        r.check(!br.beat.detected && br.first_detect_s < 0,
+                "60 into 60, card losing frames every 16.7 s, jitter %.1f ms: no beat (false alarm at %.1f s, "
+                "arrival %.4f Hz)",
+                jit, br.first_detect_s, br.beat.arrival_hz);
+        r.check(fabs(br.beat.arrival_hz - 60.0) < 0.01, "60 into 60 with loss bursts, jitter %.1f ms: arrival %.4f Hz",
+                jit, br.beat.arrival_hz);
+        // without the device timestamps (the checks off) the bursts do pass for a
+        // beat: the scenario is the false alarm, the checks are what removes it
+        s.timestamps = false;
+        BeatRun old = run_beat(s, 300);
+        r.check(old.first_detect_s > 0, "60 into 60 with loss bursts, jitter %.1f ms, no timestamps: the old false "
+                "alarm (at %.1f s)", jit, old.first_detect_s);
+    }
+    {   // the same through a card at 60: identical frames and timestamp gaps only,
+        // no empty tick (capture clusters)
+        BeatSim s;
+        s.src_hz = 60.0;
+        s.loss_every_s = 1001.0 / 60.0;
+        s.loss_len_s = 2.5;
+        s.loss_p = 0.3;
+        BeatRun br = run_beat(s, 300);
+        b_report(r, "card 60->60 + loss bursts", br);
+        r.check(!br.beat.detected && br.first_detect_s < 0 && br.beat.lossy_clusters > 0,
+                "card 60 into 60 losing frames every 16.7 s: no beat (false alarm at %.1f s, %d lossy clusters)",
+                br.first_detect_s, br.beat.lossy_clusters);
+        // a burst that starts with repeats: the gaps come inside the open cluster
+        BeatSim d = s;
+        d.loss_dups_first_s = 0.6;
+        BeatRun bd = run_beat(d, 300);
+        r.check(!bd.beat.detected && bd.first_detect_s < 0 && bd.beat.lossy_clusters > 0,
+                "card 60 into 60, bursts starting with repeats: no beat (false alarm at %.1f s, %d lossy clusters)",
+                bd.first_detect_s, bd.beat.lossy_clusters);
+        s.timestamps = false;
+        BeatRun old = run_beat(s, 300);
+        r.check(old.first_detect_s > 0 && old.first_beat.origin == FPS_BEAT_ORIGIN_CAPTURE,
+                "card 60 into 60 losing frames, no timestamps: the old false alarm (capture, at %.1f s)",
+                old.first_detect_s);
+    }
+    {   // the same bursts on top of a real 59.94 into 60: still a beat
+        BeatSim s;
+        s.card = false;
+        s.jitter_ms = 0.2;
+        s.loss_every_s = 11.0; // 60 - 1/11, 1/22, 1/33 snap to no standard rate
+        s.loss_len_s = 1.5;
+        s.loss_p = 0.3;
+        BeatRun br = run_beat(s, 300);
+        b_report(r, "obs 59.94->60 + loss bursts", br);
+        r.check(br.first_detect_s > 0 && br.first_detect_s < 70 && br.first_beat.nominal_hz == ntsc60,
+                "59.94 into 60 with a card losing frames: beat detected at 59.94 after %.0f s (%.4f, arrival %.4f Hz)",
+                br.first_detect_s, br.first_beat.signal_hz, br.first_beat.arrival_hz);
+        // the new checks change nothing here: the same verdicts as without timestamps
+        // (that frequent losses later crowd the beat out of the history is older)
+        BeatSim o = s;
+        o.timestamps = false;
+        BeatRun ob = run_beat(o, 300);
+        r.check(ob.status == br.status, "59.94 into 60 with a card losing frames: second by second as without "
+                "the timestamp checks");
     }
     {   // card at exactly 60: nothing
         BeatSim s;
