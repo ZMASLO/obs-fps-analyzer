@@ -66,7 +66,9 @@ struct fps_core_params {
     bool enable_tearing_detection;
     double tearing_sensitivity;    // % per line (>=)
     double update_interval;        // seconds between publishes; <= 0 falls back to 1.0
-    bool measure_deltas;           // fill the per-frame |d| histogram (frame debug, trace v4)
+    bool measure_deltas;           // the altered-frame check: largest |d| per frame (cheap)
+    bool measure_histogram;        // the full per-frame |d| histogram (frame debug, trace v4) - only
+                                   // while a trace is recorded; implies what measure_deltas gives
     bool beat_enabled;             // run the capture-path beat detector (fps_core_obs_tick et al.)
     uint64_t pacing_period_ns;     // OBS frame interval: frame pacing without source timestamps
                                    // (sync path) is rounded to whole multiples of it; 0 = not rounded
@@ -82,6 +84,7 @@ static inline struct fps_core_params fps_core_params_defaults(void)
     p.tearing_sensitivity = 1.0;
     p.update_interval = 1.0 / 30.0;
     p.measure_deltas = false;
+    p.measure_histogram = false;
     p.beat_enabled = true;
     p.pacing_period_ns = 0;
     p.detect_drops = true;
@@ -255,6 +258,11 @@ void fps_core_get_beat(const struct fps_core *c, uint64_t now_ns, double deliver
 
 // --- Pure helpers (also used by the adapter and the tests) ---
 size_t fps_core_count_diff_bytes(const uint8_t *a, const uint8_t *b, size_t n);
+// The differing bytes and the largest |a - b| in one pass (SSE2 on x86-64,
+// a plain loop elsewhere and for the tail; both give the same result).
+size_t fps_core_count_diff_max(const uint8_t *a, const uint8_t *b, size_t n, uint8_t *max_delta);
+// The same, the plain loop only (reference for the tests)
+size_t fps_core_count_diff_max_scalar(const uint8_t *a, const uint8_t *b, size_t n, uint8_t *max_delta);
 void fps_core_bgra_to_luma(const uint8_t *bgra, uint32_t linesize, uint8_t *luma, uint32_t width, uint32_t height);
 void fps_core_rgba_to_luma(const uint8_t *rgba, uint32_t linesize, uint8_t *luma, uint32_t width, uint32_t height);
 // Luma of `lines` rows starting at `first_line` into `luma` (width bytes per
@@ -281,7 +289,7 @@ struct fps_core_frame_debug {
     double pacing_ms;              // frame pacing sample, valid when sample_written
     bool pacing_gap;               // ... with a frame lost by the capture device
     int pos, count;
-    bool deltas_valid;             // compared and params.measure_deltas
+    bool deltas_valid;             // compared and params.measure_histogram
     uint32_t deltas[FPS_CORE_DELTA_BUCKETS]; // bytes per |d| bucket; deltas[0] = luma_size - diff
 };
 void fps_core_debug_last_frame(const struct fps_core *c, struct fps_core_frame_debug *out);
@@ -314,6 +322,7 @@ bool fps_core_frames_altered(const struct fps_core *c);
 // reads low.
 #define FPS_DROPS_WINDOW_NS 5000000000ULL // rate over the last 5 s
 #define FPS_DROPS_HOLD_NS 5000000000ULL   // the warning stays 5 s after the last loss
+#define FPS_DROPS_MAX_GAP_NS 250000000ULL // longer: the stream was interrupted, nothing counted
 #define FPS_DROPS_EMPTY_TICK_LOOKBACK 3  // an empty OBS tick within this many ticks of a gap: the card lost it
 
 struct fps_drops {

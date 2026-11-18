@@ -21,6 +21,11 @@
 #include <algorithm>
 #include <vector>
 
+#if defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64)
+#include <emmintrin.h>
+#define FPS_CORE_SSE2 1
+#endif
+
 #define FRAMETIME_HISTORY FPS_CORE_HISTORY
 
 struct fps_core {
@@ -130,14 +135,63 @@ static void ensure_luma_buffer(struct fps_core *c, size_t needed)
     c->luma_buffer.assign(needed, 0);
 }
 
-static size_t count_diff_bytes(const uint8_t *a, const uint8_t *b, size_t size)
+// The differing bytes and the largest |a - b|, the plain way
+static size_t count_diff_max_scalar(const uint8_t *a, const uint8_t *b, size_t size, uint8_t *max_delta)
 {
     size_t diff = 0;
+    uint8_t mx = 0;
     for (size_t i = 0; i < size; ++i) {
-        if (a[i] != b[i])
-            ++diff;
+        uint8_t d = a[i] > b[i] ? (uint8_t)(a[i] - b[i]) : (uint8_t)(b[i] - a[i]);
+        diff += d != 0;
+        mx = d > mx ? d : mx;
     }
+    if (max_delta)
+        *max_delta = mx;
     return diff;
+}
+
+// The same, 16 bytes at a time. Integer arithmetic only, so the result is the
+// plain loop's, bit for bit (s28_diff_equivalence checks it). Per lane a byte
+// counter takes up to 255 blocks before it is folded into the total.
+static size_t count_diff_max(const uint8_t *a, const uint8_t *b, size_t size, uint8_t *max_delta)
+{
+#ifdef FPS_CORE_SSE2
+    size_t i = 0, diff = 0;
+    const __m128i zero = _mm_setzero_si128();
+    __m128i vmax = zero;
+    while (size - i >= 16) {
+        size_t blocks = (size - i) / 16;
+        if (blocks > 255)
+            blocks = 255;
+        __m128i acc = zero;
+        for (size_t k = 0; k < blocks; k++, i += 16) {
+            __m128i va = _mm_loadu_si128((const __m128i *)(a + i));
+            __m128i vb = _mm_loadu_si128((const __m128i *)(b + i));
+            __m128i d = _mm_or_si128(_mm_subs_epu8(va, vb), _mm_subs_epu8(vb, va)); // |a - b|
+            vmax = _mm_max_epu8(vmax, d);
+            acc = _mm_add_epi8(acc, _mm_andnot_si128(_mm_cmpeq_epi8(d, zero), _mm_set1_epi8(1)));
+        }
+        __m128i sums = _mm_sad_epu8(acc, zero); // two 16-bit sums in the 64-bit halves
+        diff += (size_t)_mm_cvtsi128_si32(sums) + (size_t)_mm_cvtsi128_si32(_mm_srli_si128(sums, 8));
+    }
+    uint8_t lanes[16];
+    _mm_storeu_si128((__m128i *)lanes, vmax);
+    uint8_t mx = 0;
+    for (int l = 0; l < 16; l++)
+        mx = lanes[l] > mx ? lanes[l] : mx;
+    uint8_t tail_max = 0;
+    diff += count_diff_max_scalar(a + i, b + i, size - i, &tail_max);
+    if (max_delta)
+        *max_delta = tail_max > mx ? tail_max : mx;
+    return diff;
+#else
+    return count_diff_max_scalar(a, b, size, max_delta);
+#endif
+}
+
+static size_t count_diff_bytes(const uint8_t *a, const uint8_t *b, size_t size)
+{
+    return count_diff_max(a, b, size, nullptr);
 }
 
 // Bucket of |d| (see FPS_CORE_DELTA_BUCKETS): 0, 1, 2, 3-4, 5-8, 9-16, 17-32, >32
@@ -186,7 +240,16 @@ static void init_prev_lines_buffers(struct fps_core *c, int roi_width)
 }
 
 // One compared frame into the altered-frame check.
-static void altered_update(struct fps_core *c, size_t diff, bool unique, const uint32_t *deltas)
+// All differences at most FPS_ALTERED_MAX_DELTA_BUCKET (= 2): from the histogram
+static bool deltas_tiny(const uint32_t *deltas)
+{
+    bool tiny = true;
+    for (int i = FPS_ALTERED_MAX_DELTA_BUCKET + 1; i < FPS_CORE_DELTA_BUCKETS; i++)
+        tiny = tiny && deltas[i] == 0;
+    return tiny;
+}
+
+static void altered_update(struct fps_core *c, size_t diff, bool unique, bool tiny)
 {
     if (diff == 0) {
         if (!c->altered)
@@ -197,9 +260,6 @@ static void altered_update(struct fps_core *c, size_t diff, bool unique, const u
         }
         return;
     }
-    bool tiny = true;
-    for (int i = FPS_ALTERED_MAX_DELTA_BUCKET + 1; i < FPS_CORE_DELTA_BUCKETS; i++)
-        tiny = tiny && deltas[i] == 0;
     if (!unique || !tiny)
         return;
     if (!c->altered && ++c->altered_noise_run >= FPS_ALTERED_TRIGGER) {
@@ -645,7 +705,9 @@ static void pacing_note_frame(struct fps_core *c)
                 c->pending_gap = true;
                 c->frame_after_gap = true;
                 // (nothing counted before 30 intervals: the variable-source test needs them)
-                if (c->params.detect_drops && c->iv60_n >= 30) {
+                // A gap of more than FPS_DROPS_MAX_GAP_NS is an interrupted stream
+                // (the filter or the source switched off, the signal lost), not lost frames
+                if (c->params.detect_drops && c->iv60_n >= 30 && iv <= FPS_DROPS_MAX_GAP_NS) {
                     c->drops_variable = drops_source_variable(c, median);
                     if (!c->drops_variable) {
                         int lost = (int)((iv + median / 2) / median) - 1;
@@ -755,6 +817,7 @@ static void analyze_unique(struct fps_core *c, uint64_t now)
 static void analyze_luma_frame(struct fps_core *c, const uint8_t *luma_ptr, size_t luma_size, uint64_t now)
 {
     bool is_unique = false;
+    bool have_tiny = false, tiny = false; // the altered-frame check's input for this frame
     c->dbg.luma_size = luma_size;
     c->dbg.compared = false;
     c->dbg.diff = 0;
@@ -771,9 +834,18 @@ static void analyze_luma_frame(struct fps_core *c, const uint8_t *luma_ptr, size
         is_unique = true;
     } else {
         size_t diff;
-        if (c->params.measure_deltas) {
+        if (c->params.measure_histogram) {
+            // the full histogram, only while a trace is recorded
             diff = count_diff_deltas(luma_ptr, c->prev_frame.data(), luma_size, c->dbg.deltas);
             c->dbg.deltas_valid = true;
+            have_tiny = true;
+            tiny = deltas_tiny(c->dbg.deltas);
+        } else if (c->params.measure_deltas) {
+            // the altered-frame check needs only the largest difference
+            uint8_t max_d = 0;
+            diff = count_diff_max(luma_ptr, c->prev_frame.data(), luma_size, &max_d);
+            have_tiny = true;
+            tiny = max_d <= FPS_ALTERED_MAX_DELTA_BUCKET;
         } else {
             diff = count_diff_bytes(luma_ptr, c->prev_frame.data(), luma_size);
         }
@@ -787,8 +859,8 @@ static void analyze_luma_frame(struct fps_core *c, const uint8_t *luma_ptr, size
     }
 
     c->dbg.unique = is_unique;
-    if (c->dbg.deltas_valid)
-        altered_update(c, c->dbg.diff, is_unique, c->dbg.deltas);
+    if (have_tiny)
+        altered_update(c, c->dbg.diff, is_unique, tiny);
     if (is_unique)
         analyze_unique(c, now);
     beat_on_frame(c, is_unique, now);
@@ -1028,6 +1100,16 @@ bool fps_core_tick(struct fps_core *c, uint64_t now_ns, struct fps_core_output *
 
 // --- Pure helpers ---
 
+size_t fps_core_count_diff_max(const uint8_t *a, const uint8_t *b, size_t n, uint8_t *max_delta)
+{
+    return count_diff_max(a, b, n, max_delta);
+}
+
+size_t fps_core_count_diff_max_scalar(const uint8_t *a, const uint8_t *b, size_t n, uint8_t *max_delta)
+{
+    return count_diff_max_scalar(a, b, n, max_delta);
+}
+
 size_t fps_core_count_diff_bytes(const uint8_t *a, const uint8_t *b, size_t n)
 {
     return count_diff_bytes(a, b, n);
@@ -1159,7 +1241,7 @@ void fps_core_debug_feed_deltas(struct fps_core *c, size_t diff, bool unique,
                                 const uint32_t deltas[FPS_CORE_DELTA_BUCKETS])
 {
     if (c && deltas)
-        altered_update(c, diff, unique, deltas);
+        altered_update(c, diff, unique, deltas_tiny(deltas));
 }
 
 void fps_core_debug_feed_decision(struct fps_core *c, bool unique, bool tearing, uint64_t now_ns)

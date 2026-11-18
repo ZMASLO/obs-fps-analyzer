@@ -116,7 +116,14 @@ $mutations = @(
     @{ name = "utraty: bez przytrzymania";                 find = 'now_ns - c->last_drop_ns < FPS_DROPS_HOLD_NS'; repl = 'now_ns - c->last_drop_ns < 1' },
     @{ name = "utraty: zrodlo zmienne liczone";            find = 'c->drops_variable = drops_source_variable(c, median);'; repl = 'c->drops_variable = false;' },
     @{ name = "utraty: bez rozgrzewki 30 odstepow";        find = 'if (c->params.detect_drops && c->iv60_n >= 30) {'; repl = 'if (c->params.detect_drops && c->iv60_n >= 0) {' },
-    @{ name = "utraty: liczba klatek w dziurze";           find = 'int lost = (int)((iv + median / 2) / median) - 1;'; repl = 'int lost = 1;' }
+    @{ name = "utraty: przerwa w strumieniu liczona";     find = ' && iv <= FPS_DROPS_MAX_GAP_NS) {'; repl = ') {' },
+    @{ name = "utraty: liczba klatek w dziurze";           find = 'int lost = (int)((iv + median / 2) / median) - 1;'; repl = 'int lost = 1;' },
+    # Szybkie porownanie klatek (SSE2): musi dawac wynik zwyklej petli bit w bit
+    @{ name = "porownanie: granica <= 2 na < 2";           find = 'tiny = max_d <= FPS_ALTERED_MAX_DELTA_BUCKET;'; repl = 'tiny = max_d < FPS_ALTERED_MAX_DELTA_BUCKET;' },
+    @{ name = "porownanie: |a-b| tylko w jedna strone";    find = '__m128i d = _mm_or_si128(_mm_subs_epu8(va, vb), _mm_subs_epu8(vb, va)); // |a - b|'; repl = '__m128i d = _mm_subs_epu8(va, vb);' },
+    @{ name = "porownanie: licznik bajtowy bez oprozniania"; find = "        if (blocks > 255)`n            blocks = 255;"; repl = "        if (blocks > 300)`n            blocks = 300;" },
+    @{ name = "porownanie: ogon pominiety";                find = '    diff += count_diff_max_scalar(a + i, b + i, size - i, &tail_max);'; repl = '    tail_max = 0;' },
+    @{ name = "porownanie: maksimum z jednego pasa";       find = '    for (int l = 0; l < 16; l++)' + "`n" + '        mx = lanes[l] > mx ? lanes[l] : mx;'; repl = '    mx = lanes[0];' }
 )
 
 function Run-Layer([string]$exe, [string[]]$argv) {

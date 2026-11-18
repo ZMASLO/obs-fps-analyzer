@@ -117,6 +117,7 @@ struct fps_analyzer_filter {
     // What the core is asked to compute, kept in step with the settings and
     // with the overlay's demand (core_sync)
     bool core_measure_deltas;
+    bool core_measure_histogram;    // the full |d| histogram: only while a trace is recorded
     bool core_beat_enabled;
     uint64_t core_pacing_period_ns; // OBS frame interval given to the core (frame pacing, sync path)
     uint32_t history_gen_seen;      // last g_history_reset_gen this filter acted on
@@ -190,6 +191,7 @@ static struct fps_core_params core_params(const struct fps_analyzer_filter *filt
     p.tearing_sensitivity = filter->tearing_sensitivity;
     p.update_interval = filter->update_interval;
     p.measure_deltas = filter->core_measure_deltas;
+    p.measure_histogram = filter->core_measure_histogram;
     p.beat_enabled = filter->core_beat_enabled;
     p.pacing_period_ns = filter->core_pacing_period_ns;
     p.detect_drops = filter->detect_drops;
@@ -1051,14 +1053,16 @@ static bool source_check_wanted(uint64_t now)
 static void core_sync(struct fps_analyzer_filter *filter, uint64_t now)
 {
     bool measure = filter->trace_file != NULL || filter->block_unreliable;
+    bool histogram = filter->trace_file != NULL; // the full |d| histogram only for the trace
     bool beat = source_check_wanted(now);
     uint64_t period = 0;
     struct obs_video_info ovi;
     if (obs_get_video_info(&ovi) && ovi.fps_num > 0)
         period = (uint64_t)ovi.fps_den * 1000000000ULL / ovi.fps_num;
-    if (measure == filter->core_measure_deltas && beat == filter->core_beat_enabled &&
-        period == filter->core_pacing_period_ns)
+    if (measure == filter->core_measure_deltas && histogram == filter->core_measure_histogram &&
+        beat == filter->core_beat_enabled && period == filter->core_pacing_period_ns)
         return;
+    filter->core_measure_histogram = histogram;
     filter->core_pacing_period_ns = period;
     bool beat_changed = beat != filter->core_beat_enabled;
     filter->core_measure_deltas = measure;

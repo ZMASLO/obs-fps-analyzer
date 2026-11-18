@@ -147,11 +147,13 @@ const char *fmt_name(int fmt)
 }
 
 // fps_core_feed on alternating new / repeated frames
-Result bench_feed(int fmt, uint32_t w, uint32_t h, int method, bool deltas, bool tearing, double round_s, int rounds)
+Result bench_feed(int fmt, uint32_t w, uint32_t h, int method, bool deltas, bool tearing, double round_s, int rounds,
+                  bool histogram = false)
 {
     fps_core_params p = fps_core_params_defaults();
     p.analyze_method = method;
     p.measure_deltas = deltas;
+    p.measure_histogram = histogram; // the full |d| histogram: only while a trace is recorded
     p.enable_tearing_detection = tearing;
     fps_core *c = fps_core_create(&p);
     Frame a = make_frame(fmt, w, h, 1), b = make_frame(fmt, w, h, 2);
@@ -170,7 +172,8 @@ Result bench_feed(int fmt, uint32_t w, uint32_t h, int method, bool deltas, bool
     fps_core_destroy(c);
     char name[96];
     snprintf(name, sizeof(name), "feed %ux%u %s %s%s%s", w, h, fmt_name(fmt),
-             method == FPS_ANALYZE_DIFF ? "full" : "lastline", deltas ? " +deltas" : "", tearing ? "" : " -tear");
+             method == FPS_ANALYZE_DIFF ? "full" : "lastline", histogram ? " +histogram" : deltas ? " +deltas" : "",
+             tearing ? "" : " -tear");
     return {name, us, 0.0, 0.0};
 }
 
@@ -204,10 +207,10 @@ struct Budget {
     double us;
 };
 const Budget k_budgets[] = {
-    {"feed 3840x2160 NV12 lastline +deltas", 40.0},  // measured 9
-    {"feed 3840x2160 NV12 full +deltas", 43000.0},   // measured 10650
-    {"feed 3840x2160 YUY2 full +deltas", 48000.0},   // measured 12030
-    {"feed 3840x2160 BGRA full +deltas", 63000.0},   // measured 15720
+    {"feed 3840x2160 NV12 lastline +deltas", 10.0},  // measured 0.7 (9 before the SSE2 comparison)
+    {"feed 3840x2160 NV12 full +deltas", 4000.0},    // measured 980 (10650 with the full histogram)
+    {"feed 3840x2160 YUY2 full +deltas", 10000.0},   // measured 2380 (12030)
+    {"feed 3840x2160 BGRA full +deltas", 28000.0},   // measured 6930 (15720)
     {"beat obs_tick + get_beat", 5.0},               // measured 0.06
     {"core_tick (960 graph samples)", 5.0},          // measured 0.01
     {"plot_window 60 s 1800 px", 32.0},              // measured 7.8
@@ -277,6 +280,8 @@ int main(int argc, char **argv)
                     for (bool deltas : {false, true})
                         add(res, bench_feed(fmt, s.w, s.h, method, deltas, true, round_s, rounds));
         add(res, bench_feed(FPS_PIXFMT_NV12, 3840, 2160, FPS_ANALYZE_DIFF, true, false, round_s, rounds));
+        // while a trace is recorded (the debug option)
+        add(res, bench_feed(FPS_PIXFMT_NV12, 3840, 2160, FPS_ANALYZE_DIFF, true, true, round_s, rounds, true));
     }
 
     // Per OBS tick: beat detector, publish

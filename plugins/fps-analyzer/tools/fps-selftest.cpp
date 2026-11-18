@@ -1470,6 +1470,7 @@ struct AltSim {
     double clean_after_s = -1; // the card stops adding noise from this second on
     bool measure = true;       // params.measure_deltas
     double sensitivity = -1;   // params.sensitivity, -1 = default
+    bool histogram = false;    // params.measure_histogram (the trace's full |d| histogram)
     uint64_t seed = 3;
 };
 struct AltRun {
@@ -1485,6 +1486,7 @@ static AltRun run_altered(const AltSim &s, double seconds)
     AltRun ar;
     fps_core_params p = fps_core_params_defaults();
     p.measure_deltas = s.measure;
+    p.measure_histogram = s.measure && s.histogram;
     if (s.sensitivity >= 0)
         p.sensitivity = s.sensitivity;
     fps_core *c = fps_core_create(&p);
@@ -1553,6 +1555,7 @@ static void s24_altered_frames(Runner &r)
     r.begin("s24_altered_frames", fps_core_params_defaults());
     {   // a good card, game at 30: repeats are identical, never altered, reads 30
         AltSim s;
+        s.histogram = true; // the trace's histogram path, checked below
         AltRun a = run_altered(s, 20);
         r.check(a.first_altered_s < 0 && a.fps_end == 30, "good card, game 30: not altered, %d FPS", a.fps_end);
         r.check(a.hist_ok, "difference histogram adds up to the compared bytes and matches diff");
@@ -2187,6 +2190,27 @@ static void s27_dropped_frames(Runner &r)
                 "variable source: flagged, nothing counted (%llu / %llu)",
                 (unsigned long long)d.at_end.card_total, (unsigned long long)d.at_end.obs_total);
     }
+    {   // the stream interrupted for 3 s (filter off, source hidden): not lost frames
+        fps_core_params p = fps_core_params_defaults();
+        fps_core *c = fps_core_create(&p);
+        Frame f = make_frame(FPS_PIXFMT_NV12, 64, 4);
+        uint64_t ts = T0;
+        for (int k = 0; k < 600; k++) {
+            if (k == 300)
+                ts += 3000000000ULL;
+            ts += 16683333;
+            fill_all(f, (uint64_t)k);
+            fps_frame_view v = f.view();
+            v.src_ts_ns = ts;
+            fps_core_feed(c, &v, ts);
+            fps_core_obs_tick(c, ts, 1);
+        }
+        fps_drops d;
+        fps_core_get_drops(c, ts, &d);
+        r.check(d.card_total == 0 && d.obs_total == 0, "3 s interruption: nothing counted (%llu / %llu)",
+                (unsigned long long)d.card_total, (unsigned long long)d.obs_total);
+        fps_core_destroy(c);
+    }
     {   // switched off: nothing at all
         DropSim s;
         s.card_lose_every = 12;
@@ -2202,6 +2226,150 @@ static void s27_dropped_frames(Runner &r)
         r.check(d.inactive_after_s > 4.5 && d.inactive_after_s < 5.6,
                 "losses stop at 8 s: warning gone %.2f s later (want ~5)", d.inactive_after_s);
     }
+}
+
+// --- s28: the fast frame comparison gives the plain loop's result, bit for bit ---
+static void s28_diff_equivalence(Runner &r)
+{
+    r.begin("s28_diff_equivalence", fps_core_params_defaults());
+    uint64_t rng = 12345;
+    auto rnd = [&rng]() {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        return rng;
+    };
+    // lengths around the 16-byte vectors and the 255-block counters, a line, a 4K plane
+    const size_t lens[] = {0, 1, 15, 16, 17, 31, 255, 256, 257, 4079, 4080, 4081, 4096, 3840, 65536, 8294400};
+    std::vector<uint8_t> a, b;
+    int cases = 0, bad = 0;
+    char first_bad[160] = "";
+    auto check = [&](const char *what, size_t n) {
+        uint8_t m_fast = 0, m_ref = 0;
+        size_t d_fast = fps_core_count_diff_max(a.data(), b.data(), n, &m_fast);
+        size_t d_ref = fps_core_count_diff_max_scalar(a.data(), b.data(), n, &m_ref);
+        size_t d_bytes = fps_core_count_diff_bytes(a.data(), b.data(), n);
+        // the reference is checked against the definition too
+        size_t d_def = 0;
+        int m_def = 0;
+        for (size_t i = 0; i < n; i++) {
+            int d = abs((int)a[i] - (int)b[i]);
+            d_def += d != 0;
+            m_def = d > m_def ? d : m_def;
+        }
+        cases++;
+        if (d_fast != d_ref || m_fast != m_ref || d_bytes != d_ref || d_ref != d_def || m_ref != m_def) {
+            if (!bad)
+                snprintf(first_bad, sizeof(first_bad), "%s n=%zu: fast %zu/%u ref %zu/%u def %zu/%d", what, n,
+                         d_fast, m_fast, d_ref, m_ref, d_def, m_def);
+            bad++;
+        }
+    };
+    for (size_t n : lens) {
+        a.assign(n + 1, 0);
+        b.assign(n + 1, 0);
+        for (int pass = 0; pass < 8; pass++) {
+            // random bytes
+            for (size_t i = 0; i < n; i++) {
+                a[i] = (uint8_t)rnd();
+                b[i] = (uint8_t)rnd();
+            }
+            check("random", n);
+            // identical
+            b = a;
+            check("identical", n);
+            // dither: +-1, +-2, +-3 on part of the bytes (the <= 2 boundary)
+            for (int amp = 1; amp <= 3; amp++) {
+                for (size_t i = 0; i < n; i++) {
+                    int v = a[i] + (int)(rnd() % (2 * amp + 1)) - amp;
+                    b[i] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+                }
+                check("dither", n);
+            }
+            // one difference at the very end (the scalar tail) and at the very start
+            b = a;
+            if (n) {
+                b[n - 1] = (uint8_t)(a[n - 1] ^ 0x80);
+                check("last byte", n);
+                b[n - 1] = a[n - 1];
+                b[0] = (uint8_t)(a[0] + 1);
+                check("first byte", n);
+            }
+            // extremes: 0 against 255 everywhere (|d| = 255, both directions)
+            for (size_t i = 0; i < n; i++) {
+                a[i] = (i & 1) ? 0 : 255;
+                b[i] = (i & 1) ? 255 : 0;
+            }
+            check("0 vs 255", n);
+            // every byte different by exactly 1 (the per-lane counters at their limit)
+            for (size_t i = 0; i < n; i++) {
+                a[i] = (uint8_t)(i * 7);
+                b[i] = (uint8_t)(a[i] + 1);
+            }
+            check("all differ", n);
+        }
+    }
+    r.check(bad == 0, "fast comparison == plain loop == definition in all %d cases (%d differ%s%s)", cases, bad,
+            bad ? ": " : "", first_bad);
+
+    // the whole core: the altered-frame check from the largest |d| decides exactly as
+    // from the full histogram, scenario by scenario
+    struct Sc {
+        const char *name;
+        AltSim s;
+    };
+    std::vector<Sc> scs;
+    {
+        Sc c{"good card 30", {}};
+        scs.push_back(c);
+    }
+    {
+        Sc c{"dither 30", {}};
+        c.s.noise_p = 0.28;
+        scs.push_back(c);
+    }
+    {
+        Sc c{"dither still", {}};
+        c.s.noise_p = 0.10;
+        c.s.still = true;
+        scs.push_back(c);
+    }
+    {
+        Sc c{"changes of 3", {}};
+        c.s.noise_p = 0.5;
+        c.s.noise_max = 2;
+        c.s.still = true;
+        scs.push_back(c);
+    }
+    {
+        Sc c{"fade 60", {}};
+        c.s.game_div = 1;
+        c.s.fade_frames = 180;
+        scs.push_back(c);
+    }
+    {
+        Sc c{"dither stops", {}};
+        c.s.noise_p = 0.28;
+        c.s.clean_after_s = 6.0;
+        scs.push_back(c);
+    }
+    bool same = true;
+    char diff_txt[160] = "";
+    for (Sc &c : scs) {
+        AltSim h = c.s, m = c.s;
+        h.histogram = true;
+        m.histogram = false;
+        AltRun rh = run_altered(h, 12), rm = run_altered(m, 12);
+        if (rh.first_altered_s != rm.first_altered_s || rh.cleared_s != rm.cleared_s ||
+            rh.altered_end != rm.altered_end || rh.fps_end != rm.fps_end) {
+            if (same)
+                snprintf(diff_txt, sizeof(diff_txt), "%s: histogram %.2f/%.2f/%d vs max %.2f/%.2f/%d", c.name,
+                         rh.first_altered_s, rh.cleared_s, rh.fps_end, rm.first_altered_s, rm.cleared_s, rm.fps_end);
+            same = false;
+        }
+    }
+    r.check(same, "altered-frame check: largest |d| and full histogram decide alike in %zu scenarios%s%s",
+            scs.size(), same ? "" : " - ", diff_txt);
 }
 
 static void s23_capture_beat(Runner &r)
@@ -2540,6 +2708,7 @@ int main(int argc, char **argv)
     s25_frame_pacing(r);
     s26_plot_layout(r);
     s27_dropped_frames(r);
+    s28_diff_equivalence(r);
 #endif
 
     printf(r.fails ? "RESULT: %d FAILURES\n" : "RESULT: ALL OK\n", r.fails);

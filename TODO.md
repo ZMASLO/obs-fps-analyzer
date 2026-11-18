@@ -43,8 +43,8 @@ Nagranie `lag_mk2` (17.11.2026) to czysty pierwszy wiersz: 98 dziur w znacznikac
 
 ## Wydajność (pomiar 18.11.2026, `fps-bench` / `tools/obs-cost.py`)
 
-- [ ] **Histogram różnic przy „Full frame diff” jest za drogi.** 4K NV12: 3,0 ms bez histogramu, **10,6 ms z histogramem**, a histogram jest domyślnie włączony przez blokadę niewiarygodnych kart. W OBS (4K YUY2, 59,94 FPS) filtr kosztuje +10,8 ms czasu renderu na klatkę z 16,7 ms. Pomysł: blokada potrzebuje tylko „liczba różnych bajtów” i „max |Δ|”, a to da się policzyć w pętli, którą kompilator zwektoryzuje (bez tablicy kubełków). Pełny histogram tylko przy nagrywaniu śladu.
-- [ ] Samo porównanie „Full frame” (3 ms przy 4K) też jest wolniejsze, niż mogłoby być (~2,7 GB/s). `count_diff_bytes` można zwektoryzować.
+- [x] **Histogram różnic był za drogi** (18.11.2026): blokada liczy teraz tylko liczbę różnych bajtów i max |Δ| (SSE2), a pełny histogram tylko przy nagrywaniu śladu. 4K NV12 Full frame: 10,6 → 0,98 ms, YUY2 12,0 → 2,4 ms, BGRA 15,7 → 6,9 ms. Wynik bit w bit jak wcześniej (`s28_diff_equivalence`).
+- [ ] YUY2 i BGRA: teraz dominuje wyciąganie jasności z pikseli (2,4 / 6,9 ms przy 4K), też da się zwektoryzować.
 - [ ] Wykresy kosztują ok. 1,8 ms renderu (3 wykresy). Krzywą FPS/frametime można liczyć raz na takt zamiast przy każdym renderze.
 
 ## Inne otwarte sprawy
