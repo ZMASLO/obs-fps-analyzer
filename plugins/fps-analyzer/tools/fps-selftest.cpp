@@ -1975,6 +1975,27 @@ static void s26_plot_layout(Runner &r)
         }
         double back = plot_fps_at(&g_s26_ring, pause_end + 1100.0, pause_end + 60 * 2 * P);
         r.check(fabs(back - 1000.0 / (2 * P)) < 0.05, "resumed: %.2f FPS a second after the pause", back);
+        // the frametime graph is the same curve as an average frame time: back to 33.37 a
+        // second after the pause (an EMA would still be hundreds of ms up), and before the
+        // pause, steady at 33.37
+        double ft_back = plot_frametime_at(&g_s26_ring, pause_end + 1100.0, pause_end + 60 * 2 * P);
+        double ft_before = plot_frametime_at(&g_s26_ring, now, pause_end + 60 * 2 * P);
+        r.check(fabs(ft_back - 2 * P) < 0.1 && fabs(ft_before - 2 * P) < 0.01,
+                "frametime curve: %.2f ms before the pause, %.2f ms a second after it", ft_before, ft_back);
+    }
+    {   // frametime through the pause: only rises, never a slope (mid-pause it is the frame's time)
+        s26_fill(&g_s26_ring, {2 * P}, 600, now);
+        const double pause_end = now + 3000.0;
+        bool rising = true;
+        double prev = 0;
+        for (double t = now; t <= pause_end; t += 50.0) {
+            double v = plot_frametime_at(&g_s26_ring, t, pause_end);
+            rising = rising && v >= prev - 1e-9;
+            prev = v;
+        }
+        double mid = plot_frametime_at(&g_s26_ring, now + 1500.0, pause_end);
+        r.check(rising && mid >= 900.0 && plot_fps_to_frametime(0.0) >= 1e9,
+                "frametime curve in a pause: only rises, %.0f ms mid-pause (a slope would give ~500)", mid);
     }
     {   // the ring wraps and keeps the order
         plot_ring_clear(&g_s26_ring);

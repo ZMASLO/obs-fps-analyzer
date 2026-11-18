@@ -597,8 +597,14 @@ static void render_time_graph(int field, double ref_step, bool show_tearing, boo
     static float curve_x[4096];
     static double curve_v[4096];
     int curve_n = 0;
-    if (field == PLOT_FPS)
+    // The frametime graph is the same curve as an average frame time (1000 / FPS
+    // of the second before each moment): no slope through a pause, and no long
+    // EMA tail after it (plot_frametime_at)
+    if (field == PLOT_FPS || field == PLOT_FRAMETIME)
         curve_n = plot_fps_curve(ring, now_ms, window_s, (float)gw, 2.0f, curve_x, curve_v, 4096);
+    if (field == PLOT_FRAMETIME)
+        for (int i = 0; i < curve_n; i++)
+            curve_v[i] = plot_fps_to_frametime(curve_v[i]);
 
     // Y-axis scaling from the values on screen
     double max_val;
@@ -609,7 +615,7 @@ static void render_time_graph(int field, double ref_step, bool show_tearing, boo
     else
     {
         double hi = 0.0;
-        for (int i = 0; i < n && field != PLOT_FPS; i++)
+        for (int i = 0; i < n && field == PLOT_PACING; i++)
         {
             double v = plot_field_value(plot_ring_at(ring, spans[i].idx), field);
             if (v > hi)
@@ -778,7 +784,7 @@ static void render_time_graph(int field, double ref_step, bool show_tearing, boo
         // range, which after a long pause filled a block seconds wide
         // (one triangle batch per run of the same colour). Framerate draws its
         // per-column curve, the frametime graph its samples.
-        const bool curve = field == PLOT_FPS;
+        const bool curve = field != PLOT_PACING;
         const int points = curve ? curve_n : n;
         auto px = [&](int i) { return curve ? curve_x[i] : spans[i].x1; };
         auto pv = [&](int i) { return curve ? curve_v[i] : plot_field_value(plot_ring_at(ring, spans[i].idx), field); };
@@ -806,9 +812,9 @@ static void render_time_graph(int field, double ref_step, bool show_tearing, boo
     // The frame on screen now, when no new one has come for unusually long (a
     // pause, a loading screen): without it the line would stop and then vanish.
     // Frame graphs: a step at how long the current frame has been shown so far
-    // (it only grows until the next frame replaces it). The framerate curve
-    // already counts the frame on screen (plot_fps_at), so it needs none.
-    if (field != PLOT_FPS)
+    // (it only grows until the next frame replaces it). The framerate and
+    // frametime curves already count the frame on screen (plot_fps_at).
+    if (field == PLOT_PACING)
     {
         float tx0 = 0.0f, tx1 = 0.0f;
         double elapsed = 0.0;
@@ -1528,7 +1534,8 @@ static void fps_overlay_render(void *data, gs_effect_t *effect)
         gs_matrix_translate3f(0.0f, (float)y_offset, 0.0f);
         double ft_step = (ctx->frametime_scale > 33.33) ? 16.67 : 8.33;
 
-        render_time_graph(PLOT_FRAMETIME, ft_step, true, false, 16.67, 33.33, ctx->frametime_scale, false,
+        render_time_graph(PLOT_FRAMETIME, ft_step, true, false, 16.67, 33.33, ctx->frametime_scale,
+                          ctx->frametime_scale <= 0, // auto: 50 / 66.67 / 100 ms, a pause clipped at the edge
                           ctx->ft_grid_labels, ctx->ft_grid_values, ctx->ft_grid_count, ctx->frametime_style,
                           ctx->frametime_width, ctx->frametime_height, ctx->frametime_window,
                           ctx->frametime_invert, false);

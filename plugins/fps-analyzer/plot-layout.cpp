@@ -153,6 +153,16 @@ double plot_fps_at(const struct plot_ring *r, double t_ms, double now_ms)
     return sum * 1000.0 / PLOT_FPS_SPAN_MS;
 }
 
+double plot_fps_to_frametime(double fps)
+{
+    return fps > 0.0 ? 1000.0 / fps : 1e9;
+}
+
+double plot_frametime_at(const struct plot_ring *r, double t_ms, double now_ms)
+{
+    return plot_fps_to_frametime(plot_fps_at(r, t_ms, now_ms));
+}
+
 int plot_fps_curve(const struct plot_ring *r, double now_ms, double window_s, float width_px, float step_px,
                    float *xs, double *vals, int max_out)
 {

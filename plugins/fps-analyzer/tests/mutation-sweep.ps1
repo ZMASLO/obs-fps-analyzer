@@ -105,7 +105,9 @@ $mutations = @(
     @{ name = "framerate: bez biezacej klatki";           file = "plot-layout.cpp"; find = '    if (shown > 0.0 && t_ms > last->t_ms) {'; repl = '    if (false) {' },
     @{ name = "framerate: cale klatki zamiast ulamkow";   file = "plot-layout.cpp"; find = '            sum += (b - a) / s->ft_ms;'; repl = '            sum += 1.0;' },
     @{ name = "framerate: okno 2 s";                      file = "plot-layout.cpp"; find = '#define PLOT_FPS_SPAN_MS 1000.0'; repl = '#define PLOT_FPS_SPAN_MS 2000.0' },
-    @{ name = "framerate: overlap bez przyciecia do okna"; file = "plot-layout.cpp"; find = '        double a = start > ws ? start : ws;'; repl = '        double a = start;' }
+    @{ name = "framerate: overlap bez przyciecia do okna"; file = "plot-layout.cpp"; find = '        double a = start > ws ? start : ws;'; repl = '        double a = start;' },
+    @{ name = "frametime: FPS zamiast czasu klatki";      file = "plot-layout.cpp"; find = '    return fps > 0.0 ? 1000.0 / fps : 1e9;'; repl = '    return fps;' },
+    @{ name = "frametime: zero przy braku klatek";        file = "plot-layout.cpp"; find = '    return fps > 0.0 ? 1000.0 / fps : 1e9;'; repl = '    return fps > 0.0 ? 1000.0 / fps : 0.0;' }
 )
 
 function Run-Layer([string]$exe, [string[]]$argv) {

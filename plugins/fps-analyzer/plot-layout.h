@@ -72,6 +72,15 @@ int plot_recent_frames(const struct plot_ring *r, double now_ms, double span_ms)
 // across the pause to the first frame after it.
 double plot_fps_at(const struct plot_ring *r, double t_ms, double now_ms);
 
+// Average frame time at t_ms: 1000 / plot_fps_at - the mean time a frame was
+// on screen during the second before t (33.37 ms for a steady 30 FPS game).
+// Rises without a slope through a pause and is back a second after it,
+// unlike an EMA, which one long frame kicks up for many frames after.
+// Returns 1e9 when no frame was on screen at all.
+double plot_frametime_at(const struct plot_ring *r, double t_ms, double now_ms);
+// The conversion itself (also applied to a plot_fps_curve by the overlay)
+double plot_fps_to_frametime(double fps);
+
 // plot_fps_at every step_px across the graph (the window_s seconds before
 // now_ms in width_px). Columns whose second reaches back before the oldest
 // sample are left out (they would read too low). Returns the columns
