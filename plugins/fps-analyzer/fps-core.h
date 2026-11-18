@@ -70,6 +70,7 @@ struct fps_core_params {
     bool beat_enabled;             // run the capture-path beat detector (fps_core_obs_tick et al.)
     uint64_t pacing_period_ns;     // OBS frame interval: frame pacing without source timestamps
                                    // (sync path) is rounded to whole multiples of it; 0 = not rounded
+    bool detect_drops;             // count frames lost by the capture device / OBS (fps_core_get_drops)
 };
 
 static inline struct fps_core_params fps_core_params_defaults(void)
@@ -83,6 +84,7 @@ static inline struct fps_core_params fps_core_params_defaults(void)
     p.measure_deltas = false;
     p.beat_enabled = true;
     p.pacing_period_ns = 0;
+    p.detect_drops = true;
     return p;
 }
 
@@ -294,6 +296,33 @@ int fps_core_debug_last_published_fps(const struct fps_core *c);
 
 // True while the altered-frame check holds (see FPS_ALTERED_TRIGGER).
 bool fps_core_frames_altered(const struct fps_core *c);
+
+// --- Dropped frames (who lost them: the capture device or OBS) ---
+//
+// A frame the capture device delivered at 2x (3x...) the usual interval
+// after the previous one means frames were lost on the way: round(gap /
+// median) - 1 of them. An OBS tick without a new frame within 3 ticks of the
+// gap, before or after it (OBS buffers frames, so it is rarely right next to
+// it) says the device never delivered them (the card lost them); no such
+// tick says
+// the device did, but OBS took the newer of two frames on one tick (OBS lost
+// them, rendering lag). A 59.94-into-60 beat makes empty ticks without a gap
+// and a game's own stutter makes neither, so neither is counted. A source
+// whose intervals are not whole multiples of one period (a camera, VRR) is
+// variable: nothing is counted there. The FPS is not corrected - whether a
+// lost frame was new or a repeat cannot be known - the overlay warns that it
+// reads low.
+#define FPS_DROPS_WINDOW_NS 5000000000ULL // rate over the last 5 s
+#define FPS_DROPS_HOLD_NS 5000000000ULL   // the warning stays 5 s after the last loss
+#define FPS_DROPS_EMPTY_TICK_LOOKBACK 3  // an empty OBS tick within this many ticks of a gap: the card lost it
+
+struct fps_drops {
+    double card_per_s, obs_per_s; // lost frames per second over the last 5 s
+    uint64_t card_total, obs_total;
+    bool active;                  // a loss within FPS_DROPS_HOLD_NS
+    bool variable_source;         // intervals are not whole periods: not counted
+};
+void fps_core_get_drops(const struct fps_core *c, uint64_t now_ns, struct fps_drops *out);
 
 // Empties the graph histories (frametime, EMA, per-frame FPS, tearing, frame
 // pacing) and the published averages, as if the source had just started.

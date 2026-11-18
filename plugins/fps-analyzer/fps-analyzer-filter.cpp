@@ -120,6 +120,16 @@ struct fps_analyzer_filter {
     bool core_beat_enabled;
     uint64_t core_pacing_period_ns; // OBS frame interval given to the core (frame pacing, sync path)
     uint32_t history_gen_seen;      // last g_history_reset_gen this filter acted on
+    // Dropped frames ("detect_drops" setting, default on)
+    bool detect_drops;
+    uint32_t lagged_seen;           // obs_get_lagged_frames() at the previous tick
+    uint64_t lag_ev_t[64];          // OBS render-lag frames: when (ns) ...
+    int lag_ev_n[64];               // ... and how many
+    int lag_head, lag_count;
+    uint64_t lag_last_ns;
+    bool drops_logged;              // a dropping episode is in the log
+    uint64_t drops_since_ns;
+    uint64_t drops_card_at_start, drops_obs_at_start;
 };
 
 // --- Utility functions ---
@@ -182,6 +192,7 @@ static struct fps_core_params core_params(const struct fps_analyzer_filter *filt
     p.measure_deltas = filter->core_measure_deltas;
     p.beat_enabled = filter->core_beat_enabled;
     p.pacing_period_ns = filter->core_pacing_period_ns;
+    p.detect_drops = filter->detect_drops;
     return p;
 }
 
@@ -1062,6 +1073,63 @@ static void core_sync(struct fps_analyzer_filter *filter, uint64_t now)
     }
 }
 
+// Who drops frames: the core's attribution from the device timestamps, plus
+// OBS's own render-lag counter (the only source on the sync path, where there
+// are no device timestamps). Published for the overlay's warning; the FPS
+// itself is not corrected.
+static void publish_drops(struct fps_analyzer_filter *filter, uint64_t now)
+{
+    uint32_t lagged = obs_get_lagged_frames();
+    if (!filter->detect_drops) {
+        filter->lagged_seen = lagged;
+        g_fps_shared.drops_active = false;
+        g_fps_shared.drops_card_per_s = g_fps_shared.drops_obs_per_s = 0.0;
+        return;
+    }
+    if (lagged > filter->lagged_seen) {
+        filter->lag_ev_t[filter->lag_head] = now;
+        filter->lag_ev_n[filter->lag_head] = (int)(lagged - filter->lagged_seen);
+        filter->lag_head = (filter->lag_head + 1) % 64;
+        if (filter->lag_count < 64)
+            filter->lag_count++;
+        filter->lag_last_ns = now;
+    }
+    filter->lagged_seen = lagged;
+    int lag = 0;
+    for (int i = 0; i < filter->lag_count; i++) {
+        int k = (filter->lag_head - 1 - i + 64) % 64;
+        if (now - filter->lag_ev_t[k] > FPS_DROPS_WINDOW_NS)
+            break;
+        lag += filter->lag_ev_n[k];
+    }
+    const double lag_per_s = lag / ((double)FPS_DROPS_WINDOW_NS / 1e9);
+    bool lag_active = filter->lag_last_ns && now - filter->lag_last_ns < FPS_DROPS_HOLD_NS;
+
+    struct fps_drops d;
+    fps_core_get_drops(filter->core, now, &d);
+    // a render lag shows in both counters: take the larger, never the sum
+    double obs_per_s = d.obs_per_s > lag_per_s ? d.obs_per_s : lag_per_s;
+    bool active = d.active || lag_active;
+    g_fps_shared.drops_active = active;
+    g_fps_shared.drops_card_per_s = d.card_per_s;
+    g_fps_shared.drops_obs_per_s = obs_per_s;
+
+    if (active && !filter->drops_logged) {
+        filter->drops_logged = true;
+        filter->drops_since_ns = now;
+        filter->drops_card_at_start = d.card_total;
+        filter->drops_obs_at_start = d.obs_total;
+        blog(LOG_WARNING, "[FPS Analyzer] Dropped frames: capture device %.1f/s, OBS %.1f/s - the FPS reads low",
+             d.card_per_s, obs_per_s);
+    } else if (!active && filter->drops_logged) {
+        filter->drops_logged = false;
+        blog(LOG_INFO, "[FPS Analyzer] Dropped frames stopped after %.0f s: capture device %llu, OBS %llu frames",
+             (double)(now - filter->drops_since_ns) / 1e9,
+             (unsigned long long)(d.card_total - filter->drops_card_at_start),
+             (unsigned long long)(d.obs_total - filter->drops_obs_at_start));
+    }
+}
+
 // Can the FPS be measured exactly? Publishes the reason when it cannot.
 static void update_block(struct fps_analyzer_filter *filter, obs_source_t *parent)
 {
@@ -1234,6 +1302,7 @@ static void fps_analyzer_video_tick(void *data, float seconds)
     // frame). Feeds the beat detector and the trace's K rows.
     obs_source_t *parent = obs_filter_get_parent(filter->context);
     update_block(filter, parent);
+    publish_drops(filter, now);
     if (parent && (obs_source_get_output_flags(parent) & OBS_SOURCE_ASYNC)) {
         fps_core_obs_tick(filter->core, now, filter->frames_since_tick);
         if (filter->trace_file)
@@ -1402,8 +1471,10 @@ static void *fps_analyzer_create(obs_data_t *settings, obs_source_t *context)
     filter->enable_tearing_detection = obs_data_get_bool(settings, "enable_tearing_detection");
     filter->tearing_sensitivity = obs_data_get_double(settings, "tearing_sensitivity");
     filter->block_unreliable = obs_data_get_bool(settings, "block_unreliable");
+    filter->detect_drops = obs_data_get_bool(settings, "detect_drops");
     filter->unsupported_fmt = -1;
     filter->history_gen_seen = g_history_reset_gen.load(); // only resets from now on
+    filter->lagged_seen = obs_get_lagged_frames(); // only lag from now on counts
     filter->core_measure_deltas = filter->block_unreliable;
     filter->core_beat_enabled = false; // until an overlay asks for it (core_sync)
     filter->core = NULL;
@@ -1563,6 +1634,14 @@ static obs_properties_t *fps_analyzer_properties(void *data)
         "a compressed capture format (MJPEG, H.264) or a capture device that alters every frame, "
         "so repeated frames are never identical. Turn off only for testing: the readings are then "
         "shown, but they can be wrong. See README: Supported capture devices.");
+    obs_property_t *drops = obs_properties_add_bool(rel, "detect_drops",
+                                                    "Warn when the capture device or OBS drops frames (recommended)");
+    obs_property_set_long_description(drops,
+        "A frame lost on the way to the analysis makes the FPS read low although the game "
+        "did not lose it. The capture device's timestamps show such a gap; an OBS tick that "
+        "got no frame right before it means the device lost it, none means OBS did "
+        "(rendering lag). The overlay then says who drops frames and how many per second; "
+        "the FPS stays visible but is not corrected. Off: nothing is measured.");
     obs_properties_add_group(props, "group_reliability", "Reliability", OBS_GROUP_NORMAL, rel);
 
     // Tearing detection
@@ -1680,6 +1759,7 @@ static void fps_analyzer_update(void *data, obs_data_t *settings)
     filter->analyze_method = (analyze_method_t)obs_data_get_int(settings, "analyze_method");
     filter->sensitivity = obs_data_get_double(settings, "sensitivity");
     filter->block_unreliable = obs_data_get_bool(settings, "block_unreliable");
+    filter->detect_drops = obs_data_get_bool(settings, "detect_drops");
     {
         struct fps_core_params p = core_params(filter);
         fps_core_set_params(filter->core, &p); // keeps the analysis state, as before
@@ -1732,6 +1812,7 @@ static void fps_analyzer_get_defaults(obs_data_t *settings)
     obs_data_set_default_bool(settings, "clear_csv_on_start", true);
     obs_data_set_default_bool(settings, "enable_tearing_detection", true);
     obs_data_set_default_bool(settings, "block_unreliable", true);
+    obs_data_set_default_bool(settings, "detect_drops", true);
     obs_data_set_default_double(settings, "tearing_sensitivity", 1.0);
     obs_data_set_default_int(settings, "analyze_method", ANALYZE_LAST_LINE);
     obs_data_set_default_double(settings, "sensitivity", 0.1);

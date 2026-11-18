@@ -28,6 +28,10 @@ struct fps_shared_data {
     int blocked_reason;      // FPS_BLOCK_*
     char blocked_detail[32]; // format name for PIXFMT / COMPRESSED ("P010", "MJPEG")
     bool reliability_off;    // the filter's "Block FPS when the capture is unreliable" is off
+    // Dropped frames (fps_core_get_drops + OBS's render lag): the FPS reads low
+    bool drops_active;
+    double drops_card_per_s; // lost by the capture device
+    double drops_obs_per_s;  // lost by OBS (rendering lag)
     uint64_t srate_wanted_ns; // last tick an overlay showed the Source refresh rate line:
                               // the filter computes source rate and beat only while it is fresh
     // Graph data — linearized (oldest to newest), ready for rendering

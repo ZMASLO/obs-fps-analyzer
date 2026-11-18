@@ -180,7 +180,7 @@ static void set_label_text(obs_source_t *label, const char *text)
 static bool overlay_any_text(const struct fps_overlay_source *ctx)
 {
     return ctx->show_fps_text || ctx->show_frametime_text || ctx->show_tearing_text ||
-           ctx->show_resolution_text || g_fps_shared.blocked_reason != FPS_BLOCK_NONE;
+           ctx->show_resolution_text || g_fps_shared.blocked_reason != FPS_BLOCK_NONE || g_fps_shared.drops_active;
 }
 
 // --- Source refresh rate line ---
@@ -1335,6 +1335,24 @@ static void fps_overlay_tick(void *data, float seconds)
             if (pos > 0)
                 pos += snprintf(text + pos, sizeof(text) - pos, "\n");
             pos += snprintf(text + pos, sizeof(text) - pos, "Warning: Tearing detected");
+        }
+        // Frames lost before the analysis: the FPS reads low (shown whatever is ticked)
+        if (g_fps_shared.drops_active)
+        {
+            if (g_fps_shared.drops_card_per_s > 0.0 || g_fps_shared.drops_obs_per_s <= 0.0)
+            {
+                if (pos > 0)
+                    pos += snprintf(text + pos, sizeof(text) - pos, "\n");
+                pos += snprintf(text + pos, sizeof(text) - pos, "Capture device drops frames (%.0f/s) - FPS reads low",
+                                g_fps_shared.drops_card_per_s);
+            }
+            if (g_fps_shared.drops_obs_per_s > 0.0)
+            {
+                if (pos > 0)
+                    pos += snprintf(text + pos, sizeof(text) - pos, "\n");
+                pos += snprintf(text + pos, sizeof(text) - pos,
+                                "OBS drops frames (%.0f/s, rendering lag) - FPS reads low", g_fps_shared.drops_obs_per_s);
+            }
         }
         if (ctx->show_resolution_text && g_fps_shared.res_detect_enabled)
         {

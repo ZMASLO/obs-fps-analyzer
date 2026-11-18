@@ -160,7 +160,8 @@ Result bench_feed(int fmt, uint32_t w, uint32_t h, int method, bool deltas, bool
     uint64_t k = 0;
     double us = time_per_call(
         [&] {
-            const fps_frame_view &v = ((k >> 1) & 1) ? vb : va; // A A B B ...: new, repeat
+            fps_frame_view v = ((k >> 1) & 1) ? vb : va; // A A B B ...: new, repeat
+            v.src_ts_ns = t;                             // device timestamps: pacing and dropped frames run
             fps_core_feed(c, &v, t);
             t += 16683333;
             k++;

@@ -82,7 +82,7 @@ $mutations = @(
     @{ name = "zmienione klatki: nigdy nie zwalnia";      find = '++c->altered_exact >= FPS_ALTERED_CLEAR'; repl = '++c->altered_exact >= 1000000' },
     @{ name = "zmienione klatki: liczy tez powtorki";     find = 'if (!unique || !tiny)'; repl = 'if (!tiny)' },
     @{ name = "zmienione klatki: prog 1/3";              find = '++c->altered_noise_run >= FPS_ALTERED_TRIGGER'; repl = '++c->altered_noise_run >= FPS_ALTERED_TRIGGER / 3' },
-    @{ name = "dudnienie: wylaczenie ignorowane";         find = 'if (!c || !c->params.beat_enabled)'; repl = 'if (!c)' },
+    @{ name = "dudnienie: wylaczenie ignorowane";         find = 'if (!c->params.beat_enabled)'; repl = 'if (false)' },
     # Frame pacing: czas kazdej klatki gry ze znacznikow karty, utracone przez karte oznaczone
     @{ name = "pacing: zegar analizy zamiast znacznika";  find = 'if (c->src_ts && c->last_unique_src_ts && c->src_ts > c->last_unique_src_ts)'; repl = 'if (false)' },
     @{ name = "pacing: bez oznaczania utraconych";        find = 'if (iv * 2 > median * 3) {'; repl = 'if (false) {' },
@@ -107,7 +107,16 @@ $mutations = @(
     @{ name = "framerate: okno 2 s";                      file = "plot-layout.cpp"; find = '#define PLOT_FPS_SPAN_MS 1000.0'; repl = '#define PLOT_FPS_SPAN_MS 2000.0' },
     @{ name = "framerate: overlap bez przyciecia do okna"; file = "plot-layout.cpp"; find = '        double a = start > ws ? start : ws;'; repl = '        double a = start;' },
     @{ name = "frametime: FPS zamiast czasu klatki";      file = "plot-layout.cpp"; find = '    return fps > 0.0 ? 1000.0 / fps : 1e9;'; repl = '    return fps;' },
-    @{ name = "frametime: zero przy braku klatek";        file = "plot-layout.cpp"; find = '    return fps > 0.0 ? 1000.0 / fps : 1e9;'; repl = '    return fps > 0.0 ? 1000.0 / fps : 0.0;' }
+    @{ name = "frametime: zero przy braku klatek";        file = "plot-layout.cpp"; find = '    return fps > 0.0 ? 1000.0 / fps : 1e9;'; repl = '    return fps > 0.0 ? 1000.0 / fps : 0.0;' },
+    # Gubione klatki: kto zgubil (karta / OBS), przytrzymanie, zrodlo zmienne
+    @{ name = "utraty: pusty takt przed dziura ignorowany"; find = 'if (c->last_empty_tick && c->tick_no - c->last_empty_tick <= FPS_DROPS_EMPTY_TICK_LOOKBACK) {'; repl = 'if (false) {' },
+    @{ name = "utraty: pusty takt po dziurze ignorowany";  find = '        if (empty)' + "`n" + '            drops_record(c, g.n, true, now);'; repl = '        if (false)' + "`n" + '            drops_record(c, g.n, true, now);' },
+    @{ name = "utraty: okno 3 taktow na 0";                find = '        else if (c->tick_no - g.tick > FPS_DROPS_EMPTY_TICK_LOOKBACK)'; repl = '        else if (c->tick_no - g.tick > 0)' },
+    @{ name = "utraty: karta zamiast OBS";                 find = '            drops_record(c, g.n, false, now);'; repl = '            drops_record(c, g.n, true, now);' },
+    @{ name = "utraty: bez przytrzymania";                 find = 'now_ns - c->last_drop_ns < FPS_DROPS_HOLD_NS'; repl = 'now_ns - c->last_drop_ns < 1' },
+    @{ name = "utraty: zrodlo zmienne liczone";            find = 'c->drops_variable = drops_source_variable(c, median);'; repl = 'c->drops_variable = false;' },
+    @{ name = "utraty: bez rozgrzewki 30 odstepow";        find = 'if (c->params.detect_drops && c->iv60_n >= 30) {'; repl = 'if (c->params.detect_drops && c->iv60_n >= 0) {' },
+    @{ name = "utraty: liczba klatek w dziurze";           find = 'int lost = (int)((iv + median / 2) / median) - 1;'; repl = 'int lost = 1;' }
 )
 
 function Run-Layer([string]$exe, [string[]]$argv) {

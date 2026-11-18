@@ -31,6 +31,9 @@
 #                 blocked=altered  traces only (v4): the altered-frame check hid
 #                                the FPS (the capture device alters every frame)
 #                 notblocked     traces only (v4): it never did
+#                 drops=card | drops=obs | nodrops  traces only (v3+): frames lost
+#                                on the way to the analysis, by the capture device
+#                                (a gap after an empty OBS tick) or by OBS, or none
 #                 pacing@A-B=V+-T  traces only (v3+): every frame-pacing sample in
 #                                [A, B) seconds not flagged as a capture loss is V ms within T
 #                 pacinggaps=N | pacinggaps>0  samples flagged because the capture
@@ -73,7 +76,7 @@ trace:traces/tearing.csv     ; ; self ; VSync off, camera motion, tearing detect
 trace:traces/interval1s.csv  ; ; self ; as fps60 but with the update interval set to 1 s
 trace:traces/diff_mode.csv   ; ; self ; as fps60 but with the full frame diff analysis method
 trace:traces/gamecap60.csv   ; ; self, fps@3-21=60+-1, nobeat ; game capture of a 60 fps game, 2560x1440 BGRA through the sync render path; 22 s, 1316 unique frames, 60.01 per second
-trace:traces/4kx_dev60_obs60_ps5.csv   ; ; self, beat=59.94+-0.01   ; Elgato 4K X, device 60 / OBS 60, PS5 at 59.94 Hz (GTA V, locked 60): the card repeats a frame every 16.68 s while its timestamps claim a perfect 60.000 Hz
+trace:traces/4kx_dev60_obs60_ps5.csv   ; ; self, beat=59.94+-0.01, nodrops ; Elgato 4K X, device 60 / OBS 60, PS5 at 59.94 Hz (GTA V, locked 60): the card repeats a frame every 16.68 s while its timestamps claim a perfect 60.000 Hz
 trace:traces/4kx_dev5994_obs60_ps5.csv ; ; self, beat=59.94+-0.01   ; Elgato 4K X, device 59.94 / OBS 60, PS5 at 59.94 Hz: OBS repeats (and drops) frames in bursts every ~16.7 s
 # Altered-frame check (fpstrace v4, PS5 + GTA V, same console on both cards):
 # the Elgato 4K X dithers every frame in every mode, so a repeated frame is never
@@ -82,13 +85,22 @@ trace:traces/4kx_nv12_game30_v4.csv    ; ; self, blocked=altered ; Elgato 4K X, 
 trace:traces/4kx_i420_game30_v4.csv    ; ; self, blocked=altered ; Elgato 4K X, I420 4K, game at 30 FPS: the same in the other 4:2:0 mode
 trace:traces/4kx_i420_ps5menu_v4.csv   ; ; self, blocked=altered ; Elgato 4K X, I420 4K, PS5 home menu: the bottom line is still, only card noise changes
 trace:traces/4kx_i420_paused_v4.csv    ; ; self, blocked=altered ; Elgato 4K X, I420 4K, game paused: nothing moves, yet every frame differs
-trace:traces/mk2_yuy2_game30_v4.csv    ; ; self, notblocked, fps@3-20=30+-1, pacing@3-20=33.37+-0.05, pacinggaps=0 ; Elgato 4K Mk2, YUY2 4K, game at 30 FPS: every repeat identical, reads 30
-trace:traces/mk2_yuy2_ps5menu_v4.csv   ; ; self, notblocked, fps@3-20=60+-1, pacing@3-20=16.68+-0.05, pacinggaps=0 ; Elgato 4K Mk2, YUY2 4K, PS5 home menu (animated, 60)
-trace:traces/mk2_yuy2_pausemenu_v4.csv ; ; self, notblocked, fps@3-20=60+-1 ; Elgato 4K Mk2, YUY2 4K, GTA V pause menu (animated grain background, 60)
+trace:traces/mk2_yuy2_game30_v4.csv    ; ; self, notblocked, fps@3-20=30+-1, pacing@3-20=33.37+-0.05, pacinggaps=0, nodrops ; Elgato 4K Mk2, YUY2 4K, game at 30 FPS: every repeat identical, reads 30
+trace:traces/mk2_yuy2_ps5menu_v4.csv   ; ; self, notblocked, fps@3-20=60+-1, pacing@3-20=16.68+-0.05, pacinggaps=0, nodrops ; Elgato 4K Mk2, YUY2 4K, PS5 home menu (animated, 60)
+trace:traces/mk2_yuy2_pausemenu_v4.csv ; ; self, notblocked, fps@3-20=60+-1, nodrops ; Elgato 4K Mk2, YUY2 4K, GTA V pause menu (animated grain background, 60)
 # Frame pacing (Digital Foundry style) with a capture device that loses frames: the 4K Mk2 in a
 # bad state dropped ~5 frames a second (its timestamps jump by two periods). Every such sample is
 # flagged instead of showing up as a game stutter; all others are the game's even 33.37 ms.
 # A game with real judder: 30 FPS on average, but frames shown for 16.7 / 33.4 / 50 ms; the
 # counter and the smoothed frametime say a steady 30, only the frame pacing graph shows it.
-trace:traces/mk2_yuy2_game30_judder_v4.csv ; ; self, notblocked, fps@2-10=30+-1, pacinggaps=0, pacing@0-10=16.68|33.37|50.05+-0.05 ; Elgato 4K Mk2, YUY2 4K, game at 30 FPS with uneven pacing (74 x 16.7, 153 x 33.4, 73 x 50 ms in 10 s), no capture loss
-trace:traces/mk2_yuy2_game30_carddrops_v4.csv ; ; self, notblocked, pacinggaps>0, pacing@3-20=33.37+-0.05 ; Elgato 4K Mk2, YUY2 4K, game at 30 FPS, the card dropping 98 frames in 20 s
+trace:traces/mk2_yuy2_game30_judder_v4.csv ; ; self, notblocked, fps@2-10=30+-1, pacinggaps=0, pacing@0-10=16.68|33.37|50.05+-0.05, nodrops ; Elgato 4K Mk2, YUY2 4K, game at 30 FPS with uneven pacing (74 x 16.7, 153 x 33.4, 73 x 50 ms in 10 s), no capture loss
+trace:traces/mk2_yuy2_game30_carddrops_v4.csv ; ; self, notblocked, pacinggaps>0, pacing@3-20=33.37+-0.05, drops=card ; Elgato 4K Mk2, YUY2 4K, game at 30 FPS, the card dropping 98 frames in 20 s
+# Two more recordings of the Mk2 dropping frames (257 and 133 gaps in its timestamps, OBS
+# rendering without a single late tick): the empty OBS tick lies up to 3 ticks before or after
+# each gap (OBS buffers frames), and the losses must still go to the card, not to OBS.
+trace:traces/mk2_yuy2_carddrops_257_v4.csv ; ; self, drops=card ; Elgato 4K Mk2, YUY2 4K, PS5, the card dropping ~8.6 frames/s
+trace:traces/mk2_yuy2_carddrops_133_v4.csv ; ; self, drops=card ; Elgato 4K Mk2, YUY2 4K, PS5, the card dropping ~13 frames/s, empty ticks often after the gap
+# OBS itself lagging (18.11.2026, v0.6.0 with the slow Full frame histogram: 19 ms render per
+# frame at 59.94 FPS). OBS's stats: 122 of 1199 frames skipped; the trace has exactly 122 video-time
+# steps of two periods. The card was dropping frames as well (36 empty ticks), so this is mixed.
+trace:traces/mk2_yuy2_obslag_v4.csv ; ; self, drops=obs ; Elgato 4K Mk2, YUY2 4K, Full frame diff, OBS lagging (122 frames skipped) while the card drops some too

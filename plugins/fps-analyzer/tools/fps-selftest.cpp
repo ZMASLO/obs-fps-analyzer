@@ -2013,6 +2013,197 @@ static void s26_plot_layout(Runner &r)
     }
 }
 
+// --- s27: dropped frames (capture device vs OBS) ---
+struct DropSim {
+    double seconds = 20.0;
+    uint64_t period_ns = 16683333; // 59.94 Hz source and OBS
+    int card_lose_every = 0;       // the device loses every Nth frame (an empty OBS tick)
+    int obs_lose_every = 0;        // OBS takes the newer of two frames every Nth (no empty tick)
+    int beat_every = 0;            // an empty tick without a gap (59.94 into 60) every N
+    bool variable = false;         // random intervals (camera / VRR)
+    bool detect = true;
+    double stop_at_s = -1;         // losses stop here
+    bool obs_buffered = false;     // OBS buffers a frame: the empty tick comes one frame before the gap
+    bool empty_after = false;      // ... or two ticks after it
+    bool lose_two = false;         // each loss is two frames in a row
+};
+struct DropRun {
+    fps_drops at_end{};
+    double card_rate_mid = 0, obs_rate_mid = 0; // at 10 s
+    bool active_mid = false;
+    double inactive_after_s = -1;               // first second inactive after losses stopped
+};
+
+static DropRun run_drops(const DropSim &s)
+{
+    DropRun dr;
+    fps_core_params p = fps_core_params_defaults();
+    p.detect_drops = s.detect;
+    fps_core *c = fps_core_create(&p);
+    Frame a = make_frame(FPS_PIXFMT_NV12, 64, 4), b = make_frame(FPS_PIXFMT_NV12, 64, 4);
+    fill_all(a, 1);
+    fill_all(b, 2);
+    uint64_t rng = 5;
+    const uint64_t n = (uint64_t)(s.seconds * 1e9 / s.period_ns);
+    uint64_t ts = T0;
+    int late_gap = 0; // obs_buffered: the gap to deliver on the next frame
+    uint64_t empty_at = 0; // empty_after: the tick that gets no frame
+    for (uint64_t k = 0; k < n; k++) {
+        uint64_t now = T0 + k * s.period_ns + 2000000;
+        double t = (double)(now - T0) / 1e9;
+        bool losing = !(s.stop_at_s >= 0 && t >= s.stop_at_s);
+        bool card_loss = losing && s.card_lose_every && k % (uint64_t)s.card_lose_every == 7 % (uint64_t)s.card_lose_every;
+        bool obs_loss = losing && s.obs_lose_every && k % (uint64_t)s.obs_lose_every == 7 % (uint64_t)s.obs_lose_every;
+        bool beat = s.beat_every && k % (uint64_t)s.beat_every == 3;
+        uint64_t step = s.period_ns;
+        if (s.variable) {
+            rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+            step = s.period_ns / 2 + (rng >> 40) % (2 * s.period_ns); // 0.5 .. 2.5 periods
+        }
+        if (s.empty_after && empty_at && k == empty_at) {
+            fps_core_obs_tick(c, now, 0); // the empty tick, two ticks after the gap
+            empty_at = 0;
+            continue;
+        }
+        if (card_loss && s.empty_after) {
+            ts += 2 * step; // the gap arrives first ...
+            empty_at = k + 2;
+            Frame &f = (k & 1) ? b : a;
+            fps_frame_view v = f.view();
+            v.src_ts_ns = ts;
+            fps_core_feed(c, &v, now);
+            fps_core_obs_tick(c, now, 1);
+            continue;
+        }
+        if (card_loss && s.obs_buffered) {
+            // as in the 17.11.2026 Mk2 traces: an empty tick, then one frame at the
+            // usual interval, then the one after the lost frame
+            fps_core_obs_tick(c, now, 0);
+            late_gap = 1;
+            continue;
+        }
+        if (late_gap == 1) {
+            late_gap = 2;
+        } else if (late_gap == 2) {
+            ts += step; // the lost frame's slot
+            late_gap = 0;
+        }
+        if (card_loss || beat) {
+            // nothing delivered on this tick (a lost frame, or OBS repeating one)
+            if (card_loss)
+                ts += step * (s.lose_two ? 2 : 1); // the device's clock moves on: the next frame comes late
+            fps_core_obs_tick(c, now, 0);
+            continue;
+        }
+        if (obs_loss)
+            ts += step; // OBS skipped the older of two frames: a gap, but this tick has a frame
+        ts += step;
+        Frame &f = (k & 1) ? b : a;
+        fps_frame_view v = f.view();
+        v.src_ts_ns = ts;
+        fps_core_feed(c, &v, now);
+        fps_core_obs_tick(c, now, 1);
+        if (t >= 10.0 && t < 10.0 + s.period_ns / 1e9) {
+            fps_drops d;
+            fps_core_get_drops(c, now, &d);
+            dr.card_rate_mid = d.card_per_s;
+            dr.obs_rate_mid = d.obs_per_s;
+            dr.active_mid = d.active;
+        }
+        if (s.stop_at_s >= 0 && t > s.stop_at_s && dr.inactive_after_s < 0) {
+            fps_drops d;
+            fps_core_get_drops(c, now, &d);
+            if (!d.active)
+                dr.inactive_after_s = t - s.stop_at_s;
+        }
+    }
+    fps_core_get_drops(c, T0 + n * s.period_ns, &dr.at_end);
+    fps_core_destroy(c);
+    return dr;
+}
+
+static void s27_dropped_frames(Runner &r)
+{
+    r.begin("s27_dropped_frames", fps_core_params_defaults());
+    {   // the card loses one frame in 12 (~5/s at 59.94): attributed to the card
+        DropSim s;
+        s.card_lose_every = 12;
+        DropRun d = run_drops(s);
+        r.check(d.active_mid && fabs(d.card_rate_mid - 59.94 / 12) < 0.5 && d.obs_rate_mid == 0.0,
+                "card loses 1 in 12: %.2f/s by the card (want ~5.0), %.2f/s by OBS", d.card_rate_mid, d.obs_rate_mid);
+    }
+    {   // the same with OBS's one-frame buffer: the empty tick a frame ahead of the gap
+        DropSim s;
+        s.card_lose_every = 12;
+        s.obs_buffered = true;
+        DropRun d = run_drops(s);
+        r.check(d.active_mid && fabs(d.card_rate_mid - 59.94 / 12) < 0.5 && d.obs_rate_mid == 0.0,
+                "card loses 1 in 12 behind OBS's buffer: %.2f/s by the card, %.2f/s by OBS", d.card_rate_mid,
+                d.obs_rate_mid);
+    }
+    {   // ... or with the empty tick two ticks after the gap (seen in a third trace)
+        DropSim s;
+        s.card_lose_every = 12;
+        s.empty_after = true;
+        DropRun d = run_drops(s);
+        r.check(d.active_mid && fabs(d.card_rate_mid - 59.94 / 12) < 0.5 && d.obs_rate_mid == 0.0,
+                "card loses 1 in 12, empty tick after the gap: %.2f/s by the card, %.2f/s by OBS", d.card_rate_mid,
+                d.obs_rate_mid);
+    }
+    {   // two frames lost in a row count as two
+        DropSim s;
+        s.card_lose_every = 12;
+        s.lose_two = true;
+        DropRun d = run_drops(s);
+        r.check(fabs(d.card_rate_mid - 2 * 59.94 / 12) < 1.0, "card loses 2 in a row, 1 in 12: %.2f/s (want ~10)",
+                d.card_rate_mid);
+    }
+    {   // the Mk2 state seen live: 13 lost a second - still counted, not "variable"
+        DropSim s;
+        s.card_lose_every = 5;
+        DropRun d = run_drops(s);
+        r.check(d.active_mid && d.card_rate_mid > 10.0 && !d.at_end.variable_source,
+                "card loses 1 in 5: %.1f/s, not taken for a variable source", d.card_rate_mid);
+    }
+    {   // OBS takes the newer of two frames: a gap without an empty tick
+        DropSim s;
+        s.obs_lose_every = 20;
+        DropRun d = run_drops(s);
+        r.check(d.active_mid && d.card_rate_mid == 0.0 && fabs(d.obs_rate_mid - 59.94 / 20) < 0.5,
+                "OBS loses 1 in 20: %.2f/s by OBS (want ~3.0), %.2f/s by the card", d.obs_rate_mid, d.card_rate_mid);
+    }
+    {   // a 59.94-into-60 beat: an empty tick every ~16.7 s, no gap - no loss
+        DropSim s;
+        s.beat_every = 1000;
+        DropRun d = run_drops(s);
+        r.check(!d.at_end.active && d.at_end.card_total == 0 && d.at_end.obs_total == 0,
+                "beat (empty ticks without a gap): nothing counted");
+    }
+    {   // a camera / VRR: random intervals - variable, nothing counted
+        DropSim s;
+        s.variable = true;
+        DropRun d = run_drops(s);
+        r.check(d.at_end.variable_source && d.at_end.card_total == 0 && d.at_end.obs_total == 0,
+                "variable source: flagged, nothing counted (%llu / %llu)",
+                (unsigned long long)d.at_end.card_total, (unsigned long long)d.at_end.obs_total);
+    }
+    {   // switched off: nothing at all
+        DropSim s;
+        s.card_lose_every = 12;
+        s.detect = false;
+        DropRun d = run_drops(s);
+        r.check(!d.active_mid && d.at_end.card_total == 0, "detect_drops off: nothing measured");
+    }
+    {   // the warning holds 5 s after the last loss, then goes
+        DropSim s;
+        s.card_lose_every = 12;
+        s.stop_at_s = 8.0;
+        DropRun d = run_drops(s);
+        r.check(d.inactive_after_s > 4.5 && d.inactive_after_s < 5.6,
+                "losses stop at 8 s: warning gone %.2f s later (want ~5)", d.inactive_after_s);
+    }
+}
+
 static void s23_capture_beat(Runner &r)
 {
     r.begin("s23_capture_beat", fps_core_params_defaults());
@@ -2348,6 +2539,7 @@ int main(int argc, char **argv)
     s24_altered_frames(r);
     s25_frame_pacing(r);
     s26_plot_layout(r);
+    s27_dropped_frames(r);
 #endif
 
     printf(r.fails ? "RESULT: %d FAILURES\n" : "RESULT: ALL OK\n", r.fails);

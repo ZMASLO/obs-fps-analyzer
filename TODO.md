@@ -36,18 +36,10 @@ Nagranie `lag_mk2` (17.11.2026) to czysty pierwszy wiersz: 98 dziur w znacznikac
 
 **Częściowo zrobione:** wykres frame pacingu już oznacza na szaro próbki z klatką zgubioną przez kartę (dziura ponad 1,5 × mediana odstępu w znacznikach), więc taka klatka nie wygląda jak zacięcie gry. Odczyt FPS i blokada jeszcze tego nie uwzględniają.
 
-**Zadania:**
-- [ ] Wykrywać dziury w znacznikach źródła (odstęp ≥ 1,5 × okres sygnału) i przypisywać je karcie albo OBS według tabeli.
-- [ ] Zgodnie z zasadą precyzji ukrywać FPS z powodem (`capture device drops frames` / `OBS drops frames (rendering lag)`), aż minie N sekund bez strat. Nie „poprawiać” odczytu: nie da się pewnie stwierdzić, czy zgubiona klatka była nowa, czy powtórzona.
-- [ ] Wyłączać wykrywanie przy źródłach o zmiennej częstotliwości (`srate` w stanie „variable”: kamery, ewentualnie VRR), bo tam dziury są normalne.
-- [ ] Game / Display Capture nie mają znaczników karty, więc dla nich tylko licznik lagu OBS.
-- [ ] Testy:
-  - `lag_mk2` (wykrycie, winny sprzęt);
-  - `mk2_*_v4` (brak alarmu);
-  - nagranie z dudnieniem 59,94/60 (brak alarmu, puste takty bez dziur);
-  - lag OBS do nagrania przy sztucznym obciążeniu OBS albo do zasymulowania w selftest.
-  - Nagrania `lag_mk2*` trzeba przenieść do `tests/traces`.
-- [ ] README: porada przy zacinającym się podglądzie: zrestartować kartę w OBS, sprawdzić temperaturę i przepływ powietrza, wyłączyć HDR tone mapping w Elgato 4K Capture Utility.
+**Zrobione (18.11.2026, v0.6.0):** ostrzeżenie w overlayu „Capture device drops frames (N/s) - FPS reads low” albo „OBS drops frames (N/s, rendering lag)”, FPS zostaje widoczny i nie jest poprawiany (decyzja użytkownika). Checkbox w filtrze „Warn when the capture device or OBS drops frames”, domyślnie włączony. Przypisanie: pusty takt OBS w promieniu 3 taktów od dziury (przed albo po, bo OBS buforuje klatki) oznacza kartę, brak pustego taktu oznacza OBS. Do tego licznik lagu OBS (`obs_get_lagged_frames`), także dla Game Capture. Źródła zmienne (odstępy niebędące wielokrotnością okresu) są pomijane. Testy: `s27_dropped_frames` i trzy nagrania Mk2 (98/0, 249/1, 113/1 klatek karta/OBS).
+
+- [x] Nagranie prawdziwego lagu OBS: `tests/traces/mk2_yuy2_obslag_v4.csv` (122 klatki pominięte przez OBS, test `drops=obs`).
+- [ ] Dokładniejsze przypisanie do OBS: czas wideo OBS (kolumna `video_time_ns` w wierszach K, `obs_get_video_frame_time`) pokazuje każdą pominiętą klatkę jako krok o dwa okresy (w nagraniu 122 = 122 ze statystyk OBS). Rdzeń bierze dziś zegar taktu filtra, który widzi tylko część z nich, więc przy gęstych stratach karty część strat OBS trafia na konto karty (93 OBS / 63 karta zamiast ~122 / ~36). Dać rdzeniowi czas wideo i rozstrzygać: krok czasu wideo przy dziurze → OBS, w przeciwnym razie pusty takt → karta.
 
 ## Wydajność (pomiar 18.11.2026, `fps-bench` / `tools/obs-cost.py`)
 

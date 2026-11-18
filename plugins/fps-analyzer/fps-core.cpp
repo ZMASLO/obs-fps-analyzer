@@ -49,6 +49,28 @@ struct fps_core {
     bool frame_after_gap = false;    // the frame being analysed arrived right after a lost one
     bool carry_gap = false;          // the last new frame did: the next sample starts late too
 
+    // dropped frames (see FPS_DROPS_WINDOW_NS)
+    uint64_t tick_no = 0;            // OBS ticks seen
+    uint64_t last_empty_tick = 0;    // the last one without a new frame (0 = none)
+    struct gap_waiting {             // a gap waiting for an empty tick after it
+        uint64_t tick;
+        int n;
+    } gap_wait[16] = {};
+    int gap_wait_n = 0;
+    uint64_t iv60[60] = {};          // last intervals between delivered frames (variable-source test)
+    int iv60_n = 0, iv60_pos = 0;
+    bool drops_variable = false;
+    int pending_lost = 0;            // frames lost before the frame being analysed...
+    bool pending_card = false;       // ...and whether the card lost them
+    struct drop_event {
+        uint64_t t;
+        int n;
+        bool card;
+    } drop_ev[256] = {};
+    int drop_head = 0, drop_count = 0;
+    uint64_t card_total = 0, obs_total = 0;
+    uint64_t last_drop_ns = 0;
+
     // frame comparison. `*_allocated` mirrors v0.5.0's "is the pointer set"
     // test, which is not the same as "is the buffer non-empty" for a
     // zero-sized frame.
@@ -365,9 +387,17 @@ static void beat_on_frame(struct fps_core *c, bool unique, uint64_t now)
     b.clean_frames = 0;
 }
 
+static void drops_on_tick(struct fps_core *c, uint64_t now, bool empty);
+
 void fps_core_obs_tick(struct fps_core *c, uint64_t now_ns, int frames)
 {
-    if (!c || !c->params.beat_enabled)
+    if (!c)
+        return;
+    c->tick_no++;
+    if (frames == 0)
+        c->last_empty_tick = c->tick_no; // dropped-frame attribution: the device delivered nothing
+    drops_on_tick(c, now_ns, frames == 0);
+    if (!c->params.beat_enabled)
         return;
     auto &b = c->beat;
     beat_advance(c, now_ns, frames > 0);
@@ -539,6 +569,66 @@ void fps_core_get_beat(const struct fps_core *c, uint64_t now_ns, double deliver
 // Every delivered frame: a gap in the device's timestamps (more than 1.5x the
 // median interval) means the device lost a frame before OBS saw it. It is
 // charged to the next frame-pacing sample, whose value stays as measured.
+// Variable source (camera, VRR): fewer than 90 % of the recent intervals are
+// a whole number (1-4) of periods within 10 %. Frames lost by a card keep them
+// whole (2x, 3x), so even 13 lost a second at 60 Hz are not "variable".
+static bool drops_source_variable(const struct fps_core *c, uint64_t median)
+{
+    if (c->iv60_n < 30 || median == 0)
+        return false;
+    int whole = 0;
+    for (int i = 0; i < c->iv60_n; i++) {
+        double k = (double)c->iv60[i] / (double)median;
+        double r = k < 0.5 ? 0.0 : (double)(int)(k + 0.5);
+        whole += (r >= 1.0 && r <= 4.0 && fabs(k - r) <= 0.1 * r) ? 1 : 0;
+    }
+    return whole * 10 < c->iv60_n * 9;
+}
+
+static void drops_record(struct fps_core *c, int n, bool card, uint64_t now)
+{
+    if (n <= 0)
+        return;
+    struct fps_core::drop_event &e = c->drop_ev[c->drop_head];
+    e.t = now;
+    e.n = n;
+    e.card = card;
+    c->drop_head = (c->drop_head + 1) % 256;
+    if (c->drop_count < 256)
+        c->drop_count++;
+    if (card)
+        c->card_total += (uint64_t)n;
+    else
+        c->obs_total += (uint64_t)n;
+    c->last_drop_ns = now;
+}
+
+// The frames lost before the frame just analysed, stamped with the analysis clock
+static void drops_commit(struct fps_core *c, uint64_t now)
+{
+    if (c->pending_lost <= 0)
+        return;
+    drops_record(c, c->pending_lost, c->pending_card, now);
+    c->pending_lost = 0;
+}
+
+// Per OBS tick: an empty tick claims the gaps waiting for it (the card lost
+// those frames); a gap that saw none within the look-back went to OBS.
+static void drops_on_tick(struct fps_core *c, uint64_t now, bool empty)
+{
+    int keep = 0;
+    for (int i = 0; i < c->gap_wait_n; i++) {
+        const fps_core::gap_waiting g = c->gap_wait[i];
+        if (empty)
+            drops_record(c, g.n, true, now);
+        else if (c->tick_no - g.tick > FPS_DROPS_EMPTY_TICK_LOOKBACK)
+            drops_record(c, g.n, false, now);
+        else
+            c->gap_wait[keep++] = g;
+    }
+    c->gap_wait_n = keep;
+}
+
 static void pacing_note_frame(struct fps_core *c)
 {
     c->frame_after_gap = false;
@@ -554,8 +644,32 @@ static void pacing_note_frame(struct fps_core *c)
             if (iv * 2 > median * 3) {
                 c->pending_gap = true;
                 c->frame_after_gap = true;
+                // (nothing counted before 30 intervals: the variable-source test needs them)
+                if (c->params.detect_drops && c->iv60_n >= 30) {
+                    c->drops_variable = drops_source_variable(c, median);
+                    if (!c->drops_variable) {
+                        int lost = (int)((iv + median / 2) / median) - 1;
+                        // The device lost them if OBS had a tick without a frame
+                        // near the gap. OBS buffers frames, so in the 17.11.2026
+                        // Mk2 traces that tick came up to 3 ticks before the gap
+                        // or after it: an empty tick already seen decides now,
+                        // otherwise the gap waits (fps_core_obs_tick).
+                        if (c->last_empty_tick && c->tick_no - c->last_empty_tick <= FPS_DROPS_EMPTY_TICK_LOOKBACK) {
+                            c->pending_lost = lost;
+                            c->pending_card = true;
+                        } else if (c->gap_wait_n < 16) {
+                            c->gap_wait[c->gap_wait_n].tick = c->tick_no;
+                            c->gap_wait[c->gap_wait_n].n = lost;
+                            c->gap_wait_n++;
+                        }
+                    }
+                }
             }
         }
+        c->iv60[c->iv60_pos] = iv;
+        c->iv60_pos = (c->iv60_pos + 1) % 60;
+        if (c->iv60_n < 60)
+            c->iv60_n++;
         c->src_iv[c->src_iv_pos] = iv;
         c->src_iv_pos = (c->src_iv_pos + 1) % 15;
         if (c->src_iv_n < 15)
@@ -841,6 +955,7 @@ int fps_core_feed(struct fps_core *c, const struct fps_frame_view *frame, uint64
 
     c->src_ts = frame->src_ts_ns;
     pacing_note_frame(c);
+    drops_commit(c, now_ns);
 
     // Tearing is judged on every frame, including duplicates.
     c->tearing_detected = detect_tearing_frame(c, frame);
@@ -981,6 +1096,32 @@ void fps_core_debug_last_frame(const struct fps_core *c, struct fps_core_frame_d
         *out = c->dbg;
 }
 
+void fps_core_get_drops(const struct fps_core *c, uint64_t now_ns, struct fps_drops *out)
+{
+    if (!out)
+        return;
+    memset(out, 0, sizeof(*out));
+    if (!c || !c->params.detect_drops)
+        return;
+    int card = 0, obs = 0;
+    for (int i = 0; i < c->drop_count; i++) {
+        const struct fps_core::drop_event &e = c->drop_ev[(c->drop_head - 1 - i + 256) % 256];
+        if (now_ns > e.t && now_ns - e.t > FPS_DROPS_WINDOW_NS)
+            break;
+        if (e.card)
+            card += e.n;
+        else
+            obs += e.n;
+    }
+    const double window_s = (double)FPS_DROPS_WINDOW_NS / 1e9;
+    out->card_per_s = card / window_s;
+    out->obs_per_s = obs / window_s;
+    out->card_total = c->card_total;
+    out->obs_total = c->obs_total;
+    out->active = c->last_drop_ns && now_ns >= c->last_drop_ns && now_ns - c->last_drop_ns < FPS_DROPS_HOLD_NS;
+    out->variable_source = c->drops_variable;
+}
+
 void fps_core_clear_history(struct fps_core *c)
 {
     if (!c)
@@ -1034,6 +1175,7 @@ void fps_core_debug_feed_decision(struct fps_core *c, bool unique, bool tearing,
     c->dbg.sample_written = false;
     c->dbg.ft_ms = c->dbg.ema = c->dbg.fps_pf = 0.0;
     c->dbg.unique = unique;
+    drops_commit(c, now_ns);
     if (unique)
         analyze_unique(c, now_ns);
     beat_on_frame(c, unique, now_ns);

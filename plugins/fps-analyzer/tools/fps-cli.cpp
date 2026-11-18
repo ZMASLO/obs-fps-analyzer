@@ -154,6 +154,7 @@ struct ReplayResult {
     double first_detect_s = -1;  // first second a beat was confirmed
     struct PacingSample { double t; double ms; bool gap; };
     std::vector<PacingSample> pacing; // frame pacing samples (pacing@ / pacinggaps)
+    struct fps_drops drops = {}; // frames lost by the device / OBS over the trace (drops= / nodrops)
     int delta_frames = 0;        // v4 F rows with a difference histogram (altered-frame check)
     double first_altered_s = -1; // when the altered-frame check first held (blocked=altered)
     TraceHeader header;
@@ -370,6 +371,7 @@ static ReplayResult replay_trace(const fs::path &path, double tol, bool verbose)
 
     if (core) {
         fps_core_get_beat(core, last_ns, r.header.obs_hz, &r.beat);
+        fps_core_get_drops(core, last_ns, &r.drops);
         fps_core_destroy(core);
     }
     if (r.error.empty() && !have_header)
@@ -975,6 +977,19 @@ static int run_manifest(const fs::path &manifest, double tol, bool verbose, bool
                                                        : gaps == atoi(spec.c_str() + spec.find('=') + 1);
                     printf("  %s %s: %d samples with a frame lost by the capture device\n",
                            good ? "[ok]" : "[FAIL]", spec.c_str(), gaps);
+                    ok = ok && good;
+                    continue;
+                }
+                // Dropped frames: "drops=card" (the capture device lost frames,
+                // mostly), "drops=obs" (OBS did), "nodrops" (neither)
+                if (spec == "drops=card" || spec == "drops=obs" || spec == "nodrops") {
+                    uint64_t card = r.drops.card_total, obsl = r.drops.obs_total;
+                    bool good = spec == "nodrops" ? (card == 0 && obsl == 0)
+                              : spec == "drops=card" ? (card > 0 && card >= obsl)
+                                                     : (obsl > 0 && obsl >= card);
+                    printf("  %s %s: %llu lost by the capture device, %llu by OBS%s\n", good ? "[ok]" : "[FAIL]",
+                           spec.c_str(), (unsigned long long)card, (unsigned long long)obsl,
+                           r.drops.variable_source ? " (variable source)" : "");
                     ok = ok && good;
                     continue;
                 }
