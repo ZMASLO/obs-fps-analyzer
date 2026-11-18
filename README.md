@@ -37,6 +37,8 @@ The FPS is counted from frames that differ from the previous one, so it is only 
 
   Even a paused game, where nothing on screen moves, arrives as a different picture on every frame. The same console on a 4K Mk2 gives identical repeats
 
+**A PC as the source (NVIDIA):** set NVIDIA Control Panel → Display → Change resolution → *Use NVIDIA color settings* to **RGB, 8 bpc, Full** output dynamic range. A capture card is seen by the driver as an "HDMI - HDTV" display, and with the default colour settings the driver may send YCbCr, a limited range or more than 8 bits. Converting the desktop's RGB 8-bit into that is done with temporal dithering: every repeated frame arrives with ±1 differences, the plugin hides the FPS (`the capture device alters every frame`) although the card itself is fine. Tested with an RTX 5090 into a 4K Mk2 (Cyberpunk 2077 at ~38 FPS): with the default settings the FPS was hidden and the Mk2 also dropped frames in bursts every ~16.7 s, which could show up as a false "59.94 Hz" signal warning; with RGB / 8 bpc / Full the repeats are identical, no frames are dropped and the reading matches RTSS. Turning HDR off did not help, it was already off. AMD and Intel drivers have similar output colour format / bit depth settings
+
 If you have a different capture card, please report whether it works: record an FPS trace (Debug options) with a game capped at 30 FPS and open an issue with the file.
 
 ## Supported formats:

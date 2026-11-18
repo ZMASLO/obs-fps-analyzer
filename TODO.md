@@ -49,5 +49,7 @@ Nagranie `lag_mk2` (17.11.2026) to czysty pierwszy wiersz: 98 dziur w znacznikac
 
 ## Inne otwarte sprawy
 
+- [ ] **Fałszywe „59,94 Hz” przy seriach zgubionych klatek** (18.11.2026, PC z RTX 5090 → 4K Mk2, OBS 60): karta gubiła klatki seriami co ok. 16,7 s. Detektor dudnienia uznał to za powtórkę 59,94 / 60 i podał „signal ~59.94 Hz”, choć znaczniki czasu karty pokazywały równe 60,000 Hz. Przy OBS 59,94 test znaczników słusznie zalecał 60, więc komunikaty przełączały się w kółko. Pomysł: nie stwierdzać dudnienia, gdy znaczniki czasu pokazują zgodność, a w tym samym czasie trwają straty karty (`fps_core_get_drops`). Nagranie: `tests/traces/mk2_yuy2_pc_nvidia_default_dither_v4.csv` (25 s, za krótkie na dudnienie, potrzebne dłuższe, ok. 60 s).
+
 - [ ] Elgato 4K Mk2: potwierdzić, że dawny problem z „laggy OBS preview” już nie występuje. README mówi teraz „works” na podstawie testów 0.5.2.
 - [ ] Rozważyć obsługę P010 (10 bit). 4K X daje go tylko w 4K30 / 1440p60 / 1080p120, a sama karta i tak zmienia klatki, więc to raczej dla innych kart.
