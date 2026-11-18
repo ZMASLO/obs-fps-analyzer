@@ -1334,6 +1334,7 @@ struct BeatSim {
     double loss_p = 0.0;
     double loss_dups_first_s = 0.0; // card mode: the first part of each burst repeats frames only
     bool timestamps = true;      // feed the device timestamps (false: as before 0.6.1)
+    double ts_jitter_ms = 0.0;   // the device stamps with random jitter (+-, Avermedia GC573: 1.6)
     uint64_t seed = 1;
 };
 
@@ -1458,8 +1459,12 @@ static BeatRun run_beat(const BeatSim &s, double seconds)
             // it delivers (a stray empty OBS tick is OBS's, not a lost frame)
             if (s.card)
                 src_ts = base_ns + (uint64_t)((double)(++card_frames) / s.obs_hz * 1e9);
-            if (s.timestamps)
-                fps_core_debug_set_source_ts(c, src_ts);
+            if (s.timestamps) {
+                uint64_t fed = src_ts;
+                if (s.ts_jitter_ms > 0.0)
+                    fed = (uint64_t)((double)src_ts + (rnd() * 2.0 - 1.0) * s.ts_jitter_ms * 1e6);
+                fps_core_debug_set_source_ts(c, fed);
+            }
             fps_core_debug_feed_decision(c, unique, false, now);
             prev_gid = shown;
         }
@@ -1740,12 +1745,29 @@ struct PacingSim {
     bool sync = false;               // no device timestamps: analysis clock + OBS period
     int jitter_us = 0;               // analysis clock jitter (+-), sync path
     uint64_t period_ns = 16683333;   // 59.94 Hz
+    // device timestamp jitter (+-, GC573-like): 1 = alternating +j/-j, 2 = random within +-j
+    int ts_jitter_us = 0;
+    int ts_jitter_kind = 1;
+    int rate_change_at = -1;         // from this source frame on the period is period2_ns
+    uint64_t period2_ns = 16666667;
+    bool vrr = false;                // intervals of 8-25 ms, no common period (every frame new)
 };
 struct PacingRun {
     std::vector<double> ms;
     std::vector<bool> gap;
     int fps = 0;
+    int snapped = 0, samples = 0;    // samples counted on the signal grid
+    std::vector<int> sample_k;       // the source frame that wrote each sample...
+    std::vector<bool> snap;          // ...and whether it was counted on the grid
+    std::vector<double> each;        // every sample's pacing value, in order
+    std::vector<bool> each_gap;
+    std::vector<double> grid_t, grid_ft_each, now_t, now_ft; // framerate-graph edges: grid (-1 = none) and raw
+    std::vector<double> grid_ft;     // grid frame times of the snapped samples (framerate graph)
+    std::vector<double> raw;         // the device timestamp differences of every sample
+    double grid_t_max_off_ms = 0.0;  // largest |grid time - analysis time|
 };
+
+static struct plot_ring g_s25_ring; // large: kept off the stack
 
 static PacingRun run_pacing(const PacingSim &s, int frames)
 {
@@ -1765,7 +1787,10 @@ static PacingRun run_pacing(const PacingSim &s, int frames)
     size_t pi = 0;
     int left = 0;
     fps_core_output o{};
+    uint64_t ts = T0, last_unique_src = 0;
     for (int k = 0; k < frames; k++) {
+        if (s.vrr)
+            left = 0;
         if (left == 0) { // a new game frame
             for (auto &v : f.buf)
                 v = (uint8_t)(32 + rnd() % 160);
@@ -1775,14 +1800,45 @@ static PacingRun run_pacing(const PacingSim &s, int frames)
         bool lost = false;
         for (int l : s.lost)
             lost = lost || l == k;
-        uint64_t ts = T0 + (uint64_t)k * s.period_ns;
+        if (k > 0)
+            ts += s.vrr ? 8000000 + rnd() % 17000000
+                        : (s.rate_change_at >= 0 && k >= s.rate_change_at ? s.period2_ns : s.period_ns);
         if (lost)
             continue;
         int64_t jit = s.jitter_us ? ((int64_t)(rnd() % (2 * s.jitter_us + 1)) - s.jitter_us) * 1000 : 0;
         uint64_t now = ts + 3000000 + (uint64_t)(jit + 2000000); // the filter sees it a bit later
+        int64_t tsj = 0;
+        if (s.ts_jitter_us)
+            tsj = (s.ts_jitter_kind == 1 ? ((k & 1) ? 1 : -1) * (int64_t)s.ts_jitter_us
+                                         : (int64_t)(rnd() % (2 * s.ts_jitter_us + 1)) - s.ts_jitter_us) *
+                  1000;
         fps_frame_view v = f.view();
-        v.src_ts_ns = s.sync ? 0 : ts;
+        const uint64_t src = s.sync ? 0 : (uint64_t)((int64_t)ts + tsj);
+        v.src_ts_ns = src;
         fps_core_feed(c, &v, now);
+        fps_core_frame_debug d;
+        fps_core_debug_last_frame(c, &d);
+        if (d.sample_written) {
+            pr.samples++;
+            pr.snapped += d.pacing_snapped ? 1 : 0;
+            pr.sample_k.push_back(k);
+            pr.snap.push_back(d.pacing_snapped);
+            pr.each.push_back(d.pacing_ms);
+            pr.each_gap.push_back(d.pacing_gap);
+            pr.grid_t.push_back(d.grid_t_valid ? (double)d.grid_t_ns / 1e6 : -1.0);
+            pr.grid_ft_each.push_back(d.grid_ft_ms);
+            pr.now_t.push_back((double)now / 1e6);
+            pr.now_ft.push_back(d.ft_ms);
+            if (d.grid_t_valid) {
+                pr.grid_ft.push_back(d.grid_ft_ms);
+                double off = fabs((double)d.grid_t_ns - (double)now) / 1e6;
+                if (off > pr.grid_t_max_off_ms)
+                    pr.grid_t_max_off_ms = off;
+            }
+            pr.raw.push_back(last_unique_src && src > last_unique_src ? (double)(src - last_unique_src) / 1e6 : 0.0);
+        }
+        if (d.unique)
+            last_unique_src = src;
         fps_core_tick(c, now, &o);
     }
     for (int i = 0; i < o.graph_count; i++) {
@@ -1862,6 +1918,141 @@ static void s25_frame_pacing(Runner &r)
             whole = whole && fabs(k - round(k)) < 1e-6 && (round(k) == 2 || round(k) == 3);
         }
         r.check(whole, "sync path with clock jitter: every sample a whole 2 or 3 periods");
+    }
+    {   // a card that stamps with jitter (Avermedia GC573: +-1.6 ms, alternating): once the
+        // signal grid holds, every sample is exactly 2 periods, though the raw timestamp
+        // differences are 33.37 +- 3.2 ms; the framerate graph's edges come from the grid
+        PacingSim s;
+        s.ts_jitter_us = 1600;
+        s.ts_jitter_kind = 2;
+        s.jitter_us = 2000;
+        PacingRun pr = run_pacing(s, 1200);
+        bool exact = pr.each.size() > 500, rawbad = false, allsnap = true, ftok = true;
+        for (size_t i = 60; i < pr.each.size(); i++) {
+            exact = exact && fabs(pr.each[i] - 2 * P) < 0.02;
+            rawbad = rawbad || fabs(pr.raw[i] - 2 * P) > 2.0;
+            allsnap = allsnap && pr.snap[i];
+        }
+        // the analysis clock jitters (+-2 ms here): the fitted line's newest point settles
+        // over the first seconds; from frame 600 on the edges are within 0.03 ms
+        double ft_worst = 0.0;
+        for (size_t i = 0; i < pr.each.size(); i++)
+            if (pr.grid_t[i] >= 0.0 && pr.sample_k[i] >= 600)
+                ft_worst = std::max(ft_worst, fabs(pr.grid_ft_each[i] - 2 * P));
+        ftok = ft_worst < 0.03;
+        r.check(exact && rawbad && allsnap,
+                "jittery timestamps (+-1.6 ms): every sample from the 60th on is 33.37 ms (+-0.02) on the grid "
+                "(raw differences off by > 2 ms: %s)", rawbad ? "yes" : "no");
+        r.check(pr.grid_ft.size() > 500 && ftok && pr.grid_t_max_off_ms < P / 2,
+                "jittery timestamps: %zu grid frame times 33.37 ms within %.4f, grid time within %.2f ms of the analysis clock",
+                pr.grid_ft.size(), ft_worst, pr.grid_t_max_off_ms);
+        // the framerate graph: on the grid's edges FPS(t) stays at 29.97; on the raw ones it wobbles
+        auto spread = [&](bool grid) {
+            plot_ring_clear(&g_s25_ring);
+            for (size_t i = 0; i < pr.each.size(); i++) {
+                if (grid && pr.grid_t[i] < 0.0)
+                    continue;
+                plot_sample ps = {};
+                ps.t_ms = grid ? pr.grid_t[i] : pr.now_t[i];
+                ps.ft_ms = grid ? pr.grid_ft_each[i] : pr.now_ft[i];
+                plot_ring_push(&g_s25_ring, &ps);
+            }
+            if (g_s25_ring.count < 2)
+                return -1.0;
+            const plot_sample *last = plot_ring_at(&g_s25_ring, g_s25_ring.count - 1);
+            double lo = 1e9, hi = -1e9;
+            for (double t = last->t_ms - 8000.0; t <= last->t_ms; t += 7.3) {
+                double v = plot_fps_at(&g_s25_ring, t, last->t_ms);
+                lo = std::min(lo, v);
+                hi = std::max(hi, v);
+            }
+            return hi - lo;
+        };
+        const double sg = spread(true), sr = spread(false);
+        r.check(sg < 0.01 && sr > 0.05,
+                "framerate graph: FPS(t) spread %.4f on the grid, %.4f on the raw arrival times", sg, sr);
+    }
+    {   // random timestamp jitter and uneven game pacing: whole periods only
+        PacingSim s;
+        s.ts_jitter_us = 1600;
+        s.ts_jitter_kind = 2;
+        s.pattern = {1, 3, 2};
+        PacingRun pr = run_pacing(s, 1200);
+        bool whole = pr.each.size() > 400;
+        for (size_t i = 60; i < pr.each.size(); i++) {
+            double k = round(pr.each[i] / P);
+            whole = whole && pr.snap[i] && fabs(pr.each[i] - k * P) < 0.02 && k >= 1 && k <= 3;
+        }
+        r.check(whole, "random jitter, 16.7/50/33.4 pacing: every sample a whole 1-3 periods");
+    }
+    {   // jitter and frames lost by the card: still flagged, the value whole periods
+        PacingSim s;
+        s.ts_jitter_us = 1600;
+        s.lost = {401, 500};
+        PacingRun pr = run_pacing(s, 1200);
+        int gaps = 0;
+        bool whole = true;
+        for (size_t i = 60; i < pr.each.size(); i++) {
+            gaps += pr.each_gap[i] ? 1 : 0;
+            double k = round(pr.each[i] / P);
+            whole = whole && pr.snap[i] && fabs(pr.each[i] - k * P) < 0.02;
+            if (!pr.each_gap[i])
+                whole = whole && fabs(pr.each[i] - 2 * P) < 0.02;
+        }
+        r.check(gaps == 4 && whole, "jitter with lost frames: %d samples flagged (4), all whole periods", gaps);
+    }
+    {   // VRR / a camera: no common period, the grid never holds, the raw differences stay
+        PacingSim s;
+        s.vrr = true;
+        PacingRun pr = run_pacing(s, 900);
+        bool raw = pr.each.size() > 500;
+        for (size_t i = 1; i < pr.each.size(); i++)
+            raw = raw && fabs(pr.each[i] - pr.raw[i]) < 1e-6;
+        r.check(raw && pr.snapped == 0,
+                "VRR source: %d of %d samples on the grid (0), every sample the raw difference", pr.snapped, pr.samples);
+    }
+    {   // the signal changes rate (59.94 -> 50 Hz) under jitter: the grid starts over, nothing
+        // wrong is counted meanwhile, and it holds again on the new period
+        PacingSim s;
+        s.ts_jitter_us = 1600;
+        s.rate_change_at = 600;
+        s.period2_ns = 20000000;
+        PacingRun pr = run_pacing(s, 1500);
+        bool ok = true;
+        int after = 0;
+        for (size_t i = 0; i < pr.each.size(); i++) {
+            if (!pr.snap[i])
+                continue;
+            const int k = pr.sample_k[i];
+            if (k < 600)
+                ok = ok && fabs(pr.each[i] - 2 * P) < 0.02;
+            else if (k >= 602)
+                ok = ok && fabs(pr.each[i] - 40.0) < 0.02;
+            else // the frame across the change (P + 20 ms): still on the old grid, off by
+                 // less than FPS_GRID_MAX_RES periods; the next frames are off it and reset it
+                ok = ok && fabs(pr.each[i] - (P + 20.0)) < FPS_GRID_MAX_RES * P;
+            after += k >= 602 ? 1 : 0;
+        }
+        r.check(ok && after > 200, "59.94 -> 50 Hz: grid samples exact on both sides, %d after the change", after);
+    }
+    {   // a small change (59.94 -> 60 Hz) under jitter: the grid follows, every grid sample
+        // within 0.05 ms of the true value
+        PacingSim s;
+        s.ts_jitter_us = 1600;
+        s.rate_change_at = 600;
+        PacingRun pr = run_pacing(s, 2400);
+        double worst = 0.0;
+        int after = 0;
+        for (size_t i = 0; i < pr.each.size(); i++) {
+            const int k = pr.sample_k[i];
+            if (!pr.snap[i] || k == 600 || k == 601)
+                continue;
+            const double want = k < 600 ? 2 * P : 2 * 16.666667;
+            worst = std::max(worst, fabs(pr.each[i] - want));
+            after += k >= 602 ? 1 : 0;
+        }
+        r.check(worst < 0.05 && after > 300,
+                "59.94 -> 60 Hz: grid samples within %.4f ms (< 0.05), %d after the change", worst, after);
     }
     {   // reset: the graphs empty, the capture-path verdicts stay
         fps_core_params p = fps_core_params_defaults();
@@ -2611,6 +2802,23 @@ static void s23_capture_beat(Runner &r)
         r.check(old.first_detect_s > 0, "60 into 60 with loss bursts, jitter %.1f ms, no timestamps: the old false "
                 "alarm (at %.1f s)", jit, old.first_detect_s);
     }
+    {   // the same with a card that stamps with jitter (GC573, +-1.6 ms): the arrival rate
+        // comes from the signal grid (a median of 15 jittery intervals is a few % off),
+        // so the false alarm is still removed
+        BeatSim s;
+        s.card = false;
+        s.src_hz = 60.0;
+        s.jitter_ms = 0.5;
+        s.ts_jitter_ms = 1.6;
+        s.loss_every_s = 1001.0 / 60.0;
+        s.loss_len_s = 2.5;
+        s.loss_p = 0.3;
+        BeatRun br = run_beat(s, 300);
+        b_report(r, "obs 60->60 + loss bursts, jittery stamps", br);
+        r.check(!br.beat.detected && br.first_detect_s < 0 && fabs(br.beat.arrival_hz - 60.0) < 0.01,
+                "60 into 60, loss bursts, stamps +-1.6 ms: no beat (false alarm at %.1f s), arrival %.4f Hz",
+                br.first_detect_s, br.beat.arrival_hz);
+    }
     {   // the same through a card at 60: identical frames and timestamp gaps only,
         // no empty tick (capture clusters)
         BeatSim s;
@@ -2655,6 +2863,14 @@ static void s23_capture_beat(Runner &r)
         BeatRun ob = run_beat(o, 300);
         r.check(ob.status == br.status, "59.94 into 60 with a card losing frames: second by second as without "
                 "the timestamp checks");
+        // and with jittery stamps: still detected, at the right arrival rate
+        BeatSim j = s;
+        j.ts_jitter_ms = 1.6;
+        BeatRun bj = run_beat(j, 300);
+        r.check(bj.first_detect_s > 0 && bj.first_detect_s < 70 && bj.first_beat.nominal_hz == ntsc60 &&
+                    fabs(bj.first_beat.arrival_hz - 60000.0 / 1001.0) < 0.01,
+                "59.94 into 60, losses, stamps +-1.6 ms: beat at 59.94 after %.0f s (arrival %.4f Hz)",
+                bj.first_detect_s, bj.first_beat.arrival_hz);
     }
     {   // card at exactly 60: nothing
         BeatSim s;

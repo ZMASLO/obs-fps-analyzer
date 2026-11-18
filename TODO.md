@@ -5,7 +5,7 @@
 Dzisiejsze nagrania w `plugins/fps-analyzer/tests/traces` (fpstrace v4, PS5) obejmują tylko Elgato 4K X i 4K Mk2. Każda kolejna karta nagrana z grą w 30 FPS zostaje na stałe w zestawie i pilnuje, że plugin ocenia ją poprawnie: blokuje FPS przy karcie, która zmienia klatki, a przy dobrej karcie pokazuje prawidłowe 30.
 
 - [ ] **Elgato HD60 X:** gra w 30 FPS, menu konsoli, zapauzowana gra
-- [ ] **Avermedia Live Gamer 4K:** jak wyżej
+- [x] **Avermedia Live Gamer 4K (GC573)** (18.11.2026): gra w 30 FPS, `tests/traces/gc573_nv12_game30_v4.csv`, działa. Karta stempluje z drganiem ±1,6 ms, od 0.6.1 wykresy liczą na siatce okresów sygnału. Zostały: menu konsoli, zapauzowana gra
 - [ ] inne karty zgłoszone przez użytkowników (README prosi o ślad z gry w 30 FPS)
 
 Jak nagrać: filtr → Debug options → „Record FPS trace (per-frame CSV)”, ok. 20 s. Plik trafia do `tests/traces/<karta>_<format>_<scena>_v4.csv`. W `tests/cases.txt` dopisz wpis `self, notblocked, fps@3-20=30+-1` (dobra karta) albo `self, blocked=altered` (karta zmieniająca klatki). W README uzupełnij listę „Supported capture devices”.

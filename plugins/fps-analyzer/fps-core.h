@@ -314,6 +314,10 @@ struct fps_core_frame_debug {
     double ft_ms, ema, fps_pf;     // valid when sample_written
     double pacing_ms;              // frame pacing sample, valid when sample_written
     bool pacing_gap;               // ... with a frame lost by the capture device
+    bool pacing_snapped;           // ... counted in whole periods of the signal grid
+    bool grid_t_valid;             // grid_t_ns / grid_ft_ms valid (with sample_written)
+    uint64_t grid_t_ns;            // this new frame on the signal grid, analysis clock
+    double grid_ft_ms;             // grid time since the previous new frame
     int pos, count;
     bool deltas_valid;             // compared and params.measure_histogram
     uint32_t deltas[FPS_CORE_DELTA_BUCKETS]; // bytes per |d| bucket; deltas[0] = luma_size - diff
@@ -337,6 +341,29 @@ bool fps_core_frames_altered(const struct fps_core *c);
 // when it recreates the core for an FPS trace, so starting a trace on a
 // frame-altering device does not show its FPS while the new core re-learns.
 void fps_core_inherit_altered(struct fps_core *c);
+
+// --- Signal grid (0.6.1) ---
+//
+// A capture card delivers a fixed-refresh signal: a game frame stays on
+// screen for a whole number of refresh periods. Some cards stamp their frames
+// with jitter (Avermedia GC573, 18.11.2026: +-1.6 ms around a perfect
+// 16.683 ms grid, the errors cancelling from one frame to the next), so the
+// raw difference of two timestamps is not the time a frame was shown. The
+// core numbers every delivered frame by its refresh period - a least-squares
+// line of the device timestamps on the period number, so the period comes
+// from the whole run and not from a few jittery intervals - and, once the
+// grid holds, reports frame pacing as whole periods (exact, not rounded off
+// the measurement: nothing in between exists on the signal). It also gives
+// the beat check its frame rate and the framerate graph its frame edges.
+// The grid holds after FPS_GRID_MIN_FRAMES frames when none of the last
+// FPS_GRID_CLEAN_FRAMES lay more than FPS_GRID_MAX_RES periods off the line;
+// FPS_GRID_RESET_RUN such frames in a row (the signal changed rate, a camera,
+// VRR) start it over. Until it holds the raw timestamps are used, as before.
+#define FPS_GRID_MIN_FRAMES 31
+#define FPS_GRID_CLEAN_FRAMES 60
+#define FPS_GRID_MAX_RES 0.25
+#define FPS_GRID_RESET_RUN 3
+#define FPS_GRID_TIME_MIN_FRAMES 120 // the framerate graph's edges: the analysis clock jitters more
 
 // --- Dropped frames (who lost them: the capture device or OBS) ---
 //

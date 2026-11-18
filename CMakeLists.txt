@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(obs-fps-analyzer VERSION 0.6.0)
+project(obs-fps-analyzer VERSION 0.6.1)
 
 enable_testing()
 

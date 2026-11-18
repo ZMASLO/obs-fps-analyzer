@@ -38,6 +38,8 @@
 #                                [A, B) seconds not flagged as a capture loss is V ms within T
 #                 pacinggaps=N | pacinggaps>0  samples flagged because the capture
 #                                device lost a frame
+#                 arrival=V+-T   traces only: the beat check's frame arrival rate at the end
+#                                of the trace is V Hz within T
 #                 clear<=S       traces only (v3): the signal check said CLEAR
 #                                within S seconds of the start
 #                 prefix "xfail:" marks a known limitation: reported, but not
@@ -115,3 +117,8 @@ trace:traces/mk2_yuy2_pc_nvidia_default_full_v4.csv ; ; self, blocked=altered, n
 # Starting a trace on a device already blocked (18.11.2026, 0.6.0): the fresh core inherits the verdict
 # (header altered=1), so the FPS stays hidden from the first frame of the trace on
 trace:traces/4kx_nv12_trace_start_altered_v4.csv ; ; self, blocked=altered ; Elgato 4K X, NV12 4K, PS5 (GTA V at 60), trace started while blocked: hidden from the first frame
+# Avermedia Live Gamer 4K (GC573) (18.11.2026, PS5 at 59.94 Hz, a game at 30 FPS): every repeat identical,
+# no losses, but the card stamps its frames with +-1.6 ms of jitter around the 16.683 ms grid. Frame pacing
+# is counted on the signal grid (0.6.1): a steady 33.37 instead of 32.5-34.9 ms, and the beat check's
+# arrival rate is 59.94 (from a median of 15 jittery intervals it read 58.13).
+trace:traces/gc573_nv12_game30_v4.csv ; ; self, notblocked, fps@3-28=30+-1, pacing@3-28=33.37+-0.02, pacinggaps=0, nodrops, nobeat, arrival=59.94+-0.01 ; Avermedia GC573, NV12 4K, PS5 game at 30 FPS: jittery timestamps, reads 30

@@ -25,7 +25,7 @@ extern struct obs_source_info fps_overlay_source_info;
 
 #define FPS_CSV_HISTORY_LIMIT 300
 // Version stamped into FPS trace headers (see trace_note_frame)
-#define FPS_TRACE_PLUGIN_VERSION "0.6.0"
+#define FPS_TRACE_PLUGIN_VERSION "0.6.1"
 
 // Dodaj enum do wyboru metody analizy
 typedef enum {
@@ -782,8 +782,10 @@ static void analyze_frame(struct fps_analyzer_filter *filter, const struct fps_f
     fps_core_debug_last_frame(filter->core, &d);
     if (d.sample_written && g_fps_shared.blocked_reason == FPS_BLOCK_NONE) {
         struct plot_sample s;
-        s.t_ms = (double)now / 1e6;
-        s.ft_ms = d.ft_ms;
+        // on the signal grid when it holds: frame edges without the card's or
+        // the system's jitter (GC573), so the framerate line stays flat
+        s.t_ms = d.grid_t_valid ? (double)d.grid_t_ns / 1e6 : (double)now / 1e6;
+        s.ft_ms = d.grid_t_valid ? d.grid_ft_ms : d.ft_ms;
         s.ema_ms = d.ema;
         s.fps_pf = d.fps_pf;
         s.pacing_ms = d.pacing_ms;
@@ -1542,7 +1544,7 @@ static void *fps_analyzer_create(obs_data_t *settings, obs_source_t *context)
 static const char *fps_analyzer_get_name(void *unused)
 {
     UNUSED_PARAMETER(unused);
-    return "FPS Analyzer 0.6.0";
+    return "FPS Analyzer 0.6.1";
 }
 
 // --- Properties ---

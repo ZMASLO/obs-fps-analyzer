@@ -1016,6 +1016,19 @@ static int run_manifest(const fs::path &manifest, double tol, bool verbose, bool
                     ok = ok && good;
                     continue;
                 }
+                // "arrival=V+-T": the beat check's frame arrival rate at the end of the
+                // trace (Hz), V within T
+                if (spec.rfind("arrival=", 0) == 0) {
+                    char *end = nullptr;
+                    double want = strtod(spec.c_str() + 8, &end), tol = 0.0;
+                    if (end && strncmp(end, "+-", 2) == 0)
+                        tol = strtod(end + 2, nullptr);
+                    const double got = r.beat.arrival_hz;
+                    bool good = got > 0.0 && fabs(got - want) <= tol;
+                    printf("  %s %s: %.4f Hz\n", good ? "[ok]" : "[FAIL]", spec.c_str(), got);
+                    ok = ok && good;
+                    continue;
+                }
                 // "clear<=45": the signal check ended CLEAR within 45 s
                 if (spec.rfind("clear<=", 0) == 0) {
                     double lim = strtod(spec.c_str() + 7, nullptr);

@@ -77,7 +77,6 @@ $mutations = @(
     # Serie strat karty nie sa dudnieniem (PC -> 4K Mk2, 18.11.2026)
     @{ name = "dudnienie: brak kontroli przychodzenia"; find = 'out->arrival_rejected = true;' + $nl + '                continue;'; repl = 'out->arrival_rejected = true;' },
     @{ name = "dudnienie: prog przychodzenia 0";      find = 'fabs(delivery_hz - out->arrival_hz) < FPS_BEAT_ARRIVAL_MIN_FRAC / period'; repl = 'fabs(delivery_hz - out->arrival_hz) < 0.0 / period' },
-    @{ name = "dudnienie: przychodzenie z mediany";   find = 'if (c->src_iv[i] * 2 < shortest * 3)'; repl = 'if (true)' },
     @{ name = "dudnienie: klaster ze stratami liczony"; find = 'if (!b.cluster_obs && b.cluster_lossy) {'; repl = 'if (false) {' },
     @{ name = "dudnienie: strata w klastrze nie oznacza"; find = 'if (b.in_cluster)' + $nl + '            b.cluster_lossy = true;'; repl = '(void)0;' },
     # Sprawdzanie sygnalu: "OK" dopiero, gdy rozjazd 59.94/60 jest wykluczony
@@ -122,13 +121,13 @@ $mutations = @(
     @{ name = "frametime: FPS zamiast czasu klatki";      file = "plot-layout.cpp"; find = '    return fps > 0.0 ? 1000.0 / fps : 1e9;'; repl = '    return fps;' },
     @{ name = "frametime: zero przy braku klatek";        file = "plot-layout.cpp"; find = '    return fps > 0.0 ? 1000.0 / fps : 1e9;'; repl = '    return fps > 0.0 ? 1000.0 / fps : 0.0;' },
     # Gubione klatki: kto zgubil (karta / OBS), przytrzymanie, zrodlo zmienne
-    @{ name = "utraty: pusty takt przed dziura ignorowany"; find = 'if (c->last_empty_tick && c->tick_no - c->last_empty_tick <= FPS_DROPS_EMPTY_TICK_LOOKBACK) {'; repl = 'if (false) {' },
-    @{ name = "utraty: pusty takt po dziurze ignorowany";  find = '        if (empty)' + "`n" + '            drops_record(c, g.n, true, now);'; repl = '        if (false)' + "`n" + '            drops_record(c, g.n, true, now);' },
+    @{ name = "utraty: pusty takt przed dziura ignorowany"; find = 'c->last_empty_tick && c->tick_no - c->last_empty_tick <= FPS_DROPS_EMPTY_TICK_LOOKBACK;'; repl = 'false;' },
+    @{ name = "utraty: pusty takt po dziurze ignorowany";  find = 'g.empty_seen = g.empty_seen || empty;'; repl = 'g.empty_seen = g.empty_seen;' },
     @{ name = "utraty: okno 3 taktow na 0";                find = '        else if (c->tick_no - g.tick > FPS_DROPS_EMPTY_TICK_LOOKBACK)'; repl = '        else if (c->tick_no - g.tick > 0)' },
     @{ name = "utraty: karta zamiast OBS";                 find = '            drops_record(c, g.n, false, now);'; repl = '            drops_record(c, g.n, true, now);' },
     @{ name = "utraty: bez przytrzymania";                 find = 'now_ns - c->last_drop_ns < FPS_DROPS_HOLD_NS'; repl = 'now_ns - c->last_drop_ns < 1' },
     @{ name = "utraty: zrodlo zmienne liczone";            find = 'c->drops_variable = drops_source_variable(c, median);'; repl = 'c->drops_variable = false;' },
-    @{ name = "utraty: bez rozgrzewki 30 odstepow";        find = 'if (c->params.detect_drops && c->iv60_n >= 30) {'; repl = 'if (c->params.detect_drops && c->iv60_n >= 0) {' },
+    @{ name = "utraty: bez rozgrzewki 30 odstepow";        find = 'if (c->params.detect_drops && c->iv60_n >= 30 && iv <= FPS_DROPS_MAX_GAP_NS) {'; repl = 'if (c->params.detect_drops && c->iv60_n >= 0 && iv <= FPS_DROPS_MAX_GAP_NS) {' },
     @{ name = "utraty: przerwa w strumieniu liczona";     find = ' && iv <= FPS_DROPS_MAX_GAP_NS) {'; repl = ') {' },
     @{ name = "utraty: liczba klatek w dziurze";           find = 'int lost = (int)((iv + median / 2) / median) - 1;'; repl = 'int lost = 1;' },
     # Szybkie porownanie klatek (SSE2): musi dawac wynik zwyklej petli bit w bit
@@ -136,7 +135,18 @@ $mutations = @(
     @{ name = "porownanie: |a-b| tylko w jedna strone";    find = '__m128i d = _mm_or_si128(_mm_subs_epu8(va, vb), _mm_subs_epu8(vb, va)); // |a - b|'; repl = '__m128i d = _mm_subs_epu8(va, vb);' },
     @{ name = "porownanie: licznik bajtowy bez oprozniania"; find = "        if (blocks > 255)`n            blocks = 255;"; repl = "        if (blocks > 300)`n            blocks = 300;" },
     @{ name = "porownanie: ogon pominiety";                find = '    diff += count_diff_max_scalar(a + i, b + i, size - i, &tail_max);'; repl = '    tail_max = 0;' },
-    @{ name = "porownanie: maksimum z jednego pasa";       find = '    for (int l = 0; l < 16; l++)' + "`n" + '        mx = lanes[l] > mx ? lanes[l] : mx;'; repl = '    mx = lanes[0];' }
+    @{ name = "porownanie: maksimum z jednego pasa";       find = '    for (int l = 0; l < 16; l++)' + "`n" + '        mx = lanes[l] > mx ? lanes[l] : mx;'; repl = '    mx = lanes[0];' },
+    # Siatka okresow sygnalu (0.6.1): karta stemplujaca z drganiem (GC573)
+    @{ name = "siatka: nigdy pewna";                       find = 'return g.active && g.n >= FPS_GRID_MIN_FRAMES && g.since_bad >= FPS_GRID_CLEAN_FRAMES;'; repl = 'return false;' },
+    @{ name = "siatka: pewna od razu po klatce obok";      find = 'return g.active && g.n >= FPS_GRID_MIN_FRAMES && g.since_bad >= FPS_GRID_CLEAN_FRAMES;'; repl = 'return g.active && g.n >= FPS_GRID_MIN_FRAMES;' },
+    @{ name = "siatka: prog residuum 0.25 na 0.6";         find = 'if (fabs(res) < FPS_GRID_MAX_RES * p) {'; repl = 'if (fabs(res) < 0.6 * p) {' },
+    @{ name = "siatka: bez resetu po 3 klatkach";          find = 'if (++g.bad_run >= FPS_GRID_RESET_RUN) {'; repl = 'if (++g.bad_run >= 1000000) {' },
+    @{ name = "siatka: okres z pierwszego przyblizenia";   find = 'return (g.n >= 10.0 && g.cxx > 0.0) ? g.cxy / g.cxx : g.p0_ms;'; repl = 'return g.p0_ms;' },
+    @{ name = "siatka: pierwsze przyblizenie z mediany";   find = 'g.p0_ms = (m ? sum / m : (double)median_ns) / 1e6;'; repl = 'g.p0_ms = (double)median_ns / 1e6;' },
+    @{ name = "siatka: pacing z surowych znacznikow";      find = 'return (double)(c->grid.index - c->lu_grid_index) * grid_period_ms(c->grid);'; repl = 'return (double)(c->src_ts - c->last_unique_src_ts) / 1e6;' },
+    @{ name = "siatka: tempo dudnienia z 1. przyblizenia"; find = 'return p > 0.0 ? 1e3 / p * ratio : 0.0;'; repl = 'return c->grid.p0_ms > 0.0 ? 1e3 / c->grid.p0_ms * ratio : 0.0;' },
+    @{ name = "siatka: czas wykresu nigdy z siatki";       find = 'g.cur_t_valid = true;'; repl = 'g.cur_t_valid = false;' },
+    @{ name = "siatka: czas wykresu z ostatniej klatki";   find = 'const double gt = g.tmy + slope * ((double)g.index - g.tmx);'; repl = 'const double gt = t;' }
 )
 
 function Run-Layer([string]$exe, [string[]]$argv) {

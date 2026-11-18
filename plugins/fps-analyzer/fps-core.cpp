@@ -144,6 +144,33 @@ struct fps_core {
         bool cluster_lossy = false;    // the open cluster had a gap in it (or just before it)
         int lossy_clusters = 0;        // capture clusters discarded for that (diagnostic)
     } beat;
+
+    // The signal's refresh grid (see FPS_GRID_MIN_FRAMES): every delivered
+    // frame's device timestamp as a whole period number, fitted to a line
+    struct signal_grid {
+        bool active = false;
+        uint32_t epoch = 0;            // bumped on every reset
+        uint64_t anchor_ts = 0;        // device timestamp of period 0
+        uint64_t anchor_now = 0;       // analysis clock of period 0 (0 = not yet seen)
+        int64_t index = 0;             // the current frame's period number
+        double p0_ms = 0.0;            // first period estimate (median interval)
+        // device timestamp (ms from anchor_ts) on the period number (Welford)
+        double n = 0, mx = 0, my = 0, cxx = 0, cxy = 0;
+        // analysis clock (ms from anchor_now) on the period number
+        double tn = 0, tmx = 0, tmy = 0, tcxx = 0, tcxy = 0;
+        int bad_run = 0;               // consecutive frames off the grid
+        int since_bad = 1 << 30;       // frames since the last one off the grid
+        bool frame_bad = false;        // the current frame is off the grid
+        bool time_pending = false;     // the current frame still needs its analysis time
+        bool cur_t_valid = false;      // cur_t_ns: the current frame's grid time
+        uint64_t cur_t_ns = 0;
+    } grid;
+    // the grid position of the previous new frame
+    bool lu_grid_ok = false;
+    uint32_t lu_grid_epoch = 0;
+    int64_t lu_grid_index = 0;
+    bool lu_grid_t_valid = false;
+    uint64_t lu_grid_t_ns = 0;
 };
 
 // --- Small helpers ---
@@ -552,11 +579,12 @@ static int beat_find(const struct fps_core::beat_state &b, bool obs, double t, d
 // frame rate (median timestamp interval) scaled by how its clock runs against
 // the analysis clock, over the whole check. 0 = unknown (no timestamps, under
 // FPS_BEAT_ARRIVAL_MIN_S watched, or timestamps that do not follow the clock).
+static double grid_period_ms(const struct fps_core::signal_grid &g);
+
 static double beat_arrival_hz(const struct fps_core *c)
 {
     const auto &b = c->beat;
-    if (!b.arr_first_now || b.arr_last_now <= b.arr_first_now || b.arr_last_ts <= b.arr_first_ts ||
-        c->src_iv_n < 5)
+    if (!b.arr_first_now || b.arr_last_now <= b.arr_first_now || b.arr_last_ts <= b.arr_first_ts)
         return 0.0;
     const double span_now = (double)(b.arr_last_now - b.arr_first_now);
     if (span_now < FPS_BEAT_ARRIVAL_MIN_S * 1e9)
@@ -570,18 +598,15 @@ static double beat_arrival_hz(const struct fps_core *c)
     const double ratio = 1.0 / slope;
     if (ratio < 0.9 || ratio > 1.1)
         return 0.0;
-    // The device's frame period: the median of the recent intervals that are
-    // single periods. Lost frames only lengthen an interval, so inside a burst
-    // of losses (more than half of them doubled) the plain median would be two.
-    const uint64_t shortest = *std::min_element(c->src_iv, c->src_iv + c->src_iv_n);
-    uint64_t tmp[15];
-    int m = 0;
-    for (int i = 0; i < c->src_iv_n; i++)
-        if (c->src_iv[i] * 2 < shortest * 3)
-            tmp[m++] = c->src_iv[i];
-    std::nth_element(tmp, tmp + m / 2, tmp + m);
-    const uint64_t period = tmp[m / 2];
-    return period ? 1e9 / (double)period * ratio : 0.0;
+    // The device's frame period from the signal grid: a line through all its
+    // timestamps (lost frames only skip period numbers). Until 0.6.1 this was a
+    // median of the last 15 single intervals, which a card stamping with jitter
+    // (GC573, +-1.6 ms) put a few percent off (58.13 Hz for 59.94). No grid
+    // (a source without a common period): unknown, the test is skipped.
+    if (!c->grid.active || c->grid.n < FPS_GRID_MIN_FRAMES)
+        return 0.0;
+    const double p = grid_period_ms(c->grid);
+    return p > 0.0 ? 1e3 / p * ratio : 0.0;
 }
 
 // The confirmed-beat search: fills the beat fields of `out` and sets
@@ -865,6 +890,127 @@ static void drops_on_tick(struct fps_core *c, uint64_t now, bool empty)
     c->gap_wait_n = keep;
 }
 
+// --- Signal grid (see FPS_GRID_MIN_FRAMES) ---
+
+static double grid_period_ms(const struct fps_core::signal_grid &g)
+{
+    return (g.n >= 10.0 && g.cxx > 0.0) ? g.cxy / g.cxx : g.p0_ms;
+}
+
+static bool grid_locked(const struct fps_core *c)
+{
+    const auto &g = c->grid;
+    return g.active && g.n >= FPS_GRID_MIN_FRAMES && g.since_bad >= FPS_GRID_CLEAN_FRAMES;
+}
+
+static void grid_reset(struct fps_core *c)
+{
+    const uint32_t epoch = c->grid.epoch + 1;
+    c->grid = fps_core::signal_grid();
+    c->grid.epoch = epoch;
+}
+
+static void grid_fit(double &n, double &mx, double &my, double &cxx, double &cxy, double x, double y)
+{
+    n += 1.0;
+    const double dx = x - mx;
+    mx += dx / n;
+    my += (y - my) / n;
+    cxx += dx * (x - mx);
+    cxy += dx * (y - my);
+}
+
+// period 0 at this frame; median_ns: the recent median interval
+static void grid_start(struct fps_core *c, uint64_t median_ns)
+{
+    grid_reset(c);
+    auto &g = c->grid;
+    g.active = true;
+    g.anchor_ts = c->src_ts;
+    // First period: the mean of the recent single intervals. Not the median:
+    // with alternating jitter (+-j, -+j) the median is one of the two
+    // lengths, P - 2j or P + 2j; their mean is P. Lost frames (2x) are left out.
+    double sum = 0.0;
+    int m = 0;
+    for (int i = 0; i < c->src_iv_n; i++)
+        if (c->src_iv[i] * 2 > median_ns && c->src_iv[i] * 2 < median_ns * 3) {
+            sum += (double)c->src_iv[i];
+            m++;
+        }
+    g.p0_ms = (m ? sum / m : (double)median_ns) / 1e6;
+    grid_fit(g.n, g.mx, g.my, g.cxx, g.cxy, 0.0, 0.0);
+    g.time_pending = true;
+}
+
+// Every delivered frame with a device timestamp (pacing_note_frame)
+static void grid_note_frame(struct fps_core *c, uint64_t iv, uint64_t median_ns)
+{
+    auto &g = c->grid;
+    g.time_pending = false;
+    if (!g.active) {
+        if (median_ns)
+            grid_start(c, median_ns);
+        return;
+    }
+    if (iv == 0 || iv > FPS_DROPS_MAX_GAP_NS) { // timestamps restarted, stream interrupted
+        if (median_ns)
+            grid_start(c, median_ns);
+        else
+            grid_reset(c);
+        return;
+    }
+    const double p = grid_period_ms(g);
+    const double y = (double)(c->src_ts - g.anchor_ts) / 1e6;
+    const double b = g.my - p * g.mx;
+    int64_t idx = (int64_t)llround((y - b) / p);
+    if (idx <= g.index)
+        idx = g.index + 1;
+    const double res = y - (b + p * (double)idx);
+    g.index = idx;
+    if (fabs(res) < FPS_GRID_MAX_RES * p) {
+        grid_fit(g.n, g.mx, g.my, g.cxx, g.cxy, (double)idx, y);
+        g.bad_run = 0;
+        g.frame_bad = false;
+        if (g.since_bad < (1 << 30))
+            g.since_bad++;
+    } else {
+        g.frame_bad = true;
+        g.since_bad = 0;
+        if (++g.bad_run >= FPS_GRID_RESET_RUN) {
+            grid_start(c, median_ns ? median_ns : (uint64_t)(p * 1e6));
+            return;
+        }
+    }
+    g.time_pending = true;
+}
+
+// The current frame's analysis time (once per delivered frame, before the
+// frame is analysed): fits the analysis clock on the period number, so the
+// grid time follows the analysis clock without its jitter.
+static void grid_note_time(struct fps_core *c, uint64_t now)
+{
+    auto &g = c->grid;
+    g.cur_t_valid = false;
+    if (!g.time_pending)
+        return;
+    g.time_pending = false;
+    if (!g.anchor_now)
+        g.anchor_now = now;
+    if (now < g.anchor_now)
+        return;
+    const double t = (double)(now - g.anchor_now) / 1e6;
+    if (!g.frame_bad)
+        grid_fit(g.tn, g.tmx, g.tmy, g.tcxx, g.tcxy, (double)g.index, t);
+    if (!grid_locked(c) || g.tn < FPS_GRID_TIME_MIN_FRAMES || g.tcxx <= 0.0)
+        return;
+    const double slope = g.tcxy / g.tcxx;
+    const double gt = g.tmy + slope * ((double)g.index - g.tmx);
+    if (gt < 0.0 || fabs(gt - t) >= 0.5 * slope)
+        return;
+    g.cur_t_ns = g.anchor_now + (uint64_t)llround(gt * 1e6);
+    g.cur_t_valid = true;
+}
+
 static void pacing_note_frame(struct fps_core *c)
 {
     c->frame_after_gap = false;
@@ -923,14 +1069,35 @@ static void pacing_note_frame(struct fps_core *c)
         if (c->src_iv_n < 15)
             c->src_iv_n++;
     }
+    {
+        uint64_t median = 0;
+        if (c->src_iv_n >= 5) {
+            uint64_t tmp[15];
+            std::copy(c->src_iv, c->src_iv + c->src_iv_n, tmp);
+            std::nth_element(tmp, tmp + c->src_iv_n / 2, tmp + c->src_iv_n);
+            median = tmp[c->src_iv_n / 2];
+        }
+        const uint64_t iv = (c->last_src_ts && c->src_ts > c->last_src_ts) ? c->src_ts - c->last_src_ts : 0;
+        grid_note_frame(c, iv, median);
+    }
     c->last_src_ts = c->src_ts;
 }
 
-// How long the previous new frame was on screen: from the device's
-// timestamps when there are any (exact refresh periods), else from the
-// analysis clock rounded to whole OBS frames (sync path: one frame per tick).
+// Both ends of the sample on the same holding signal grid
+static bool grid_snaps(const struct fps_core *c)
+{
+    return c->src_ts && grid_locked(c) && !c->grid.frame_bad && c->lu_grid_ok &&
+           c->lu_grid_epoch == c->grid.epoch && c->grid.index > c->lu_grid_index;
+}
+
+// How long the previous new frame was on screen: in whole periods of the
+// signal grid once it holds (a card that stamps with jitter), else from the
+// device's timestamps when there are any, else from the analysis clock
+// rounded to whole OBS frames (sync path: one frame per tick).
 static double pacing_sample(const struct fps_core *c, double ft_ms)
 {
+    if (grid_snaps(c))
+        return (double)(c->grid.index - c->lu_grid_index) * grid_period_ms(c->grid);
     if (c->src_ts && c->last_unique_src_ts && c->src_ts > c->last_unique_src_ts)
         return (double)(c->src_ts - c->last_unique_src_ts) / 1e6;
     if (c->params.pacing_period_ns > 0) {
@@ -949,6 +1116,11 @@ static void analyze_unique(struct fps_core *c, uint64_t now)
         double ft = (now - c->last_unique_frame_time) / 1000000.0;
         c->frametime_history[c->frametime_pos] = ft;
         c->pacing_ms[c->frametime_pos] = pacing_sample(c, ft);
+        c->dbg.pacing_snapped = grid_snaps(c);
+        c->dbg.grid_t_valid = c->dbg.pacing_snapped && c->grid.cur_t_valid && c->lu_grid_t_valid &&
+                              c->grid.cur_t_ns > c->lu_grid_t_ns;
+        c->dbg.grid_t_ns = c->dbg.grid_t_valid ? c->grid.cur_t_ns : 0;
+        c->dbg.grid_ft_ms = c->dbg.grid_t_valid ? (double)(c->grid.cur_t_ns - c->lu_grid_t_ns) / 1e6 : 0.0;
         // A lost frame touches two samples: the one it falls in, and - when
         // the new frame that ends it is the late stand-in for a lost one -
         // the next, whose start is then late as well.
@@ -996,6 +1168,11 @@ static void analyze_unique(struct fps_core *c, uint64_t now)
     }
     c->last_unique_frame_time = now;
     c->last_unique_src_ts = c->src_ts;
+    c->lu_grid_ok = c->src_ts && c->grid.active && !c->grid.frame_bad;
+    c->lu_grid_epoch = c->grid.epoch;
+    c->lu_grid_index = c->grid.index;
+    c->lu_grid_t_valid = c->grid.cur_t_valid;
+    c->lu_grid_t_ns = c->grid.cur_t_ns;
     c->carry_gap = c->frame_after_gap;
     c->pending_gap = false;
 }
@@ -1010,6 +1187,9 @@ static void analyze_luma_frame(struct fps_core *c, const uint8_t *luma_ptr, size
     c->dbg.percent = 0.0;
     c->dbg.sample_written = false;
     c->dbg.ft_ms = c->dbg.ema = c->dbg.fps_pf = 0.0;
+    c->dbg.pacing_snapped = c->dbg.grid_t_valid = false;
+    c->dbg.grid_t_ns = 0;
+    c->dbg.grid_ft_ms = 0.0;
     c->dbg.deltas_valid = false;
 
     if (!c->prev_frame_allocated || c->prev_frame.size() != luma_size) {
@@ -1218,6 +1398,7 @@ int fps_core_feed(struct fps_core *c, const struct fps_frame_view *frame, uint64
 
     c->src_ts = frame->src_ts_ns;
     pacing_note_frame(c);
+    grid_note_time(c, now_ns);
     drops_commit(c, now_ns);
 
     // Tearing is judged on every frame, including duplicates.
@@ -1410,6 +1591,8 @@ void fps_core_clear_history(struct fps_core *c)
     c->ema_frametime = 0.0;
     c->last_unique_frame_time = 0;
     c->last_unique_src_ts = 0;
+    c->lu_grid_ok = false;
+    c->lu_grid_t_valid = false;
     c->pending_gap = false;
     c->carry_gap = false;
     c->last_published_fps = 0;
@@ -1457,7 +1640,11 @@ void fps_core_debug_feed_decision(struct fps_core *c, bool unique, bool tearing,
     c->dbg.percent = 0.0;
     c->dbg.sample_written = false;
     c->dbg.ft_ms = c->dbg.ema = c->dbg.fps_pf = 0.0;
+    c->dbg.pacing_snapped = c->dbg.grid_t_valid = false;
+    c->dbg.grid_t_ns = 0;
+    c->dbg.grid_ft_ms = 0.0;
     c->dbg.unique = unique;
+    grid_note_time(c, now_ns);
     drops_commit(c, now_ns);
     if (unique)
         analyze_unique(c, now_ns);

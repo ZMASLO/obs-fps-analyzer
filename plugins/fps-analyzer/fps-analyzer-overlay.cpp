@@ -98,7 +98,7 @@ struct fps_overlay_source
 static const char *fps_overlay_get_name(void *unused)
 {
     UNUSED_PARAMETER(unused);
-    return "FPS Analyzer 0.6.0";
+    return "FPS Analyzer 0.6.1";
 }
 
 static void update_text_source(struct fps_overlay_source *ctx, const char *text)
@@ -1281,7 +1281,7 @@ static void fps_overlay_tick(void *data, float seconds)
     {
         snprintf(text, sizeof(text),
                  "No FPS Analyzer filter active.\n"
-                 "Add the \"FPS Analyzer 0.6.0\" filter\n"
+                 "Add the \"FPS Analyzer 0.6.1\" filter\n"
                  "to a video source to start.");
     }
     else if (g_fps_shared.active_filter_count > 1)
@@ -1725,7 +1725,7 @@ bool obs_module_load(void)
     obs_register_source(&fps_analyzer_filter_info);
     obs_register_source(&fps_overlay_source_info);
     fps_analyzer_register_hotkeys();
-    blog(LOG_INFO, "FPS Analyzer 0.6.0 loaded");
+    blog(LOG_INFO, "FPS Analyzer 0.6.1 loaded");
     return true;
 }
 
