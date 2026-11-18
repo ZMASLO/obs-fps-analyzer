@@ -1888,6 +1888,94 @@ static void s26_plot_layout(Runner &r)
         r.check(plot_value_y(500.0, 100.0, 100.0f, true) == 100.0f && plot_value_y(-5.0, 100.0, 100.0f, false) == 100.0f,
                 "values beyond the scale are clipped at the edge");
     }
+    {   // the frame on screen now: frames keep coming (judder included) -> no tail
+        s26_fill(&g_s26_ring, {P, 3 * P}, 600, now);
+        float a = 0, b = 0;
+        double el = 0;
+        bool none = !plot_tail(&g_s26_ring, now + 40.0, 10.0, 1000.0f, &a, &b, &el) &&
+                    !plot_tail(&g_s26_ring, now + 99.0, 10.0, 1000.0f, &a, &b, &el);
+        r.check(none, "frames still coming (a 50 ms frame, 99 ms since the last): no tail");
+    }
+    {   // a 3 s pause in a 10 s window: the tail runs from 70 % to the edge, showing 3000 ms
+        s26_fill(&g_s26_ring, {2 * P}, 600, now);
+        float a = 0, b = 0;
+        double el = 0;
+        bool got = plot_tail(&g_s26_ring, now + 3000.0, 10.0, 1000.0f, &a, &b, &el);
+        r.check(got && fabs(a - 700.0f) < 0.01 && b == 1000.0f && fabs(el - 3000.0) < 0.001,
+                "3 s pause: tail %.1f..%.1f px, current frame shown %.0f ms", a, b, el);
+        // a pause longer than the window: the tail covers all of it, the line never vanishes
+        got = plot_tail(&g_s26_ring, now + 15000.0, 10.0, 1000.0f, &a, &b, &el);
+        r.check(got && a == 0.0f && b == 1000.0f && fabs(el - 15000.0) < 0.001,
+                "15 s pause in a 10 s window: tail over the whole width");
+    }
+    {   // FPS "now": new frames in the last second, 0 while the picture stands still
+        s26_fill(&g_s26_ring, {2 * P}, 600, now);
+        int during = plot_recent_frames(&g_s26_ring, now, 1000.0);
+        int paused = plot_recent_frames(&g_s26_ring, now + 1500.0, 1000.0);
+        int half = plot_recent_frames(&g_s26_ring, now + 500.0, 1000.0);
+        r.check(during >= 29 && during <= 31 && paused == 0 && half >= 14 && half <= 16,
+                "recent frames: %d while playing at 30, %d half a second into a pause, %d after 1.5 s", during,
+                half, paused);
+    }
+    {   // framerate in time: steady 30 and 60 FPS read 29.97 / 59.94 at every column, no 29/30 flicker
+        static float xs[4096];
+        static double vs[4096];
+        bool ok = true;
+        double worst = 0;
+        for (double ft : {2 * P, P}) {
+            s26_fill(&g_s26_ring, {ft}, 2400, now);
+            int n = plot_fps_curve(&g_s26_ring, now, 20.0, 1000.0f, 2.0f, xs, vs, 4096);
+            double want = 1000.0 / ft;
+            ok = ok && n > 400;
+            for (int i = 0; i < n; i++) {
+                if (fabs(vs[i] - want) > fabs(worst))
+                    worst = vs[i] - want;
+                ok = ok && fabs(vs[i] - want) < 0.01;
+            }
+        }
+        r.check(ok, "framerate curve: steady 30 and 60 FPS flat at 29.97 / 59.94 (worst off by %.4f)", worst);
+        // judder 16.7 / 50 ms still averages 29.97 - the judder belongs to the pacing graph
+        s26_fill(&g_s26_ring, {P, 3 * P}, 1200, now);
+        int n = plot_fps_curve(&g_s26_ring, now, 10.0, 1000.0f, 2.0f, xs, vs, 4096);
+        bool flat = n > 100;
+        for (int i = 0; i < n; i++)
+            flat = flat && fabs(vs[i] - 1000.0 / (2 * P)) < 0.05;
+        r.check(flat, "framerate curve: judder 16.7 / 50 ms reads a steady 29.97");
+    }
+    {   // a 3 s pause after a 30 FPS game: falls within a second, never a slope across the pause
+        s26_fill(&g_s26_ring, {2 * P}, 600, now);
+        const double pause_end = now + 3000.0;
+        bool falling = true;
+        double prev = 1e9, peak = 0;
+        for (double t = now; t <= pause_end; t += 50.0) {
+            double v = plot_fps_at(&g_s26_ring, t, pause_end);
+            falling = falling && v <= prev + 1e-9;
+            prev = v;
+            if (v > peak)
+                peak = v;
+        }
+        double one_s = plot_fps_at(&g_s26_ring, now + 1000.0, now + 1000.0);
+        double mid = plot_fps_at(&g_s26_ring, now + 1500.0, pause_end);
+        double end = plot_fps_at(&g_s26_ring, pause_end, pause_end);
+        r.check(falling && peak <= 1000.0 / (2 * P) + 1e-6 && one_s < 1.1 && mid <= 1.1 && fabs(end - 1000.0 / 3000.0) < 0.01,
+                "pause: only falls (peak %.2f), %.2f a second in, %.2f mid-pause (a slope would give ~15), %.2f at 3 s",
+                peak, one_s, mid, end);
+        // the game resumes: back to 29.97 a second later
+        plot_ring_clear(&g_s26_ring);
+        s26_fill(&g_s26_ring, {2 * P}, 600, now);
+        struct plot_sample after = {};
+        after.t_ms = pause_end;
+        after.ft_ms = 3000.0;
+        plot_ring_push(&g_s26_ring, &after);
+        for (int k = 1; k <= 60; k++) {
+            struct plot_sample s = {};
+            s.t_ms = pause_end + k * 2 * P;
+            s.ft_ms = 2 * P;
+            plot_ring_push(&g_s26_ring, &s);
+        }
+        double back = plot_fps_at(&g_s26_ring, pause_end + 1100.0, pause_end + 60 * 2 * P);
+        r.check(fabs(back - 1000.0 / (2 * P)) < 0.05, "resumed: %.2f FPS a second after the pause", back);
+    }
     {   // the ring wraps and keeps the order
         plot_ring_clear(&g_s26_ring);
         for (int i = 0; i < FPS_PLOT_CAP + 1808; i++) {

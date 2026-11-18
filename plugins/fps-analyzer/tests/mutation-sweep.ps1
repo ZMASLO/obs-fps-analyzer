@@ -97,7 +97,15 @@ $mutations = @(
     @{ name = "wykres: brak odwrocenia osi";              file = "plot-layout.cpp"; find = 'return (float)(inverted ? f * height : (1.0 - f) * height);'; repl = 'return (float)((1.0 - f) * height);' },
     @{ name = "wykres: bez przyciecia wartosci";          file = "plot-layout.cpp"; find = '    if (f > 1.0)'; repl = '    if (f > 100.0)' },
     @{ name = "wykres: stare probki w oknie";             file = "plot-layout.cpp"; find = 'if (s->t_ms <= start_ms)'; repl = 'if (s->t_ms <= start_ms - 1000.0)' },
-    @{ name = "wykres: pierscien bez zawijania";          file = "plot-layout.cpp"; find = 'int idx = (r->head - r->count + i + FPS_PLOT_CAP) % FPS_PLOT_CAP;'; repl = 'int idx = i % FPS_PLOT_CAP;' }
+    @{ name = "wykres: pierscien bez zawijania";          file = "plot-layout.cpp"; find = 'int idx = (r->head - r->count + i + FPS_PLOT_CAP) % FPS_PLOT_CAP;'; repl = 'int idx = i % FPS_PLOT_CAP;' },
+    @{ name = "wykres: bez biezacej klatki w pauzie";     file = "plot-layout.cpp"; find = '    if (elapsed <= threshold)'; repl = '    if (true)' },
+    @{ name = "wykres: biezaca klatka zawsze";            file = "plot-layout.cpp"; find = '    if (elapsed <= threshold)'; repl = '    if (elapsed <= 0.0)' },
+    @{ name = "wykres: biezaca klatka od zlego miejsca";  file = "plot-layout.cpp"; find = 'double x = (last->t_ms - (now_ms - window_ms)) * (double)width_px / window_ms;'; repl = 'double x = (last->t_ms - last->ft_ms - (now_ms - window_ms)) * (double)width_px / window_ms;' },
+    @{ name = "wykres: FPS teraz z okna 2 s";             file = "plot-layout.cpp"; find = 'if (plot_ring_at(r, i)->t_ms <= now_ms - span_ms)'; repl = 'if (plot_ring_at(r, i)->t_ms <= now_ms - 2.0 * span_ms)' },
+    @{ name = "framerate: bez biezacej klatki";           file = "plot-layout.cpp"; find = '    if (shown > 0.0 && t_ms > last->t_ms) {'; repl = '    if (false) {' },
+    @{ name = "framerate: cale klatki zamiast ulamkow";   file = "plot-layout.cpp"; find = '            sum += (b - a) / s->ft_ms;'; repl = '            sum += 1.0;' },
+    @{ name = "framerate: okno 2 s";                      file = "plot-layout.cpp"; find = '#define PLOT_FPS_SPAN_MS 1000.0'; repl = '#define PLOT_FPS_SPAN_MS 2000.0' },
+    @{ name = "framerate: overlap bez przyciecia do okna"; file = "plot-layout.cpp"; find = '        double a = start > ws ? start : ws;'; repl = '        double a = start;' }
 )
 
 function Run-Layer([string]$exe, [string[]]$argv) {

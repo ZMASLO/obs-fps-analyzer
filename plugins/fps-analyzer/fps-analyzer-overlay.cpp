@@ -591,7 +591,16 @@ static void render_time_graph(int field, double ref_step, bool show_tearing, boo
     const struct plot_ring *ring = &g_fps_shared.plot;
     int n = plot_window(ring, now_ms, window_s, (float)gw, spans, FPS_PLOT_CAP);
 
-    // Y-axis scaling from the samples on screen
+    // Framerate: computed at every other pixel column in time (frames on screen
+    // in the second before it), not interpolated between frames - a pause then
+    // drops to 0 instead of drawing a slope across it (plot_fps_curve)
+    static float curve_x[4096];
+    static double curve_v[4096];
+    int curve_n = 0;
+    if (field == PLOT_FPS)
+        curve_n = plot_fps_curve(ring, now_ms, window_s, (float)gw, 2.0f, curve_x, curve_v, 4096);
+
+    // Y-axis scaling from the values on screen
     double max_val;
     if (max_override > 0)
     {
@@ -600,12 +609,15 @@ static void render_time_graph(int field, double ref_step, bool show_tearing, boo
     else
     {
         double hi = 0.0;
-        for (int i = 0; i < n; i++)
+        for (int i = 0; i < n && field != PLOT_FPS; i++)
         {
             double v = plot_field_value(plot_ring_at(ring, spans[i].idx), field);
             if (v > hi)
                 hi = v;
         }
+        for (int i = 0; i < curve_n; i++)
+            if (curve_v[i] > hi)
+                hi = curve_v[i];
         if (pacing_auto)
             max_val = hi <= 48.0 ? 50.0 : hi <= 64.0 ? 66.67 : 100.0;
         else
@@ -696,6 +708,35 @@ static void render_time_graph(int field, double ref_step, bool show_tearing, boo
         }
         gs_effect_set_vec4(color_param, &col);
     };
+    // Colour bucket of a value (same thresholds as set_color), for batching
+    auto color_index = [&](double v) {
+        if (higher_is_better)
+            return v >= green_thresh ? 0 : v >= yellow_thresh ? 1 : 2;
+        return v <= green_thresh + 0.05 ? 0 : v <= yellow_thresh + 0.05 ? 1 : 2;
+    };
+    // Two triangles: a band LINE_THICKNESS wide along a -> b (inside gs_render_start)
+    auto band_vertices = [&](float ax, float ay, float bx, float by) {
+        float dx = bx - ax, dy = by - ay;
+        float len = sqrtf(dx * dx + dy * dy);
+        float h = LINE_THICKNESS * 0.5f;
+        float nx = 0.0f, ny = h;
+        if (len > 0.001f)
+        {
+            nx = -dy / len * h;
+            ny = dx / len * h;
+        }
+        gs_vertex2f(ax + nx, ay + ny);
+        gs_vertex2f(ax - nx, ay - ny);
+        gs_vertex2f(bx + nx, by + ny);
+        gs_vertex2f(bx + nx, by + ny);
+        gs_vertex2f(ax - nx, ay - ny);
+        gs_vertex2f(bx - nx, by - ny);
+    };
+    auto draw_segment = [&](float ax, float ay, float bx, float by) {
+        gs_render_start(true);
+        band_vertices(ax, ay, bx, by);
+        gs_render_stop(GS_TRIS);
+    };
     const float ymax = (float)(gh - LINE_THICKNESS);
     auto yof = [&](double v) {
         float y = plot_value_y(v, max_val, (float)gh, inverted);
@@ -732,27 +773,68 @@ static void render_time_graph(int field, double ref_step, bool show_tearing, boo
     }
     else
     {
-        // A line through the samples (each at the end of its frame)
-        for (int i = 0; i + 1 < n; i++)
+        // A line through the samples (each at the end of its frame), drawn as a
+        // band of constant thickness along the segment - not a box over its value
+        // range, which after a long pause filled a block seconds wide
+        // (one triangle batch per run of the same colour). Framerate draws its
+        // per-column curve, the frametime graph its samples.
+        const bool curve = field == PLOT_FPS;
+        const int points = curve ? curve_n : n;
+        auto px = [&](int i) { return curve ? curve_x[i] : spans[i].x1; };
+        auto pv = [&](int i) { return curve ? curve_v[i] : plot_field_value(plot_ring_at(ring, spans[i].idx), field); };
+        int run_color = -1;
+        for (int i = 0; i + 1 < points; i++)
         {
-            double v0 = plot_field_value(plot_ring_at(ring, spans[i].idx), field);
-            double v1 = plot_field_value(plot_ring_at(ring, spans[i + 1].idx), field);
-            float x0 = spans[i].x1, x1 = spans[i + 1].x1;
-            float y0 = yof(v0), y1 = yof(v1);
+            double v0 = pv(i);
+            double v1 = pv(i + 1);
             double worst = higher_is_better ? (v0 < v1 ? v0 : v1) : (v0 > v1 ? v0 : v1);
-            set_color(worst, false);
-            float top = y0 < y1 ? y0 : y1;
-            float bot = y0 > y1 ? y0 : y1;
-            float seg_h = bot - top;
-            if (seg_h < LINE_THICKNESS)
-                seg_h = (float)LINE_THICKNESS;
-            float seg_w = x1 - x0;
-            if (seg_w < 1.0f)
-                seg_w = 1.0f;
-            gs_matrix_push();
-            gs_matrix_translate3f(x0, top, 0.0f);
-            gs_draw_sprite(0, 0, (uint32_t)(seg_w + 1.0f), (uint32_t)seg_h);
-            gs_matrix_pop();
+            int c = color_index(worst);
+            if (c != run_color)
+            {
+                if (run_color >= 0)
+                    gs_render_stop(GS_TRIS);
+                set_color(worst, false);
+                gs_render_start(true);
+                run_color = c;
+            }
+            band_vertices(px(i), yof(v0), px(i + 1), yof(v1));
+        }
+        if (run_color >= 0)
+            gs_render_stop(GS_TRIS);
+    }
+
+    // The frame on screen now, when no new one has come for unusually long (a
+    // pause, a loading screen): without it the line would stop and then vanish.
+    // Frame graphs: a step at how long the current frame has been shown so far
+    // (it only grows until the next frame replaces it). The framerate curve
+    // already counts the frame on screen (plot_fps_at), so it needs none.
+    if (field != PLOT_FPS)
+    {
+        float tx0 = 0.0f, tx1 = 0.0f;
+        double elapsed = 0.0;
+        if (plot_tail(ring, now_ms, window_s, (float)gw, &tx0, &tx1, &elapsed))
+        {
+            const struct plot_sample *last = plot_ring_at(ring, ring->count - 1);
+            double lv = plot_field_value(last, field);
+            float lx = n > 0 ? spans[n - 1].x1 : tx0;
+            double tv = elapsed;
+            set_color(tv, false);
+            if (stepped)
+            {
+                float ly = yof(lv), ty = yof(tv);
+                gs_matrix_push();
+                gs_matrix_translate3f(tx0, ly < ty ? ly : ty, 0.0f);
+                gs_draw_sprite(0, 0, (uint32_t)LINE_THICKNESS, (uint32_t)(fabsf(ty - ly) + LINE_THICKNESS));
+                gs_matrix_pop();
+                gs_matrix_push();
+                gs_matrix_translate3f(tx0, ty, 0.0f);
+                gs_draw_sprite(0, 0, (uint32_t)(tx1 - tx0 + 1.0f), (uint32_t)LINE_THICKNESS);
+                gs_matrix_pop();
+            }
+            else
+            {
+                draw_segment(lx, yof(lv), tx1, yof(tv));
+            }
         }
     }
 
