@@ -48,6 +48,13 @@ if(FPS_ANALYZER_BUILD_TOOLS)
     find_package(Threads REQUIRED)
     target_link_libraries(srate-selftest PRIVATE Threads::Threads)
 
+    # Performance: per-frame and per-render cost of the OBS-free code (fps-bench)
+    add_executable(fps-bench tools/fps-bench.cpp ${FPS_CORE} source-rate.cpp)
+    target_include_directories(fps-bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(fps-bench PRIVATE cxx_std_20)
+    target_compile_definitions(fps-bench PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_link_libraries(fps-bench PRIVATE Threads::Threads)
+
     # `ctest -C Release` runs these; run-tests.ps1 and the CI workflow call it.
     # resdet-selftest writes spectrum_*.bmp next to itself, so keep its working
     # directory inside the build tree.
@@ -59,4 +66,7 @@ if(FPS_ANALYZER_BUILD_TOOLS)
     add_test(NAME fps-fixtures COMMAND fps-cli --manifest
              ${CMAKE_CURRENT_SOURCE_DIR}/tests/cases.txt)
     add_test(NAME srate-selftest COMMAND srate-selftest)
+    # Generous per-call budgets: catches only a gross slowdown, on any machine
+    # (run-perf.ps1 compares with a local baseline for the fine-grained check)
+    add_test(NAME fps-perf-budget COMMAND fps-bench --check)
 endif()

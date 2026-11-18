@@ -49,6 +49,12 @@ Nagranie `lag_mk2` (17.11.2026) to czysty pierwszy wiersz: 98 dziur w znacznikac
   - Nagrania `lag_mk2*` trzeba przenieść do `tests/traces`.
 - [ ] README: porada przy zacinającym się podglądzie: zrestartować kartę w OBS, sprawdzić temperaturę i przepływ powietrza, wyłączyć HDR tone mapping w Elgato 4K Capture Utility.
 
+## Wydajność (pomiar 18.11.2026, `fps-bench` / `tools/obs-cost.py`)
+
+- [ ] **Histogram różnic przy „Full frame diff” jest za drogi.** 4K NV12: 3,0 ms bez histogramu, **10,6 ms z histogramem**, a histogram jest domyślnie włączony przez blokadę niewiarygodnych kart. W OBS (4K YUY2, 59,94 FPS) filtr kosztuje +10,8 ms czasu renderu na klatkę z 16,7 ms. Pomysł: blokada potrzebuje tylko „liczba różnych bajtów” i „max |Δ|”, a to da się policzyć w pętli, którą kompilator zwektoryzuje (bez tablicy kubełków). Pełny histogram tylko przy nagrywaniu śladu.
+- [ ] Samo porównanie „Full frame” (3 ms przy 4K) też jest wolniejsze, niż mogłoby być (~2,7 GB/s). `count_diff_bytes` można zwektoryzować.
+- [ ] Wykresy kosztują ok. 1,8 ms renderu (3 wykresy). Krzywą FPS/frametime można liczyć raz na takt zamiast przy każdym renderze.
+
 ## Inne otwarte sprawy
 
 - [ ] Elgato 4K Mk2: potwierdzić, że dawny problem z „laggy OBS preview” już nie występuje. README mówi teraz „works” na podstawie testów 0.5.2.

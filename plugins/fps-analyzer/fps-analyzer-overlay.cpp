@@ -1029,22 +1029,23 @@ static bool graph_toggle_modified(obs_properties_t *props, obs_property_t *p, ob
         snprintf(key, sizeof(key), "%s_height", pre);
         obs_property_set_visible(obs_properties_get(props, key), custom);
     }
+    // an unchecked section folds to its title
+    obs_property_t *hide = obs_properties_get(props, "autohide_source_rate");
+    if (hide)
+        obs_property_set_visible(hide, obs_data_get_bool(settings, "show_source_rate"));
     return true;
 }
 
 // Size (Custom), time window and inverted axis of one graph
-static void add_graph_extras(obs_properties_t *props, const char *pre, const char *title, bool with_invert)
+static void add_graph_extras(obs_properties_t *props, const char *pre, bool with_invert)
 {
-    char key[64], name[96];
+    char key[64];
     snprintf(key, sizeof(key), "%s_width", pre);
-    snprintf(name, sizeof(name), "%s graph width (px)", title);
-    obs_properties_add_int(props, key, name, 100, 3840, 10);
+    obs_properties_add_int(props, key, "Width (px)", 100, 3840, 10);
     snprintf(key, sizeof(key), "%s_height", pre);
-    snprintf(name, sizeof(name), "%s graph height (px)", title);
-    obs_properties_add_int(props, key, name, 40, 2160, 10);
+    obs_properties_add_int(props, key, "Height (px)", 40, 2160, 10);
     snprintf(key, sizeof(key), "%s_window", pre);
-    snprintf(name, sizeof(name), "%s time window", title);
-    obs_property_t *w = obs_properties_add_list(props, key, name, OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_FLOAT);
+    obs_property_t *w = obs_properties_add_list(props, key, "Time window", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_FLOAT);
     obs_property_list_add_float(w, "3 s", 3.0);
     obs_property_list_add_float(w, "5 s", 5.0);
     obs_property_list_add_float(w, "10 s", 10.0);
@@ -1057,8 +1058,7 @@ static void add_graph_extras(obs_properties_t *props, const char *pre, const cha
     if (with_invert)
     {
         snprintf(key, sizeof(key), "%s_invert", pre);
-        snprintf(name, sizeof(name), "%s: long frames down (Digital Foundry style)", title);
-        obs_properties_add_bool(props, key, name);
+        obs_properties_add_bool(props, key, "Long frames down (Digital Foundry style)");
     }
 }
 
@@ -1066,106 +1066,122 @@ static obs_properties_t *fps_overlay_properties(void *data)
 {
     obs_properties_t *props = obs_properties_create();
 
-    obs_property_t *font = obs_properties_add_list(
-        props, "font_size", "Font size",
-        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    // Sections: plain groups for what is always there, checkable groups (the
+    // checkbox is the same "show_*" setting as before, so scenes keep their
+    // state) for what can be turned off - unchecked, their settings are hidden
+    // and the section folds to its title.
+
+    // --- Text ---
+    obs_properties_t *text = obs_properties_create();
+    obs_property_t *font = obs_properties_add_list(text, "font_size", "Font size", OBS_COMBO_TYPE_LIST,
+                                                   OBS_COMBO_FORMAT_INT);
     obs_property_list_add_int(font, "16", 16);
     obs_property_list_add_int(font, "24", 24);
     obs_property_list_add_int(font, "32", 32);
     obs_property_list_add_int(font, "48", 48);
     obs_property_list_add_int(font, "64", 64);
+    obs_properties_add_bool(text, "show_fps_text", "Show FPS");
+    obs_properties_add_bool(text, "show_frametime_text", "Show Frametime");
+    obs_properties_add_bool(text, "show_tearing_text", "Show Tearing warning");
+    obs_properties_add_bool(text, "show_text_background", "Text background");
+    obs_properties_add_group(props, "group_text", "Text", OBS_GROUP_NORMAL, text);
 
-    obs_properties_add_bool(props, "show_fps_text", "Show FPS text");
-    obs_properties_add_bool(props, "show_frametime_text", "Show Frametime text");
-    obs_properties_add_bool(props, "show_tearing_text", "Show Tearing warning");
-    obs_property_t *res_text = obs_properties_add_bool(props, "show_resolution_text", "Show Source resolution text");
+    // --- Source resolution ---
+    obs_properties_t *res = obs_properties_create();
+    obs_property_t *res_text = obs_properties_add_bool(res, "show_resolution_text", "Show Source resolution text");
     obs_property_set_long_description(res_text,
         "Shows the upscale source resolution estimate. Requires \"Detect upscale "
         "source resolution\" to be enabled in the FPS Analyzer filter.");
-    obs_property_t *spec_prop = obs_properties_add_bool(props, "show_resolution_spectrum", "Show Source resolution spectrum");
+    obs_property_t *spec_prop = obs_properties_add_bool(res, "show_resolution_spectrum", "Show Source resolution spectrum");
     obs_property_set_long_description(spec_prop,
         "Shows the 2D DCT spectrum of the frame (low frequencies top-left) with "
         "markers at the detected source resolution. Requires \"Detect upscale "
         "source resolution\" to be enabled in the FPS Analyzer filter.");
-    obs_property_t *srate_prop = obs_properties_add_bool(props, "show_source_rate", "Show Source refresh rate");
-    obs_property_set_long_description(srate_prop,
-        "Measures the real refresh rate of a capture card / camera signal and "
-        "compares it with the OBS FPS (Settings > Video). A mismatch, e.g. a "
-        "59.94 Hz console captured at 60 FPS, makes OBS repeat a frame every "
-        "~17 s. Not available for Game/Display/Window Capture.");
-    obs_property_t *srate_hide = obs_properties_add_bool(props, "autohide_source_rate",
-                                                         "Auto-hide Source refresh rate when OK");
+    obs_properties_add_group(props, "group_resolution", "Source resolution", OBS_GROUP_NORMAL, res);
+
+    // --- Source refresh rate (checkable) ---
+    obs_properties_t *srate = obs_properties_create();
+    obs_property_t *srate_hide = obs_properties_add_bool(srate, "autohide_source_rate", "Auto-hide when OK");
     obs_property_set_long_description(srate_hide,
         "Hides the Source refresh rate line 5 s after the verdict is OK. It comes "
         "back on a mismatch, a variable rate or while measuring again (e.g. after "
         "changing the OBS FPS).");
-    obs_properties_add_bool(props, "show_text_background", "Show text background");
+    obs_property_t *srate_group = obs_properties_add_group(props, "show_source_rate", "Source refresh rate",
+                                                           OBS_GROUP_CHECKABLE, srate);
+    obs_property_set_long_description(srate_group,
+        "Measures the real refresh rate of a capture card / camera signal and "
+        "compares it with the OBS FPS (Settings > Video). A mismatch, e.g. a "
+        "59.94 Hz console captured at 60 FPS, makes OBS repeat a frame every "
+        "~17 s. Not available for Game/Display/Window Capture. Unchecked, it is "
+        "not computed at all.");
+    obs_property_set_modified_callback(srate_group, graph_toggle_modified);
 
-    obs_property_t *pc_toggle = obs_properties_add_bool(props, "show_pacing_graph", "Show frame pacing graph");
-    obs_property_set_long_description(pc_toggle,
-        "How long each game frame stayed on screen, frame by frame and unsmoothed, from the "
-        "capture card's timestamps (whole refresh periods: 16.7 / 33.3 / 50 ms), like Digital "
-        "Foundry's frame-time graph. A flat line is even pacing; a saw-tooth is judder even when "
-        "the FPS reads 30. Grey: the capture device lost a frame there, not the game.");
-    obs_property_set_modified_callback(pc_toggle, graph_toggle_modified);
-
-    obs_property_t *pc_style = obs_properties_add_list(
-        props, "pacing_style", "Frame pacing graph style",
-        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-    obs_property_list_add_int(pc_style, "Big (1920x360)", GRAPH_STYLE_BIG);
+    // --- Frame pacing graph (checkable) ---
+    obs_properties_t *pc = obs_properties_create();
+    obs_property_t *pc_style = obs_properties_add_list(pc, "pacing_style", "Style", OBS_COMBO_TYPE_LIST,
+                                                       OBS_COMBO_FORMAT_INT);
+    obs_property_list_add_int(pc_style, "Big (1800x360)", GRAPH_STYLE_BIG);
     obs_property_list_add_int(pc_style, "Compact (300x80)", GRAPH_STYLE_COMPACT);
     obs_property_list_add_int(pc_style, "Custom", GRAPH_STYLE_CUSTOM);
     obs_property_set_modified_callback(pc_style, graph_toggle_modified);
-
-    obs_property_t *pc_scale = obs_properties_add_list(
-        props, "pacing_scale", "Frame pacing scale",
-        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_FLOAT);
+    obs_property_t *pc_scale = obs_properties_add_list(pc, "pacing_scale", "Scale", OBS_COMBO_TYPE_LIST,
+                                                       OBS_COMBO_FORMAT_FLOAT);
     obs_property_list_add_float(pc_scale, "Auto", 0.0);
     obs_property_list_add_float(pc_scale, "33.33 ms", 33.33);
     obs_property_list_add_float(pc_scale, "50 ms", 50.0);
     obs_property_list_add_float(pc_scale, "66.67 ms", 66.67);
     obs_property_list_add_float(pc_scale, "100 ms", 100.0);
-    add_graph_extras(props, "pacing", "Frame pacing", true);
+    add_graph_extras(pc, "pacing", true);
+    obs_property_t *pc_group = obs_properties_add_group(props, "show_pacing_graph", "Frame pacing graph",
+                                                        OBS_GROUP_CHECKABLE, pc);
+    obs_property_set_long_description(pc_group,
+        "How long each game frame stayed on screen, frame by frame and unsmoothed, from the "
+        "capture card's timestamps (whole refresh periods: 16.7 / 33.3 / 50 ms), like Digital "
+        "Foundry's frame-time graph. A flat line is even pacing; a saw-tooth is judder even when "
+        "the FPS reads 30. Grey: the capture device lost a frame there, not the game.");
+    obs_property_set_modified_callback(pc_group, graph_toggle_modified);
 
-    obs_property_t *ft_toggle = obs_properties_add_bool(props, "show_frametime_graph", "Show frametime graph");
-    obs_property_set_modified_callback(ft_toggle, graph_toggle_modified);
-
-    obs_property_t *ft_style = obs_properties_add_list(
-        props, "frametime_style", "Frametime graph style",
-        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-    obs_property_list_add_int(ft_style, "Big (1920x360)", GRAPH_STYLE_BIG);
+    // --- Frametime graph (checkable) ---
+    obs_properties_t *ft = obs_properties_create();
+    obs_property_t *ft_style = obs_properties_add_list(ft, "frametime_style", "Style", OBS_COMBO_TYPE_LIST,
+                                                       OBS_COMBO_FORMAT_INT);
+    obs_property_list_add_int(ft_style, "Big (1800x360)", GRAPH_STYLE_BIG);
     obs_property_list_add_int(ft_style, "Compact (300x80)", GRAPH_STYLE_COMPACT);
     obs_property_list_add_int(ft_style, "Custom", GRAPH_STYLE_CUSTOM);
     obs_property_set_modified_callback(ft_style, graph_toggle_modified);
-
-    obs_property_t *ft_scale = obs_properties_add_list(
-        props, "frametime_scale", "Frametime scale",
-        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_FLOAT);
+    obs_property_t *ft_scale = obs_properties_add_list(ft, "frametime_scale", "Scale", OBS_COMBO_TYPE_LIST,
+                                                       OBS_COMBO_FORMAT_FLOAT);
     obs_property_list_add_float(ft_scale, "Auto", 0.0);
     obs_property_list_add_float(ft_scale, "16.67 ms", 16.67);
     obs_property_list_add_float(ft_scale, "33.33 ms", 33.33);
     obs_property_list_add_float(ft_scale, "66.67 ms", 66.67);
-    add_graph_extras(props, "frametime", "Frametime", true);
+    add_graph_extras(ft, "frametime", true);
+    obs_property_t *ft_group = obs_properties_add_group(props, "show_frametime_graph", "Frametime graph",
+                                                        OBS_GROUP_CHECKABLE, ft);
+    obs_property_set_long_description(ft_group,
+        "The average frame time of the second before each moment (1000 / the framerate graph).");
+    obs_property_set_modified_callback(ft_group, graph_toggle_modified);
 
-    obs_property_t *fps_toggle = obs_properties_add_bool(props, "show_fps_graph", "Show framerate graph");
-    obs_property_set_modified_callback(fps_toggle, graph_toggle_modified);
-
-    obs_property_t *fps_style_prop = obs_properties_add_list(
-        props, "fps_style", "Framerate graph style",
-        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-    obs_property_list_add_int(fps_style_prop, "Big (1920x360)", GRAPH_STYLE_BIG);
+    // --- Framerate graph (checkable) ---
+    obs_properties_t *fr = obs_properties_create();
+    obs_property_t *fps_style_prop = obs_properties_add_list(fr, "fps_style", "Style", OBS_COMBO_TYPE_LIST,
+                                                             OBS_COMBO_FORMAT_INT);
+    obs_property_list_add_int(fps_style_prop, "Big (1800x360)", GRAPH_STYLE_BIG);
     obs_property_list_add_int(fps_style_prop, "Compact (300x80)", GRAPH_STYLE_COMPACT);
     obs_property_list_add_int(fps_style_prop, "Custom", GRAPH_STYLE_CUSTOM);
     obs_property_set_modified_callback(fps_style_prop, graph_toggle_modified);
-
-    obs_property_t *fps_scale = obs_properties_add_list(
-        props, "fps_scale", "Framerate scale",
-        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_FLOAT);
+    obs_property_t *fps_scale = obs_properties_add_list(fr, "fps_scale", "Scale", OBS_COMBO_TYPE_LIST,
+                                                        OBS_COMBO_FORMAT_FLOAT);
     obs_property_list_add_float(fps_scale, "Auto", 0.0);
     obs_property_list_add_float(fps_scale, "120 FPS", 120.0);
     obs_property_list_add_float(fps_scale, "60 FPS", 60.0);
     obs_property_list_add_float(fps_scale, "30 FPS", 30.0);
-    add_graph_extras(props, "fps", "Framerate", false);
+    add_graph_extras(fr, "fps", false);
+    obs_property_t *fr_group = obs_properties_add_group(props, "show_fps_graph", "Framerate graph",
+                                                        OBS_GROUP_CHECKABLE, fr);
+    obs_property_set_long_description(fr_group,
+        "Game frames on screen in the second before each moment.");
+    obs_property_set_modified_callback(fr_group, graph_toggle_modified);
 
     // Initial visibility
     obs_data_t *cur = data ? obs_source_get_settings(((struct fps_overlay_source *)data)->self) : NULL;

@@ -1526,44 +1526,56 @@ static obs_properties_t *fps_analyzer_properties(void *data)
         "e.g. before a new test run. The hotkey \"FPS Analyzer: reset graph history\" "
         "(Settings -> Hotkeys) does the same from inside the game.");
 
-    // Analysis method
-    obs_property_t *method = obs_properties_add_list(props, "analyze_method", "Analysis method",
+    // Sections: plain groups for what is always there, checkable groups (the
+    // checkbox is the same setting as before, so existing filters keep their
+    // state) for what can be turned off - unchecked, the section folds to its title.
+
+    // --- Analysis ---
+    obs_properties_t *an = obs_properties_create();
+    obs_property_t *method = obs_properties_add_list(an, "analyze_method", "Analysis method",
         OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
     obs_property_list_add_int(method, "Last line diff (pixel analysis)", ANALYZE_LAST_LINE);
     obs_property_list_add_int(method, "Full frame diff (all lines)", ANALYZE_DIFF);
     obs_property_set_modified_callback(method, analyze_method_modified);
 
     // Sensitivity threshold
-    obs_property_t *slider = obs_properties_add_float_slider(props, "sensitivity", "Sensitivity threshold (%)", 0.0, 5.0, 0.1);
+    obs_property_t *slider = obs_properties_add_float_slider(an, "sensitivity", "Sensitivity threshold (%)", 0.0, 5.0, 0.1);
     int method_val = data ? ((struct fps_analyzer_filter*)data)->analyze_method : ANALYZE_LAST_LINE;
     obs_property_set_visible(slider, method_val == ANALYZE_DIFF || method_val == ANALYZE_LAST_LINE);
 
     // Update interval
     obs_property_t *interval = obs_properties_add_list(
-        props, "update_interval", "Update interval (seconds)",
+        an, "update_interval", "Update interval (seconds)",
         OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_FLOAT);
     obs_property_list_add_float(interval, "60 FPS (0.017s)", 1.0 / 60.0);
     obs_property_list_add_float(interval, "30 FPS (0.033s)", 1.0 / 30.0);
     obs_property_list_add_float(interval, "0.5s", 0.5);
     obs_property_list_add_float(interval, "1s", 1.0);
     obs_property_list_add_float(interval, "2s", 2.0);
+    obs_properties_add_group(props, "group_analysis", "Analysis", OBS_GROUP_NORMAL, an);
 
     // Reliability check
-    obs_property_t *block = obs_properties_add_bool(props, "block_unreliable",
+    obs_properties_t *rel = obs_properties_create();
+    obs_property_t *block = obs_properties_add_bool(rel, "block_unreliable",
                                                     "Block FPS when the capture is unreliable (recommended)");
     obs_property_set_long_description(block,
         "Hides the FPS and shows the reason instead when it cannot be measured exactly: "
         "a compressed capture format (MJPEG, H.264) or a capture device that alters every frame, "
         "so repeated frames are never identical. Turn off only for testing: the readings are then "
         "shown, but they can be wrong. See README: Supported capture devices.");
+    obs_properties_add_group(props, "group_reliability", "Reliability", OBS_GROUP_NORMAL, rel);
 
     // Tearing detection
-    obs_properties_add_bool(props, "enable_tearing_detection", "Tearing detection");
-    obs_properties_add_float_slider(props, "tearing_sensitivity", "Tearing sensitivity threshold (%)", 0.1, 10.0, 0.1);
+    obs_properties_t *tear = obs_properties_create();
+    obs_properties_add_float_slider(tear, "tearing_sensitivity", "Sensitivity threshold (%)", 0.1, 10.0, 0.1);
+    obs_properties_add_group(props, "enable_tearing_detection", "Tearing detection", OBS_GROUP_CHECKABLE, tear);
 
     // Upscale source resolution detection
-    obs_property_t *res_prop = obs_properties_add_bool(
-        props, "enable_resolution_detection", "Detect upscale source resolution (DCT)");
+    obs_properties_t *ups = obs_properties_create();
+    obs_property_t *spec_fps = obs_properties_add_list(ups, "spectrum_fps",
+        "Spectrum refresh rate", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    obs_property_t *res_prop = obs_properties_add_group(
+        props, "enable_resolution_detection", "Upscale source resolution detection (DCT)", OBS_GROUP_CHECKABLE, ups);
     obs_property_set_long_description(res_prop,
         "Estimates the internal render resolution the image was upscaled from "
         "using DCT spectral analysis (~1 analysis per second on a background thread). "
@@ -1571,8 +1583,6 @@ static obs_properties_t *fps_analyzer_properties(void *data)
         "AI upscalers like DLSS/FSR2+/PSSR.");
     obs_property_set_modified_callback(res_prop, resolution_detection_modified);
 
-    obs_property_t *spec_fps = obs_properties_add_list(props, "spectrum_fps",
-        "Spectrum refresh rate", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
     obs_property_list_add_int(spec_fps, "Analysis rate (~2/s, lowest CPU)", 0);
     obs_property_list_add_int(spec_fps, "30 FPS (center crop, ~20% of one core)", 30);
     obs_property_list_add_int(spec_fps, "60 FPS (center crop, ~40% of one core)", 60);
@@ -1584,12 +1594,12 @@ static obs_properties_t *fps_analyzer_properties(void *data)
         data ? ((struct fps_analyzer_filter*)data)->enable_resolution_detection : false);
 
     // CSV logging
-    obs_property_t *csv_toggle = obs_properties_add_bool(props, "enable_csv", "Enable CSV logging");
-    obs_property_set_modified_callback(csv_toggle, enable_csv_modified);
-
-    obs_property_t *path_prop = obs_properties_add_path(props, "output_path", "CSV Output file",
+    obs_properties_t *csv = obs_properties_create();
+    obs_property_t *path_prop = obs_properties_add_path(csv, "output_path", "CSV Output file",
                             OBS_PATH_FILE_SAVE, "CSV File (*.csv)", NULL);
-    obs_property_t *clear_prop = obs_properties_add_bool(props, "clear_csv_on_start", "Clear CSV file on start");
+    obs_property_t *clear_prop = obs_properties_add_bool(csv, "clear_csv_on_start", "Clear CSV file on start");
+    obs_property_t *csv_toggle = obs_properties_add_group(props, "enable_csv", "CSV logging", OBS_GROUP_CHECKABLE, csv);
+    obs_property_set_modified_callback(csv_toggle, enable_csv_modified);
 
     // Set initial CSV fields visibility
     bool csv_on = data ? ((struct fps_analyzer_filter*)data)->enable_csv : false;
@@ -1597,25 +1607,24 @@ static obs_properties_t *fps_analyzer_properties(void *data)
     obs_property_set_visible(clear_prop, csv_on);
 
     // Debug options
-    obs_property_t *dbg = obs_properties_add_bool(props, "debug_options", "Debug options");
-    obs_property_set_modified_callback(dbg, debug_options_modified);
-    obs_property_t *dump_dir = obs_properties_add_path(props, "debug_dump_dir", "Frame dump folder",
+    obs_properties_t *dbgp = obs_properties_create();
+    obs_property_t *dump_dir = obs_properties_add_path(dbgp, "debug_dump_dir", "Frame dump folder",
                                                        OBS_PATH_DIRECTORY, NULL, NULL);
     obs_property_set_long_description(dump_dir,
         "Where frame dumps are written (one subfolder per dump: <label>_<timestamp>). "
         "Empty = the plugin's config folder.");
-    obs_property_t *dump_label = obs_properties_add_text(props, "debug_dump_label",
+    obs_property_t *dump_label = obs_properties_add_text(dbgp, "debug_dump_label",
                                                          "Dump label (case name)", OBS_TEXT_DEFAULT);
-    obs_property_t *dump_count = obs_properties_add_int(props, "debug_dump_count",
+    obs_property_t *dump_count = obs_properties_add_int(dbgp, "debug_dump_count",
                                                         "Frames per dump", 1, 200, 1);
-    obs_property_t *dump_delay = obs_properties_add_int_slider(props, "debug_dump_delay",
+    obs_property_t *dump_delay = obs_properties_add_int_slider(dbgp, "debug_dump_delay",
                                                                "Start delay (s)", 0, 30, 1);
     obs_property_set_long_description(dump_delay,
         "Countdown before recording actually starts - time to Alt+Tab back into the game "
         "and leave the pause menu. Applies both to \"Dump frames now\" and to ticking "
         "\"Record FPS trace\". The hotkeys (Settings -> Hotkeys, top section) skip the "
         "countdown and start immediately.");
-    obs_property_t *dump_btn = obs_properties_add_button(props, "debug_dump_now",
+    obs_property_t *dump_btn = obs_properties_add_button(dbgp, "debug_dump_now",
                                                          "Dump frames now", debug_dump_button);
     obs_property_set_long_description(dump_btn,
         "After the start delay, writes the next N full-frame luma planes fed to the "
@@ -1624,8 +1633,8 @@ static obs_properties_t *fps_analyzer_properties(void *data)
     char status[800] = "Dump status: idle";
     if (data)
         debug_dump_status_text((struct fps_analyzer_filter *)data, status, sizeof(status));
-    obs_property_t *dump_status = obs_properties_add_text(props, "debug_dump_status", status, OBS_TEXT_INFO);
-    obs_property_t *trace_prop = obs_properties_add_bool(props, "debug_fps_trace",
+    obs_property_t *dump_status = obs_properties_add_text(dbgp, "debug_dump_status", status, OBS_TEXT_INFO);
+    obs_property_t *trace_prop = obs_properties_add_bool(dbgp, "debug_fps_trace",
                                                          "Record FPS trace (per-frame CSV)");
     obs_property_set_long_description(trace_prop,
         "While enabled, writes fpstrace_<label>_<timestamp>.csv into the frame dump folder: "
@@ -1637,8 +1646,10 @@ static obs_properties_t *fps_analyzer_properties(void *data)
     char trace_status[800] = "Trace status: idle";
     if (data)
         debug_trace_status_text((struct fps_analyzer_filter *)data, trace_status, sizeof(trace_status));
-    obs_property_t *trace_status_prop = obs_properties_add_text(props, "debug_fps_trace_status",
+    obs_property_t *trace_status_prop = obs_properties_add_text(dbgp, "debug_fps_trace_status",
                                                                trace_status, OBS_TEXT_INFO);
+    obs_property_t *dbg = obs_properties_add_group(props, "debug_options", "Debug options", OBS_GROUP_CHECKABLE, dbgp);
+    obs_property_set_modified_callback(dbg, debug_options_modified);
     bool dbg_on = data ? ((struct fps_analyzer_filter*)data)->debug_options : false;
     obs_property_set_visible(dump_dir, dbg_on);
     obs_property_set_visible(dump_label, dbg_on);
