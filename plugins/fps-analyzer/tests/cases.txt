@@ -122,3 +122,6 @@ trace:traces/4kx_nv12_trace_start_altered_v4.csv ; ; self, blocked=altered ; Elg
 # is counted on the signal grid (0.6.1): a steady 33.37 instead of 32.5-34.9 ms, and the beat check's
 # arrival rate is 59.94 (from a median of 15 jittery intervals it read 58.13).
 trace:traces/gc573_nv12_game30_v4.csv ; ; self, notblocked, fps@3-28=30+-1, pacing@3-28=33.37+-0.02, pacinggaps=0, nodrops, nobeat, arrival=59.94+-0.01 ; Avermedia GC573, NV12 4K, PS5 game at 30 FPS: jittery timestamps, reads 30
+# Same card on the released 0.6.1 build (19.11.2026, 20 s): the live overlay read 30 FPS and a flat 33.37 pacing;
+# two 50 ms game frames (two repeats in a row). Too short (19.99 s) for the 20 s arrival measurement, so no arrival check.
+trace:traces/gc573_nv12_game30_061_v4.csv ; ; self, notblocked, fps@3-18=30+-1, pacing@3-18=33.37+-0.02, pacinggaps=0, nodrops, nobeat ; Avermedia GC573, NV12 4K, PS5 game at 30 FPS on 0.6.1: reads 30, steady 33.37
